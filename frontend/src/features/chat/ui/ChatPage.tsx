@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   createCurrentThreadRepository,
   type CurrentThreadRepository,
 } from "@/entities/thread/model/current-thread-repository";
+import { selectLatestTodoSnapshot } from "@/entities/todo/model/todo-list";
 import {
   useChatRun,
   type ChatRunCanceller,
@@ -24,6 +25,11 @@ import { useConversationScroll } from "@/features/chat/model/use-conversation-sc
 import { useThreadHistory } from "@/features/threads/model/use-thread-history";
 import { useThreadList } from "@/features/threads/model/use-thread-list";
 import { useThreadRuns } from "@/features/threads/model/use-thread-runs";
+import {
+  buildHumanInputResponseText,
+  type HumanInputRequest,
+  type HumanInputResponse,
+} from "@/features/chat/model/human-input";
 
 interface ChatPageProps {
   readonly streamRunner?: ChatStreamRunner;
@@ -55,6 +61,8 @@ export function ChatPage({
   const [threadId, setThreadId] = useState(() =>
     threadRepository.getOrCreateCurrentThreadId(),
   );
+  const [isRailCollapsed, setIsRailCollapsed] = useState(false);
+  const [isMobileNavigationOpen, setIsMobileNavigationOpen] = useState(false);
   const { state, isActive, hydrateHistory, submit, cancel } = useChatRun({
     threadId,
     ...(streamRunner === undefined ? {} : { streamRunner }),
@@ -91,8 +99,13 @@ export function ChatPage({
   } = useConversationScroll({
     threadId,
     items: state.timeline,
+    isStreaming: isActive,
   });
   const lastRefreshedRunId = useRef<string | null>(null);
+  const latestTodoSnapshot = useMemo(
+    () => selectLatestTodoSnapshot(state.timeline),
+    [state.timeline],
+  );
 
   useEffect(() => {
     if (!history.isInitialLoading && history.error === null) {
@@ -153,9 +166,16 @@ export function ChatPage({
     },
     [deleteThread, threadId, threadRepository],
   );
+  const submitHumanInput = useCallback(
+    (request: HumanInputRequest, response: HumanInputResponse) =>
+      submit(buildHumanInputResponseText(request, response), [], {
+        humanInputResponse: response,
+      }),
+    [submit],
+  );
 
   return (
-    <div className="app-shell">
+    <div className="app-shell" data-rail-collapsed={isRailCollapsed}>
       <ConversationRail
         phase={state.phase}
         currentThreadId={threadId}
@@ -165,6 +185,10 @@ export function ChatPage({
         threadListError={threadListError}
         isNewThreadDisabled={isActive}
         isThreadSwitchDisabled={isActive}
+        collapsed={isRailCollapsed}
+        mobileOpen={isMobileNavigationOpen}
+        onToggleCollapsed={() => setIsRailCollapsed((current) => !current)}
+        onCloseMobile={() => setIsMobileNavigationOpen(false)}
         onCreateNewThread={createNewThread}
         onSelectThread={selectThread}
         onRetryThreadList={retryThreadList}
@@ -176,6 +200,8 @@ export function ChatPage({
           phase={state.phase}
           threadId={threadId}
           runId={state.runId}
+          navigationOpen={isMobileNavigationOpen}
+          onOpenNavigation={() => setIsMobileNavigationOpen(true)}
         />
         <div className="chat-stage-region">
           <section
@@ -217,6 +243,7 @@ export function ChatPage({
                 phase={state.phase}
                 startedAt={state.startedAt}
                 runs={threadRuns}
+                onSubmitHumanInput={submitHumanInput}
               />
               {history.error !== null && (
                 <aside className="history-error" role="alert">
@@ -260,6 +287,12 @@ export function ChatPage({
           key={threadId}
           isActive={isActive}
           isStopping={state.phase === "stopping"}
+          {...(latestTodoSnapshot === null
+            ? {}
+            : {
+                todoList: latestTodoSnapshot.list,
+                todoSourceStepId: latestTodoSnapshot.sourceToolItemId,
+              })}
           onSubmit={submit}
           onCancel={cancel}
         />

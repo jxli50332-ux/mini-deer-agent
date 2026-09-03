@@ -215,19 +215,13 @@ describe("Mini Deer Agent 实时聊天页", () => {
     expect(
       screen.getByRole("status", { name: "工具 get_weather 已完成" }),
     ).toBeInTheDocument();
-    const toolActivity = screen.getByRole("status", {
+    const toolStep = screen.getByRole("status", {
       name: "工具 get_weather 已完成",
     });
-    const toolDisclosure = toolActivity.querySelector("details");
-    const toolSummary = toolActivity.querySelector("summary");
-    expect(toolDisclosure).not.toHaveAttribute("open");
-    expect(toolSummary).not.toBeNull();
-    fireEvent.click(toolSummary!);
-    expect(toolDisclosure).toHaveAttribute("open");
-    expect(
-      within(toolActivity).getByText(/"city": "北京"/),
-    ).toBeInTheDocument();
-    expect(screen.getByText("北京 24°C")).toBeInTheDocument();
+    expect(within(toolStep).getByText("查询 北京 天气")).toBeInTheDocument();
+    expect(toolStep.querySelector("details")).toBeNull();
+    expect(screen.queryByText(/"city": "北京"/)).not.toBeInTheDocument();
+    expect(screen.queryByText("北京 24°C")).not.toBeInTheDocument();
     expect(screen.getByText("北京当前天气为 24°C。")).toBeInTheDocument();
     expect(textbox).toBeEnabled();
   });
@@ -781,6 +775,70 @@ describe("Mini Deer Agent 实时聊天页", () => {
     expect(screen.queryByLabelText("开始新对话")).not.toBeInTheDocument();
   });
 
+  it("刷新后恢复最新 Todo，并在输入框上方独立展示", async () => {
+    const historyPageLoader: ThreadHistoryPageLoader = (request) =>
+      Promise.resolve({
+        version: "1",
+        threadId: request.threadId,
+        threadExists: true,
+        items: [
+          {
+            kind: "message",
+            id: "history-todo-user",
+            role: "user",
+            content: "完成复杂任务",
+            runId: RUN_ID,
+            threadSequence: 1,
+            createdAt: "2026-08-30T07:00:00+00:00",
+          },
+          {
+            kind: "tool",
+            id: "history-todo-tool",
+            toolCallId: "call-todo-history",
+            name: "write_todos",
+            input: "{}",
+            result: JSON.stringify({
+              todos: [
+                { content: "分析需求", status: "completed" },
+                { content: "改造界面", status: "in_progress" },
+              ],
+            }),
+            status: "completed",
+            runId: RUN_ID,
+            threadSequence: 2,
+            createdAt: "2026-08-30T07:00:01+00:00",
+          },
+          {
+            kind: "message",
+            id: "history-todo-assistant",
+            role: "assistant",
+            content: "正在处理。",
+            runId: RUN_ID,
+            threadSequence: 3,
+            createdAt: "2026-08-30T07:00:02+00:00",
+          },
+        ],
+        hasMore: false,
+        nextBeforeSequence: null,
+      });
+
+    const { container } = render(
+      <ChatPage
+        currentThreadRepository={fixedThreadRepository()}
+        historyPageLoader={historyPageLoader}
+      />,
+    );
+
+    expect(await screen.findByText("正在处理。")).toBeInTheDocument();
+    expect(screen.getByText("更新任务清单")).toBeInTheDocument();
+    const todoHeader = screen.getByRole("button", { name: /Todos/ });
+    const composerRegion = container.querySelector(".composer-region");
+    expect(composerRegion?.firstElementChild).toHaveClass("todo-panel");
+    fireEvent.click(todoHeader);
+    expect(screen.getByText("分析需求")).toBeVisible();
+    expect(screen.getByText("改造界面")).toBeVisible();
+  });
+
   it("刷新后从持久历史恢复搜索来源卡和 Assistant 引用", async () => {
     const searchResult = JSON.stringify({
       query: "Mini Deer",
@@ -845,13 +903,13 @@ describe("Mini Deer Agent 实时聊天页", () => {
     expect(await screen.findByText("刷新后的搜索回答")).toBeInTheDocument();
     expect(screen.getByText("参考来源（1）")).toBeInTheDocument();
     const tool = screen.getByRole("status", { name: "工具 web_search 已完成" });
-    fireEvent.click(tool.querySelector("summary")!);
-    expect(
-      within(tool).getByText("刷新后仍可读取的搜索摘要。"),
-    ).toBeInTheDocument();
+    expect(within(tool).getByText("搜索“Mini Deer”")).toBeInTheDocument();
     expect(
       within(tool).getByRole("link", { name: "示例研究" }),
     ).toHaveAttribute("href", "https://example.com/research");
+    expect(
+      within(tool).queryByText("刷新后仍可读取的搜索摘要。"),
+    ).not.toBeInTheDocument();
   });
 
   it("刷新后从持久历史恢复网页读取卡和正文引用", async () => {
@@ -915,11 +973,11 @@ describe("Mini Deer Agent 实时聊天页", () => {
     expect(await screen.findByText("正文结论")).toBeInTheDocument();
     expect(screen.getByText("参考来源（1）")).toBeInTheDocument();
     const tool = screen.getByRole("status", { name: "工具 web_fetch 已完成" });
-    fireEvent.click(tool.querySelector("summary")!);
+    expect(within(tool).getByText("读取网页")).toBeInTheDocument();
     expect(within(tool).getByText("已读取的文章")).toBeInTheDocument();
     expect(
-      within(tool).getByText("刷新后仍能看到的网页正文摘要。"),
-    ).toBeInTheDocument();
+      within(tool).queryByText("刷新后仍能看到的网页正文摘要。"),
+    ).not.toBeInTheDocument();
   });
 
   it("加载更早消息后把每个 Run 的耗时恢复到自己的轮次", async () => {

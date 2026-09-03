@@ -142,6 +142,43 @@ describe("useChatRun", () => {
     ]);
   });
 
+  it("结构化回答同时进入请求元数据和隐藏的 optimistic 时间线", async () => {
+    let capturedResponse: unknown;
+    const response = {
+      version: 1,
+      kind: "human_input_response",
+      request_id: "clarification:call-1",
+      response_kind: "text",
+      value: "Markdown",
+    } as const;
+    const runner: ChatStreamRunner = async function* (request) {
+      await Promise.resolve();
+      capturedResponse = request.humanInputResponse;
+      yield started();
+      yield completed(2);
+    };
+    const { result } = renderHook(() =>
+      useChatRun({
+        threadId: THREAD_ID,
+        streamRunner: runner,
+        createMessageId: () => "user-human-input-1",
+      }),
+    );
+
+    await act(async () => {
+      await result.current.submit("我选择 Markdown", [], {
+        humanInputResponse: response,
+      });
+    });
+
+    expect(capturedResponse).toEqual(response);
+    expect(result.current.state.timeline[0]).toMatchObject({
+      id: "user-human-input-1",
+      hiddenFromUi: true,
+      humanInputResponse: response,
+    });
+  });
+
   it("用 active operation guard 阻止同一时刻重复提交", async () => {
     const gate = deferred();
     const runner: ChatStreamRunner = async function* () {

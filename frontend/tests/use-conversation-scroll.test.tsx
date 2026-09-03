@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useCallback } from "react";
 import { describe, expect, it } from "vitest";
 
@@ -24,6 +24,8 @@ interface ScrollHarnessProps {
   readonly items: readonly ChatTimelineItem[];
   readonly scrollHeight: number;
   readonly clientHeight?: number;
+  readonly isStreaming?: boolean;
+  readonly streamText?: string;
 }
 
 function ScrollHarness({
@@ -31,21 +33,26 @@ function ScrollHarness({
   items,
   scrollHeight,
   clientHeight = 200,
+  isStreaming = false,
+  streamText = "",
 }: ScrollHarnessProps) {
   const { setViewport, hasUnseenContent, handleScroll, scrollToLatest } =
-    useConversationScroll({ threadId, items });
+    useConversationScroll({ threadId, items, isStreaming });
   const setViewportRef = useCallback(
     (node: HTMLDivElement | null) => {
       if (node !== null) {
         Object.defineProperties(node, {
-          scrollHeight: { configurable: true, value: scrollHeight },
+          scrollHeight: {
+            configurable: true,
+            get: () => Number(node.dataset.scrollHeight),
+          },
           clientHeight: { configurable: true, value: clientHeight },
           scrollTo: { configurable: true, value: undefined },
         });
       }
       setViewport(node);
     },
-    [clientHeight, scrollHeight, setViewport],
+    [clientHeight, setViewport],
   );
 
   return (
@@ -53,8 +60,11 @@ function ScrollHarness({
       <div
         ref={setViewportRef}
         data-testid="viewport"
+        data-scroll-height={scrollHeight}
         onScroll={handleScroll}
-      />
+      >
+        <span>{streamText}</span>
+      </div>
       {hasUnseenContent && (
         <button type="button" onClick={scrollToLatest}>
           回到最新
@@ -149,5 +159,57 @@ describe("对话粘底滚动", () => {
     expect(
       screen.queryByRole("button", { name: "回到最新" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("流式文字更新同一条消息时仍自动跟随最新内容", async () => {
+    const { rerender } = render(
+      <ScrollHarness
+        items={[FIRST_ITEM]}
+        scrollHeight={600}
+        isStreaming
+        streamText="正在分析"
+      />,
+    );
+    const viewport = screen.getByTestId("viewport");
+    expect(viewport.scrollTop).toBe(400);
+
+    rerender(
+      <ScrollHarness
+        items={[FIRST_ITEM]}
+        scrollHeight={760}
+        isStreaming
+        streamText="正在分析并持续生成最新 COT 步骤"
+      />,
+    );
+
+    await waitFor(() => expect(viewport.scrollTop).toBe(560));
+  });
+
+  it("用户在流式执行中上滚后不强制跟随 DOM 更新", async () => {
+    const { rerender } = render(
+      <ScrollHarness
+        items={[FIRST_ITEM]}
+        scrollHeight={600}
+        isStreaming
+        streamText="第一段"
+      />,
+    );
+    const viewport = screen.getByTestId("viewport");
+    viewport.scrollTop = 120;
+    fireEvent.scroll(viewport);
+
+    rerender(
+      <ScrollHarness
+        items={[FIRST_ITEM]}
+        scrollHeight={760}
+        isStreaming
+        streamText="第一段和新增内容"
+      />,
+    );
+
+    await waitFor(() => expect(viewport.scrollTop).toBe(120));
+    expect(
+      screen.getByRole("button", { name: "回到最新" }),
+    ).toBeInTheDocument();
   });
 });

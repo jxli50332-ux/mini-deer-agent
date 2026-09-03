@@ -12,12 +12,17 @@ import {
   validateTextAttachmentPayloads,
   type TextAttachmentPayload,
 } from "@/entities/attachment/model/text-attachments";
+import {
+  parseHumanInputResponse,
+  type HumanInputResponse,
+} from "@/features/chat/model/human-input";
 
 export interface ChatStreamRequest {
   readonly threadId: string;
   readonly messageId: string;
   readonly message: string;
   readonly attachments?: readonly TextAttachmentPayload[];
+  readonly humanInputResponse?: HumanInputResponse;
   readonly signal?: AbortSignal;
   readonly onRunId?: (runId: string) => void;
 }
@@ -128,6 +133,7 @@ function validateRequest(request: ChatStreamRequest): {
   readonly messageId: string;
   readonly message: string;
   readonly attachments: readonly TextAttachmentPayload[];
+  readonly humanInputResponse: HumanInputResponse | null;
 } {
   const threadId = request.threadId.trim().toLowerCase();
   if (!UUID_PATTERN.test(threadId)) {
@@ -167,7 +173,18 @@ function validateRequest(request: ChatStreamRequest): {
       { retryable: false },
     );
   }
-  return { threadId, messageId, message, attachments };
+  const humanInputResponse =
+    request.humanInputResponse === undefined
+      ? null
+      : parseHumanInputResponse(request.humanInputResponse);
+  if (request.humanInputResponse !== undefined && humanInputResponse === null) {
+    throw new ChatStreamClientError(
+      "invalid_request",
+      "humanInputResponse 不是受支持的 v1 澄清回答",
+      { retryable: false },
+    );
+  }
+  return { threadId, messageId, message, attachments, humanInputResponse };
 }
 
 function validateRunAddress(request: ChatRunCancelRequest): {
@@ -643,6 +660,9 @@ export async function* streamChatRun(
         ...(validated.attachments.length > 0
           ? { attachments: validated.attachments }
           : {}),
+        ...(validated.humanInputResponse === null
+          ? {}
+          : { human_input_response: validated.humanInputResponse }),
       }),
       credentials: "same-origin",
       cache: "no-store",

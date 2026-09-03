@@ -11,6 +11,7 @@ from mini_deer_agent.domain import (
     normalize_thread_title,
 )
 from mini_deer_agent.streaming.events import RunEvent
+from mini_deer_agent.application.memory import MemoryStore
 
 
 class ActiveRunConflictError(RuntimeError):
@@ -28,7 +29,7 @@ class ThreadCheckpointStore(Protocol):
         """删除一个 Thread 的全部 LangGraph checkpoint。"""
 
 
-class ConversationRepository(Protocol):
+class ConversationRepository(MemoryStore, Protocol):
     """定义运行写入和历史查询共同依赖的产品数据仓储契约。"""
 
     def create_run(
@@ -39,8 +40,9 @@ class ConversationRepository(Protocol):
         user_message_id: str,
         user_message: str,
         attachments: tuple[TextAttachment, ...] = (),
+        human_input_response: dict[str, object] | None = None,
     ) -> None:
-        """原子创建 Thread、Run、本轮用户消息及其文本附件。"""
+        """原子创建 Thread、Run、本轮用户消息、附件与澄清响应。"""
 
     def apply_run_event(self, event: RunEvent) -> bool:
         """物化 RunEvent；返回 False 表示终态竞争使事件不再可写。"""

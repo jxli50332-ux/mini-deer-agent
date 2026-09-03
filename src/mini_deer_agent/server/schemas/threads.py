@@ -4,7 +4,11 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from mini_deer_agent.domain import MAX_THREAD_TITLE_LENGTH, normalize_thread_title
+from mini_deer_agent.domain import (
+    MAX_THREAD_TITLE_LENGTH,
+    TextAttachmentMediaType,
+    normalize_thread_title,
+)
 
 
 class ThreadResponse(BaseModel):
@@ -66,6 +70,7 @@ class RunEventResponse(BaseModel):
     version: Literal["1"]
     event: Literal[
         "run_started",
+        "reasoning_delta",
         "ai_delta",
         "tool_call_delta",
         "tool_result",
@@ -81,23 +86,19 @@ class RunEventResponse(BaseModel):
     created_at: str
 
 
-class TextAttachmentMetadataResponse(BaseModel):
-    """公开附件展示所需元数据，正文只留在服务端和模型上下文。"""
+class TextAttachmentResponse(BaseModel):
+    """公开一条已持久化文本附件的完整内容，供历史恢复时查看正文。"""
 
     model_config = ConfigDict(extra="forbid")
 
     filename: str
-    media_type: Literal[
-        "text/plain",
-        "text/markdown",
-        "application/json",
-        "text/csv",
-    ]
+    media_type: TextAttachmentMediaType
     size_bytes: int = Field(ge=1)
+    content: str = Field(min_length=1)
 
 
 class MessageHistoryItemResponse(BaseModel):
-    """公开一条用户或模型文本消息。"""
+    """公开一条消息及可用于恢复结构化交互的受控元数据。"""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -108,7 +109,10 @@ class MessageHistoryItemResponse(BaseModel):
     role: Literal["user", "assistant"]
     content: str
     created_at: str
-    attachments: list[TextAttachmentMetadataResponse] = Field(default_factory=list)
+    reasoning: str | None = None
+    attachments: list[TextAttachmentResponse] = Field(default_factory=list)
+    hidden_from_ui: bool = False
+    human_input_response: dict[str, Any] | None = None
 
 
 class ToolHistoryItemResponse(BaseModel):

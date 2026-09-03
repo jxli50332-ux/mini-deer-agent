@@ -25,6 +25,13 @@ def test_settings_has_non_sensitive_defaults(monkeypatch: pytest.MonkeyPatch) ->
     assert settings.api_base_url is None
     assert settings.checkpoint_database_path == Path("data/checkpoints.sqlite")
     assert settings.application_database_path == Path("data/application.sqlite")
+    assert settings.context_summary_enabled is True
+    assert settings.context_summary_trigger_tokens == 50_000
+    assert settings.context_summary_trigger_messages == 40
+    assert settings.context_summary_keep_messages == 10
+    assert settings.context_summary_input_tokens == 25_000
+    assert settings.mcp_config_path == Path("mcp_servers.json")
+    assert settings.mcp_server_init_timeout_seconds == 10.0
 
 
 def test_environment_variables_override_settings(
@@ -81,3 +88,39 @@ def test_example_env_targets_deepseek_without_exposing_key(
     assert settings.model_name == "deepseek-v4-flash"
     assert settings.api_key is None
     assert str(settings.api_base_url) == "https://api.deepseek.com/"
+    assert settings.context_summary_enabled is True
+    assert settings.context_summary_trigger_tokens == 50_000
+    assert settings.context_summary_trigger_messages == 40
+    assert settings.context_summary_keep_messages == 10
+    assert settings.context_summary_input_tokens == 25_000
+
+
+def test_environment_can_override_context_summary_thresholds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实验收和不同模型可通过环境变量调整摘要预算。"""
+    monkeypatch.setenv("MINI_DEER_CONTEXT_SUMMARY_ENABLED", "false")
+    monkeypatch.setenv("MINI_DEER_CONTEXT_SUMMARY_TRIGGER_TOKENS", "8000")
+    monkeypatch.setenv("MINI_DEER_CONTEXT_SUMMARY_TRIGGER_MESSAGES", "12")
+    monkeypatch.setenv("MINI_DEER_CONTEXT_SUMMARY_KEEP_MESSAGES", "4")
+    monkeypatch.setenv("MINI_DEER_CONTEXT_SUMMARY_INPUT_TOKENS", "3000")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.context_summary_enabled is False
+    assert settings.context_summary_trigger_tokens == 8000
+    assert settings.context_summary_trigger_messages == 12
+    assert settings.context_summary_keep_messages == 4
+    assert settings.context_summary_input_tokens == 3000
+
+
+def test_environment_can_override_mcp_runtime_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MINI_DEER_MCP_CONFIG_PATH", "config/custom-mcp.json")
+    monkeypatch.setenv("MINI_DEER_MCP_SERVER_INIT_TIMEOUT_SECONDS", "2.5")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.mcp_config_path == Path("config/custom-mcp.json")
+    assert settings.mcp_server_init_timeout_seconds == 2.5

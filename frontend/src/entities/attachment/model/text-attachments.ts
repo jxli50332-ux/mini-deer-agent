@@ -2,11 +2,39 @@ export const MAX_TEXT_ATTACHMENT_COUNT = 3;
 export const MAX_TEXT_ATTACHMENT_BYTES = 32 * 1024;
 export const MAX_TEXT_ATTACHMENTS_TOTAL_BYTES = 64 * 1024;
 
-const MEDIA_TYPES_BY_EXTENSION = {
+// 只收录可以安全作为 UTF-8 文本内联进模型上下文的扩展名。
+// 此映射必须与后端 attachments.py 保持一致，历史恢复会按同一媒体类型白名单校验。
+export const MEDIA_TYPES_BY_EXTENSION = {
+  // 基础文本与数据
   ".txt": "text/plain",
   ".md": "text/markdown",
   ".json": "application/json",
   ".csv": "text/csv",
+  // 编程语言
+  ".py": "text/x-python",
+  ".js": "text/javascript",
+  ".jsx": "text/jsx",
+  ".ts": "text/typescript",
+  ".tsx": "text/tsx",
+  ".go": "text/x-go",
+  ".java": "text/x-java",
+  ".c": "text/x-c",
+  ".h": "text/x-c",
+  ".cpp": "text/x-c++",
+  ".hpp": "text/x-c++",
+  ".rs": "text/x-rust",
+  ".sql": "text/x-sql",
+  ".sh": "text/x-sh",
+  // Web 标记与样式
+  ".html": "text/html",
+  ".htm": "text/html",
+  ".css": "text/css",
+  ".scss": "text/x-scss",
+  // 配置与结构化数据
+  ".yaml": "text/yaml",
+  ".yml": "text/yaml",
+  ".xml": "text/xml",
+  ".toml": "application/toml",
 } as const;
 
 export type TextAttachmentMediaType =
@@ -16,6 +44,11 @@ export interface TextAttachmentMetadata {
   readonly filename: string;
   readonly mediaType: TextAttachmentMediaType;
   readonly sizeBytes: number;
+}
+
+/** 从服务端历史读回的完整附件，含正文，用于历史消息里查看文件内容。 */
+export interface TextAttachmentContent extends TextAttachmentMetadata {
+  readonly content: string;
 }
 
 export interface PreparedTextAttachment extends TextAttachmentMetadata {
@@ -52,9 +85,18 @@ function validateFilename(filename: string): TextAttachmentMediaType {
   }
   const mediaType = mediaTypeForFilename(filename);
   if (mediaType === null) {
-    throw new Error("仅支持 .txt、.md、.json、.csv 文本附件");
+    throw new Error("不支持该文件类型，仅支持文本类附件");
   }
   return mediaType;
+}
+
+/** 判断历史响应中的媒体类型是否属于当前支持的文本附件集合，并作为类型守卫收窄。 */
+export function isSupportedTextAttachmentMediaType(
+  value: string,
+): value is TextAttachmentMediaType {
+  return (
+    Object.values(MEDIA_TYPES_BY_EXTENSION) as readonly string[]
+  ).includes(value);
 }
 
 function utf8Size(content: string): number {

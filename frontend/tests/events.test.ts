@@ -130,6 +130,21 @@ describe("v1 ChatRunEvent 校验器", () => {
     });
   });
 
+  it("解码 reasoning_delta 事件并规范化为 camelCase", () => {
+    const event = decodeChatRunEvent(
+      runFrame(
+        "reasoning_delta",
+        2,
+        { text: "先分析问题。" },
+        { messageId: "message-ai-1" },
+      ),
+    );
+
+    expect(event.event).toBe("reasoning_delta");
+    expect(event.payload).toEqual({ text: "先分析问题。" });
+    expect(event.messageId).toBe("message-ai-1");
+  });
+
   it("拒绝无法解析的 JSON，且错误中不复制原始数据", () => {
     const secret = "sk-sensitive-value";
     const decode = () =>

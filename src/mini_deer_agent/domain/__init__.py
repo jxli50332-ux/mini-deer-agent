@@ -6,7 +6,7 @@ from mini_deer_agent.domain.attachments import (
     MAX_TEXT_ATTACHMENT_FILENAME_LENGTH,
     MAX_TEXT_ATTACHMENTS_TOTAL_BYTES,
     TextAttachment,
-    TextAttachmentMetadata,
+    TextAttachmentMediaType,
     validate_text_attachment_batch,
 )
 
@@ -22,6 +22,14 @@ from mini_deer_agent.domain.conversations import (
     default_thread_title,
     normalize_thread_title,
 )
+from mini_deer_agent.domain.memory import (
+    MAX_MEMORY_CONTENT_LENGTH,
+    MAX_MEMORY_QUERY_LENGTH,
+    MAX_MEMORY_SEARCH_LIMIT,
+    MEMORY_CATEGORIES,
+    MemoryCategory,
+    MemoryFact,
+)
 
 
 __all__ = [
@@ -31,12 +39,18 @@ __all__ = [
     "MAX_TEXT_ATTACHMENT_FILENAME_LENGTH",
     "MAX_TEXT_ATTACHMENTS_TOTAL_BYTES",
     "MAX_THREAD_TITLE_LENGTH",
+    "MAX_MEMORY_CONTENT_LENGTH",
+    "MAX_MEMORY_QUERY_LENGTH",
+    "MAX_MEMORY_SEARCH_LIMIT",
+    "MEMORY_CATEGORIES",
     "MessageHistoryItem",
+    "MemoryCategory",
+    "MemoryFact",
     "RunRecord",
     "StoredRunEventRecord",
     "ThreadRecord",
     "TextAttachment",
-    "TextAttachmentMetadata",
+    "TextAttachmentMediaType",
     "TimelineHistoryItem",
     "ToolExecutionHistoryItem",
     "default_thread_title",

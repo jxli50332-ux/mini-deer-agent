@@ -27,6 +27,23 @@ def test_text_attachment_batch_infers_trusted_metadata() -> None:
     ]
 
 
+def test_text_attachment_batch_supports_code_and_config_extensions() -> None:
+    """代码与配置文件也按扩展名推导为稳定的文本媒体类型。"""
+    attachments = validate_text_attachment_batch(
+        [
+            ("main.py", "print(1)"),
+            ("config.yaml", "name: demo"),
+            ("App.tsx", "export const x = 1;"),
+        ]
+    )
+
+    assert [(item.filename, item.media_type) for item in attachments] == [
+        ("main.py", "text/x-python"),
+        ("config.yaml", "text/yaml"),
+        ("App.tsx", "text/tsx"),
+    ]
+
+
 @pytest.mark.parametrize(
     ("filename", "content", "message"),
     [

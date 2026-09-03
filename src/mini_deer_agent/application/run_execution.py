@@ -81,6 +81,7 @@ class RunExecutionManager:
         thread_id: str,
         user_message_id: str,
         attachments: tuple[TextAttachment, ...] = (),
+        human_input_response: dict[str, object] | None = None,
     ) -> StartedRun:
         """先持久化 Run，再无等待窗口地附加后台执行 Task。"""
         if self._shutting_down:
@@ -94,6 +95,7 @@ class RunExecutionManager:
             user_message_id=user_message_id,
             user_message=message,
             attachments=attachments,
+            human_input_response=human_input_response,
         )
 
         started_event = RunEvent(
@@ -127,7 +129,12 @@ class RunExecutionManager:
         self._active_runs[run_id] = active
         try:
             active.task = asyncio.create_task(
-                self._execute(active, message, attachments),
+                self._execute(
+                    active,
+                    message,
+                    attachments,
+                    human_input_response,
+                ),
                 name=f"mini-deer-run-{run_id}",
             )
         except BaseException:
@@ -152,15 +159,32 @@ class RunExecutionManager:
         active: _ActiveRun,
         message: str,
         attachments: tuple[TextAttachment, ...],
+        human_input_response: dict[str, object] | None,
     ) -> None:
         """驱动异步 LangGraph，把事件先持久化再发布给 SSE 订阅者。"""
+        logger.info(
+            "Run 开始执行：run_id=%s thread_id=%s",
+            active.run_id,
+            active.thread_id,
+        )
         try:
-            async for event in self._stream_service.astream_run_events(
-                message,
-                active.thread_id,
-                active.run_id,
-                attachments,
-            ):
+            stream = (
+                self._stream_service.astream_run_events(
+                    message,
+                    active.thread_id,
+                    active.run_id,
+                    attachments,
+                )
+                if human_input_response is None
+                else self._stream_service.astream_run_events(
+                    message,
+                    active.thread_id,
+                    active.run_id,
+                    attachments,
+                    human_input_response,
+                )
+            )
+            async for event in stream:
                 if event.event == "run_started" and event.sequence == 1:
                     # start_run 已在返回响应前持久化并排队，投影器的同一事件不重复发送。
                     continue
@@ -168,7 +192,13 @@ class RunExecutionManager:
                     raise asyncio.CancelledError
                 if not await self._persist_and_publish(active, event):
                     return
+            logger.info("Run 执行完成：run_id=%s", active.run_id)
         except asyncio.CancelledError:
+            logger.info(
+                "Run 被中断：run_id=%s reason=%s",
+                active.run_id,
+                active.abort_reason,
+            )
             if not active.terminal:
                 await self._finish_interrupted(active)
         except Exception as exc:

@@ -5,7 +5,13 @@ import asyncio
 import httpx
 import pytest
 
-from mini_deer_agent.tools import get_weather
+from mini_deer_agent.tools import get_agent_tools, get_skill_tools, get_weather
+
+
+def test_weather_is_registered_only_as_a_skill_specialized_tool() -> None:
+    """被动主 Agent 不暴露天气能力，专用注册表则只包含天气工具。"""
+    assert "get_weather" not in tuple(tool.name for tool in get_agent_tools())
+    assert tuple(tool.name for tool in get_skill_tools()) == ("get_weather",)
 
 
 def test_get_weather_exposes_model_visible_contract() -> None:

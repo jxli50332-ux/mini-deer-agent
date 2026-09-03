@@ -111,6 +111,9 @@ export function projectConversation(
   let currentTurn: MutableConversationTurn | null = null;
 
   for (const item of timeline) {
+    if (item.kind === "message" && item.hiddenFromUi === true) {
+      continue;
+    }
     if (isUserMessage(item)) {
       if (currentTurn !== null) {
         turns.push(currentTurn);

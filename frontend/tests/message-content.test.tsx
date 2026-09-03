@@ -189,13 +189,15 @@ describe("对话正文渲染", () => {
     const assistantMessages = screen.getAllByRole("article", {
       name: "Mini Deer的消息",
     });
+    expect(assistantMessages).toHaveLength(1);
+    const cot = screen.getByRole("region", { name: "思考与执行步骤" });
     expect(
-      within(assistantMessages[0]!).queryByRole("button", {
+      within(cot).queryByRole("button", {
         name: "复制回答",
       }),
     ).not.toBeInTheDocument();
     expect(
-      within(assistantMessages[1]!).getByRole("button", {
+      within(assistantMessages[0]!).getByRole("button", {
         name: "复制回答",
       }),
     ).toBeInTheDocument();

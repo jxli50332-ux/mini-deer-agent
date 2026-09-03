@@ -154,6 +154,14 @@ describe("POST SSE chat client", () => {
         messageId: MESSAGE_ID,
         message: "  查询北京天气  ",
         attachments: [{ filename: "brief.md", content: "代号：云杉" }],
+        humanInputResponse: {
+          version: 1,
+          kind: "human_input_response",
+          request_id: "clarification:call-1",
+          response_kind: "option",
+          option_id: "option-1",
+          value: "北京",
+        },
         onRunId: (runId) => observedRunIds.push(runId),
       },
       { fetcher },
@@ -177,6 +185,14 @@ describe("POST SSE chat client", () => {
         message_id: MESSAGE_ID,
         message: "查询北京天气",
         attachments: [{ filename: "brief.md", content: "代号：云杉" }],
+        human_input_response: {
+          version: 1,
+          kind: "human_input_response",
+          request_id: "clarification:call-1",
+          response_kind: "option",
+          option_id: "option-1",
+          value: "北京",
+        },
       }),
     });
     expect(new Headers(init?.headers).get("accept")).toBe("text/event-stream");

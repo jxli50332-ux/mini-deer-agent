@@ -19,6 +19,11 @@ from mini_deer_agent.application.run_events import (
     RunEventStore,
 )
 from mini_deer_agent.application.run_stream import RunStreamService
+from mini_deer_agent.application.memory import (
+    DuplicateMemoryFactError,
+    MemoryFactNotFoundError,
+    MemoryStore,
+)
 
 
 __all__ = [
@@ -27,6 +32,9 @@ __all__ = [
     "CancelOutcome",
     "ConversationHistoryService",
     "ConversationRepository",
+    "DuplicateMemoryFactError",
+    "MemoryFactNotFoundError",
+    "MemoryStore",
     "RunExecutionManager",
     "RunEventHistoryService",
     "RunEventSequenceError",

@@ -1,13 +1,35 @@
-import type { TextAttachmentMetadata } from "@/entities/attachment/model/text-attachments";
+import type { TextAttachmentContent } from "@/entities/attachment/model/text-attachments";
 
 export type MessageRole = "assistant" | "user";
+
+export type HumanInputResponseMetadata =
+  | {
+      readonly version: 1;
+      readonly kind: "human_input_response";
+      readonly request_id: string;
+      readonly response_kind: "text";
+      readonly value: string;
+    }
+  | {
+      readonly version: 1;
+      readonly kind: "human_input_response";
+      readonly request_id: string;
+      readonly response_kind: "option";
+      readonly option_id: string;
+      readonly value: string;
+    };
 
 export interface MessageTimelineItem {
   readonly kind: "message";
   readonly id: string;
   readonly role: MessageRole;
   readonly content: string;
-  readonly attachments?: readonly TextAttachmentMetadata[];
+  /** 思考过程；与最终回答同属一条消息，前端折叠展示。 */
+  readonly reasoning?: string;
+  readonly attachments?: readonly TextAttachmentContent[];
+  /** 卡片提交的回答保留在原始时间线中，但不重复渲染为用户气泡。 */
+  readonly hiddenFromUi?: boolean;
+  readonly humanInputResponse?: HumanInputResponseMetadata;
 }
 
 export interface ToolTimelineItem {

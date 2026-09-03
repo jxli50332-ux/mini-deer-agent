@@ -1,5 +1,9 @@
 import type { ThreadHistoryItem } from "@/entities/message/model/types";
-import type { TextAttachmentMetadata } from "@/entities/attachment/model/text-attachments";
+import {
+  isSupportedTextAttachmentMediaType,
+  type TextAttachmentContent,
+} from "@/entities/attachment/model/text-attachments";
+import { parseHumanInputResponse } from "@/features/chat/model/human-input";
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -97,7 +101,7 @@ function positiveInteger(record: UnknownRecord, field: string): number {
 
 function parseTextAttachments(
   value: unknown,
-): readonly TextAttachmentMetadata[] {
+): readonly TextAttachmentContent[] {
   if (value === undefined) {
     return [];
   }
@@ -110,10 +114,8 @@ function parseTextAttachments(
     }
     const mediaType = item.media_type;
     if (
-      mediaType !== "text/plain" &&
-      mediaType !== "text/markdown" &&
-      mediaType !== "application/json" &&
-      mediaType !== "text/csv"
+      typeof mediaType !== "string" ||
+      !isSupportedTextAttachmentMediaType(mediaType)
     ) {
       invalidResponse("附件 media_type 不受支持");
     }
@@ -121,6 +123,7 @@ function parseTextAttachments(
       filename: requiredString(item, "filename"),
       mediaType,
       sizeBytes: positiveInteger(item, "size_bytes"),
+      content: requiredString(item, "content"),
     };
   });
 }
@@ -145,6 +148,26 @@ function parseHistoryItem(value: unknown): ThreadHistoryItem {
       invalidResponse("消息 role 不受支持");
     }
     const attachments = parseTextAttachments(value.attachments);
+    const hiddenFromUi = value.hidden_from_ui ?? false;
+    if (typeof hiddenFromUi !== "boolean") {
+      invalidResponse("消息 hidden_from_ui 必须是 boolean");
+    }
+    const humanInputResponse =
+      value.human_input_response === null ||
+      value.human_input_response === undefined
+        ? null
+        : parseHumanInputResponse(value.human_input_response);
+    if (
+      value.human_input_response !== null &&
+      value.human_input_response !== undefined &&
+      humanInputResponse === null
+    ) {
+      invalidResponse("消息 human_input_response 不受支持");
+    }
+    const reasoning =
+      value.reasoning === null || value.reasoning === undefined
+        ? undefined
+        : requiredString(value, "reasoning");
     return {
       kind: "message",
       id,
@@ -153,7 +176,10 @@ function parseHistoryItem(value: unknown): ThreadHistoryItem {
       runId,
       threadSequence,
       createdAt,
+      ...(reasoning === undefined ? {} : { reasoning }),
       ...(attachments.length > 0 ? { attachments } : {}),
+      ...(hiddenFromUi ? { hiddenFromUi: true } : {}),
+      ...(humanInputResponse === null ? {} : { humanInputResponse }),
     };
   }
 

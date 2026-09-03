@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "learning": {
+      "enabled": true,
+      "transport": "stdio",
+      "command": "python",
+      "args": ["examples/mcp_learning_server.py"]
+    }
+  }
+}

@@ -8,6 +8,10 @@ export interface AiDeltaPayload {
   readonly text: string;
 }
 
+export interface ReasoningDeltaPayload {
+  readonly text: string;
+}
+
 export interface ToolCallDeltaPayload {
   readonly toolCallId: string;
   readonly name: string | null;
@@ -51,6 +55,10 @@ export type RunStartedEvent = ChatRunEventBase<
   RunStartedPayload
 >;
 export type AiDeltaEvent = ChatRunEventBase<"ai_delta", AiDeltaPayload>;
+export type ReasoningDeltaEvent = ChatRunEventBase<
+  "reasoning_delta",
+  ReasoningDeltaPayload
+>;
 export type ToolCallDeltaEvent = ChatRunEventBase<
   "tool_call_delta",
   ToolCallDeltaPayload
@@ -73,6 +81,7 @@ export type RunCompletedEvent = ChatRunEventBase<
 export type ChatRunEvent =
   | RunStartedEvent
   | AiDeltaEvent
+  | ReasoningDeltaEvent
   | ToolCallDeltaEvent
   | ToolResultEvent
   | RunErrorEvent
@@ -198,6 +207,7 @@ function isRunEventName(value: string): value is ChatRunEvent["event"] {
   return (
     value === "run_started" ||
     value === "ai_delta" ||
+    value === "reasoning_delta" ||
     value === "tool_call_delta" ||
     value === "tool_result" ||
     value === "run_error" ||
@@ -274,6 +284,14 @@ export function decodeChatRunEvent(frame: SseFrame): ChatRunEvent {
         },
       };
     case "ai_delta":
+      return {
+        ...base,
+        event: frame.event,
+        payload: {
+          text: requireString(payload, "text", "invalid_payload"),
+        },
+      };
+    case "reasoning_delta":
       return {
         ...base,
         event: frame.event,

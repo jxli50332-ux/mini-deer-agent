@@ -102,6 +102,42 @@ describe("对话展示投影", () => {
     expect(projectConversation([], "streaming")).toEqual([]);
   });
 
+  it("隐藏的结构化回答不产生重复用户气泡，但后续回答仍接在当前轮次", () => {
+    const hiddenAnswer: ChatTimelineItem = {
+      kind: "message",
+      id: "hidden-answer",
+      role: "user",
+      content: "针对澄清问题，我选择 Markdown",
+      hiddenFromUi: true,
+      humanInputResponse: {
+        version: 1,
+        kind: "human_input_response",
+        request_id: "clarification:call-1",
+        response_kind: "text",
+        value: "Markdown",
+      },
+    };
+    const continuation: ChatTimelineItem = {
+      kind: "message",
+      id: "assistant-after-answer",
+      role: "assistant",
+      content: "收到，我将使用 Markdown。",
+    };
+
+    const turns = projectConversation(
+      [...TIMELINE.slice(0, 4), hiddenAnswer, continuation],
+      "completed",
+    );
+
+    expect(turns).toHaveLength(1);
+    expect(turns[0]?.steps.map((item) => item.id)).toContain(
+      "assistant-after-answer",
+    );
+    expect(turns[0]?.steps.map((item) => item.id)).not.toContain(
+      "hidden-answer",
+    );
+  });
+
   it("只把服务端开始时间投影到最后一个活动轮次", () => {
     const startedAt = "2026-08-29T08:00:00+00:00";
     const turns = projectConversation(TIMELINE, "streaming", startedAt);

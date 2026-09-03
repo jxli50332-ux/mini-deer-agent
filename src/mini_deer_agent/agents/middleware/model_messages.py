@@ -9,6 +9,17 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from mini_deer_agent.agents.middleware.tool_history import (
     repair_tool_call_message_history,
 )
+from mini_deer_agent.agents.middleware.context_summary import (
+    project_context_summary,
+)
+from mini_deer_agent.agents.middleware.durable_context import (
+    project_durable_context,
+)
+from mini_deer_agent.agents.durable_state import (
+    DelegationEntry,
+    SkillContextEntry,
+    TodoSnapshot,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -70,6 +81,12 @@ def _attachment_context_message(message: HumanMessage) -> HumanMessage:
 def prepare_model_messages(
     system_message: SystemMessage,
     messages: Sequence[BaseMessage],
+    *,
+    summary_text: str | None = None,
+    delegations: Sequence[DelegationEntry] = (),
+    skill_context: Sequence[SkillContextEntry] = (),
+    todos: TodoSnapshot | None = None,
+    current_turn_id: str | None = None,
 ) -> list[BaseMessage]:
     """返回一个 SystemMessage 位于首位的模型专用消息视图。
 
@@ -78,18 +95,34 @@ def prepare_model_messages(
     非首位系统消息破坏严格 OpenAI-compatible 协议。
     """
     repaired = repair_tool_call_message_history(messages)
+    summary_projection = project_context_summary(
+        system_message,
+        repaired,
+        summary_text,
+    )
+    durable_projection = project_durable_context(
+        summary_projection.system_message,
+        summary_projection.messages,
+        delegations=delegations,
+        skill_context=skill_context,
+        todos=todos,
+        current_turn_id=current_turn_id,
+    )
     non_system_messages = [
         _attachment_context_message(message)
         if isinstance(message, HumanMessage)
         else message
-        for message in repaired
+        for message in durable_projection.messages
         if not isinstance(message, SystemMessage)
     ]
-    removed_count = len(repaired) - len(non_system_messages)
+    removed_count = sum(
+        isinstance(message, SystemMessage)
+        for message in durable_projection.messages
+    )
     if removed_count:
         # 不记录 SystemMessage 正文，避免内部提示进入日志。
         logger.warning(
             "模型消息历史包含旧 SystemMessage，已从调用视图移除：count=%d",
             removed_count,
         )
-    return [system_message, *non_system_messages]
+    return [durable_projection.system_message, *non_system_messages]

@@ -45,6 +45,8 @@ def test_agent_registry_exposes_search_before_fetch() -> None:
     assert tuple(tool.name for tool in get_agent_tools()) == (
         "web_search",
         "web_fetch",
+        "write_todos",
+        "ask_clarification",
     )
 
 

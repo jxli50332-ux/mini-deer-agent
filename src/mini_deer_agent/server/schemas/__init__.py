@@ -5,6 +5,10 @@ from mini_deer_agent.server.schemas.runs import (
     RunStreamRequest,
     TextAttachmentRequest,
 )
+from mini_deer_agent.server.schemas.mcp import (
+    McpServerStatusResponse,
+    McpStatusResponse,
+)
 from mini_deer_agent.server.schemas.threads import (
     HistoryItemResponse,
     MessageHistoryItemResponse,
@@ -13,7 +17,7 @@ from mini_deer_agent.server.schemas.threads import (
     ThreadHistoryPageResponse,
     ThreadResponse,
     ThreadTitleUpdateRequest,
-    TextAttachmentMetadataResponse,
+    TextAttachmentResponse,
     ToolHistoryItemResponse,
 )
 
@@ -21,6 +25,8 @@ from mini_deer_agent.server.schemas.threads import (
 __all__ = [
     "HistoryItemResponse",
     "LegacyChatStreamRequest",
+    "McpServerStatusResponse",
+    "McpStatusResponse",
     "MessageHistoryItemResponse",
     "RunEventResponse",
     "RunResponse",
@@ -29,6 +35,6 @@ __all__ = [
     "ThreadResponse",
     "ThreadTitleUpdateRequest",
     "TextAttachmentRequest",
-    "TextAttachmentMetadataResponse",
+    "TextAttachmentResponse",
     "ToolHistoryItemResponse",
 ]

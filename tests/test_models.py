@@ -98,7 +98,7 @@ def test_factory_builds_openai_compatible_model(
         captured.update(kwargs)
         return object()
 
-    monkeypatch.setattr(models, "ChatOpenAI", fake_chat_openai)
+    monkeypatch.setattr(models, "PatchedChatOpenAI", fake_chat_openai)
     settings = Settings(
         model_provider="openai-compatible",
         model_name="test-model",

@@ -3,6 +3,8 @@
 import asyncio
 import json
 from collections.abc import Sequence
+from importlib import import_module
+from pathlib import Path
 from typing import Any, Self
 
 import pytest
@@ -15,6 +17,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from langchain_core.runnables import RunnableLambda
+from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import Field
 
@@ -25,13 +28,21 @@ from mini_deer_agent.agents import (
     build_agent_graph,
     model_node,
 )
-from mini_deer_agent.tools import web_fetch, web_search
+from mini_deer_agent.skills import (
+    BuiltInSkill,
+    BuiltInSkillCatalog,
+    SkillCatalogError,
+)
+from mini_deer_agent.streaming import astream_agent_messages
+from mini_deer_agent.streaming.projector import aproject_run_events
+from mini_deer_agent.tools import get_weather, web_fetch, web_search
 
 
 class ToolAwareFakeModel(FakeMessagesListChatModel):
     """记录绑定工具并按顺序返回预设消息，避免测试访问 DeepSeek。"""
 
     bound_tool_names: list[str] = Field(default_factory=list)
+    bound_tool_name_histories: list[list[str]] = Field(default_factory=list)
     received_histories: list[list[BaseMessage]] = Field(default_factory=list)
 
     def bind_tools(
@@ -43,6 +54,7 @@ class ToolAwareFakeModel(FakeMessagesListChatModel):
     ) -> Self:
         """模拟模型绑定并保存模型实际收到的工具名称。"""
         self.bound_tool_names = [tool.name for tool in tools]
+        self.bound_tool_name_histories.append(list(self.bound_tool_names))
         return self
 
     def _generate(
@@ -60,6 +72,33 @@ class ToolAwareFakeModel(FakeMessagesListChatModel):
             run_manager=run_manager,
             **kwargs,
         )
+
+
+def _delegation_task_call(
+    call_id: str,
+    description: str,
+) -> dict[str, Any]:
+    """构造一个自包含的通用子 Agent 调用。"""
+    return {
+        "name": "task",
+        "args": {
+            "description": description,
+            "prompt": f"独立完成：{description}",
+            "subagent_type": "general-purpose",
+        },
+        "id": call_id,
+        "type": "tool_call",
+    }
+
+
+def _skill_activation_call(call_id: str, name: str) -> dict[str, Any]:
+    """构造一个只携带精确技能名称的自动激活调用。"""
+    return {
+        "name": "activate_skill",
+        "args": {"name": name},
+        "id": call_id,
+        "type": "tool_call",
+    }
 
 
 def test_model_node_returns_injected_model_response() -> None:
@@ -143,10 +182,803 @@ def test_compiled_graph_injects_prompt_without_persisting_system_message() -> No
     assert "`web_fetch`" in prompt_text
     assert "deepseek" not in prompt_text.lower()
     assert "claude" not in prompt_text.lower()
+    assert "`/structured-explainer`" in prompt_text
+    assert '<activated_skill name="structured-explainer">' not in prompt_text
     assert [type(message).__name__ for message in result["messages"]] == [
         "HumanMessage",
         "AIMessage",
     ]
+
+
+def test_compiled_graph_activates_builtin_skill_without_persisting_projection() -> None:
+    """显式 slash 应清理模型任务视图并注入技能，但 checkpoint 保留原始用户消息。"""
+    model = ToolAwareFakeModel(responses=[AIMessage(content="结构化解释完成。")])
+    graph = build_agent_graph(model)
+
+    result = graph.invoke(
+        {
+            "messages": [
+                HumanMessage(
+                    content=(
+                        "/structured-explainer 解释什么是 LangGraph checkpoint"
+                    )
+                )
+            ]
+        }
+    )
+
+    assert len(model.received_histories) == 1
+    received = model.received_histories[0]
+    assert '<activated_skill name="structured-explainer">' in received[0].text
+    assert received[-1].text == "解释什么是 LangGraph checkpoint"
+    assert result["messages"][0].text == (
+        "/structured-explainer 解释什么是 LangGraph checkpoint"
+    )
+    assert all(
+        '<activated_skill name="structured-explainer">' not in message.text
+        for message in result["messages"]
+    )
+
+
+def test_compiled_graph_automatically_activates_skill_before_final_answer() -> None:
+    """模型的可见激活调用完成后，下一次模型调用才获得技能正文。"""
+    model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    _skill_activation_call(
+                        "call-auto-activate",
+                        "structured-explainer",
+                    )
+                ],
+            ),
+            AIMessage(content="已按结构化技能完成。"),
+        ]
+    )
+    graph = build_agent_graph(model)
+
+    result = graph.invoke(
+        {
+            "messages": [
+                HumanMessage(content="请分层、通俗地解释 LangGraph checkpoint。")
+            ]
+        }
+    )
+
+    assert "activate_skill" in model.bound_tool_names
+    assert len(model.received_histories) == 2
+    assert '<activated_skill name="structured-explainer">' not in (
+        model.received_histories[0][0].text
+    )
+    assert '<activated_skill name="structured-explainer">' in (
+        model.received_histories[1][0].text
+    )
+    assert model.received_histories[1][1].text == (
+        "请分层、通俗地解释 LangGraph checkpoint。"
+    )
+    tool_result = next(
+        message for message in result["messages"] if isinstance(message, ToolMessage)
+    )
+    assert tool_result.name == "activate_skill"
+    assert json.loads(tool_result.text) == {
+        "version": 1,
+        "kind": "skill_activation",
+        "status": "activated",
+        "name": "structured-explainer",
+        "message": "技能已为当前 Run 激活。",
+    }
+    assert "### 一句话结论" not in tool_result.text
+
+
+def test_passive_run_cannot_execute_specialized_weather_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """未激活天气技能时，模型契约和执行边界都必须拒绝专用工具。"""
+    called_cities: list[str] = []
+
+    def unexpected_weather(city: str) -> str:
+        called_cities.append(city)
+        return "不应执行"
+
+    monkeypatch.setattr(get_weather, "func", unexpected_weather)
+    model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "get_weather",
+                        "args": {"city": "北京"},
+                        "id": "call-passive-weather",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="天气专用工具当前不可用。"),
+        ]
+    )
+
+    result = build_agent_graph(model).invoke(
+        {"messages": [HumanMessage(content="普通回答，不要激活技能。")]}
+    )
+
+    assert "get_weather" not in model.bound_tool_name_histories[0]
+    assert called_cities == []
+    blocked = next(
+        message
+        for message in result["messages"]
+        if isinstance(message, ToolMessage) and message.name == "get_weather"
+    )
+    assert blocked.status == "error"
+    assert json.loads(blocked.text)["reason"] == "skill_tool_not_allowed"
+
+
+def test_automatic_weather_skill_filters_schema_and_executes_allowed_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """自动激活后只绑定框架工具与天气工具，并把真实结果交回模型。"""
+    called_cities: list[str] = []
+
+    def fake_weather(city: str) -> str:
+        called_cities.append(city)
+        return "北京当前天气：晴；温度 26°C；来源 Open-Meteo。"
+
+    monkeypatch.setattr(get_weather, "func", fake_weather)
+    model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    _skill_activation_call(
+                        "call-activate-weather",
+                        "weather-briefing",
+                    )
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "get_weather",
+                        "args": {"city": "北京"},
+                        "id": "call-weather-allowed",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="北京现在晴，26°C。"),
+        ]
+    )
+
+    result = build_agent_graph(model).invoke(
+        {"messages": [HumanMessage(content="北京现在天气怎么样？")]}
+    )
+
+    restricted_names = [
+        "write_todos",
+        "ask_clarification",
+        "activate_skill",
+        "get_weather",
+    ]
+    assert "get_weather" not in model.bound_tool_name_histories[0]
+    assert model.bound_tool_name_histories[1:] == [
+        restricted_names,
+        restricted_names,
+    ]
+    assert called_cities == ["北京"]
+    assert "实际可用工具清单" in model.received_histories[1][0].text
+    assert "`get_weather`" in model.received_histories[1][0].text
+    assert "`web_search`" not in model.received_histories[1][0].text.split(
+        '<active_skill_tool_policy name="weather-briefing">', 1
+    )[1]
+    weather_result = next(
+        message
+        for message in result["messages"]
+        if isinstance(message, ToolMessage) and message.name == "get_weather"
+    )
+    assert "Open-Meteo" in weather_result.text
+    assert result["messages"][-1].text == "北京现在晴，26°C。"
+
+
+def test_slash_weather_skill_is_restricted_from_first_model_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """显式 slash 不需要激活工具，首次模型调用便只能看到天气权限集合。"""
+    monkeypatch.setattr(
+        get_weather,
+        "func",
+        lambda city: f"{city}当前天气：多云；来源 Open-Meteo。",
+    )
+    model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "get_weather",
+                        "args": {"city": "上海"},
+                        "id": "call-slash-weather",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="上海当前多云。"),
+        ]
+    )
+
+    result = build_agent_graph(model).invoke(
+        {"messages": [HumanMessage(content="/weather-briefing 上海现在天气怎么样？")]}
+    )
+
+    assert model.bound_tool_name_histories == [
+        [
+            "write_todos",
+            "ask_clarification",
+            "activate_skill",
+            "get_weather",
+        ],
+        [
+            "write_todos",
+            "ask_clarification",
+            "activate_skill",
+            "get_weather",
+        ],
+    ]
+    assert not any(
+        isinstance(message, ToolMessage) and message.name == "activate_skill"
+        for message in result["messages"]
+    )
+    assert result["messages"][-1].text == "上海当前多云。"
+
+
+def test_weather_skill_blocks_disallowed_execution_as_an_exclusive_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """受限技能伪造联网调用时不得执行，且同批获准调用也必须安全跳过。"""
+    search_queries: list[str] = []
+    weather_cities: list[str] = []
+    monkeypatch.setattr(
+        web_search,
+        "func",
+        lambda query, max_results=5: search_queries.append(query) or "不应执行",
+    )
+    monkeypatch.setattr(
+        get_weather,
+        "func",
+        lambda city: weather_cities.append(city) or "不应执行",
+    )
+    model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "web_search",
+                        "args": {"query": "北京天气"},
+                        "id": "call-weather-denied-search",
+                        "type": "tool_call",
+                    },
+                    {
+                        "name": "get_weather",
+                        "args": {"city": "北京"},
+                        "id": "call-weather-skipped-allowed",
+                        "type": "tool_call",
+                    },
+                ],
+            ),
+            AIMessage(content="已停止未授权工具批次。"),
+        ]
+    )
+
+    result = build_agent_graph(model).invoke(
+        {"messages": [HumanMessage(content="/weather-briefing 北京天气")]}
+    )
+
+    assert search_queries == []
+    assert weather_cities == []
+    tool_results = [
+        message
+        for message in result["messages"]
+        if isinstance(message, ToolMessage)
+    ]
+    assert [json.loads(message.text)["reason"] for message in tool_results] == [
+        "skill_tool_not_allowed",
+        "skill_policy_batch_rejected",
+    ]
+
+
+def test_empty_allowed_tools_keeps_only_framework_controls() -> None:
+    """显式空白名单仍保留澄清、任务清单和激活控制，不开放业务工具。"""
+    catalog = BuiltInSkillCatalog(
+        skills=(
+            BuiltInSkill(
+                name="framework-only",
+                description="只验证框架控制工具。",
+                instructions="直接回答测试问题。",
+                source_file=Path("framework-only/SKILL.md"),
+                allowed_tools=(),
+            ),
+        )
+    )
+    model = ToolAwareFakeModel(responses=[AIMessage(content="完成。")])
+
+    build_agent_graph(model, skill_catalog=catalog).invoke(
+        {"messages": [HumanMessage(content="/framework-only 执行测试。")]}
+    )
+
+    assert model.bound_tool_name_histories == [
+        ["write_todos", "ask_clarification", "activate_skill"]
+    ]
+
+
+def test_graph_rejects_skill_policy_that_names_unregistered_tool() -> None:
+    """内置资产引用未知工具时必须在构图阶段失败，不能运行时静默放宽。"""
+    catalog = BuiltInSkillCatalog(
+        skills=(
+            BuiltInSkill(
+                name="broken-policy",
+                description="引用未知工具的测试技能。",
+                instructions="不应进入模型。",
+                source_file=Path("broken-policy/SKILL.md"),
+                allowed_tools=("missing_tool",),
+            ),
+        )
+    )
+    model = ToolAwareFakeModel(responses=[AIMessage(content="不应调用。")])
+
+    with pytest.raises(SkillCatalogError, match="unknown allowed tool"):
+        build_agent_graph(model, skill_catalog=catalog)
+
+
+def test_weather_tool_policy_expires_on_next_run_in_same_thread() -> None:
+    """新用户消息必须恢复被动工具集合，不能继承上一轮天气权限。"""
+    model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(content="第一轮天气回答。"),
+            AIMessage(content="第二轮普通回答。"),
+        ]
+    )
+    graph = build_agent_graph(model, checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "weather-policy-expiry"}}
+
+    graph.invoke(
+        {"messages": [HumanMessage(content="/weather-briefing 北京天气")]},
+        config,
+    )
+    graph.invoke(
+        {"messages": [HumanMessage(content="解释普通问题。") ]},
+        config,
+    )
+
+    assert model.bound_tool_name_histories[0] == [
+        "write_todos",
+        "ask_clarification",
+        "activate_skill",
+        "get_weather",
+    ]
+    assert model.bound_tool_name_histories[1] == [
+        "web_search",
+        "web_fetch",
+        "write_todos",
+        "ask_clarification",
+        "activate_skill",
+        "task",
+    ]
+    assert '<active_skill_tool_policy name="weather-briefing">' in (
+        model.received_histories[0][0].text
+    )
+    assert "<active_skill_tool_policy" not in (
+        model.received_histories[1][0].text
+    )
+
+
+def test_async_slash_weather_executes_registered_coroutine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Web 使用的异步主图必须执行天气协程，并保持相同白名单。"""
+    called_cities: list[str] = []
+
+    async def fake_weather(city: str) -> str:
+        called_cities.append(city)
+        return f"{city}当前天气：晴；来源 Open-Meteo。"
+
+    monkeypatch.setattr(get_weather, "coroutine", fake_weather)
+    model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "get_weather",
+                        "args": {"city": "广州"},
+                        "id": "call-async-weather",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="广州当前晴。"),
+        ]
+    )
+
+    result = asyncio.run(
+        build_agent_graph(model).ainvoke(
+            {"messages": [HumanMessage(content="/weather-briefing 广州天气")]}
+        )
+    )
+
+    assert called_cities == ["广州"]
+    assert result["messages"][-1].text == "广州当前晴。"
+
+
+def test_automatic_skill_activation_reaches_product_tool_event() -> None:
+    """自动激活结果必须进入版本化产品流，供现有通用工具卡直接展示。"""
+
+    async def collect_events() -> list:
+        """运行真实异步消息流和产品事件投影，不绕过 Web 使用的边界。"""
+        model = ToolAwareFakeModel(
+            responses=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        _skill_activation_call(
+                            "call-visible-activation",
+                            "structured-explainer",
+                        )
+                    ],
+                ),
+                AIMessage(content="结构化解释完成。"),
+            ]
+        )
+        return [
+            event
+            async for event in aproject_run_events(
+                astream_agent_messages(
+                    build_agent_graph(model),
+                    [HumanMessage(content="结构化解释 checkpoint。")],
+                ),
+                run_id="run-visible-activation",
+                thread_id="thread-visible-activation",
+            )
+        ]
+
+    run_events = asyncio.run(collect_events())
+    tool_event = next(event for event in run_events if event.event == "tool_result")
+
+    assert tool_event.payload["name"] == "activate_skill"
+    assert tool_event.payload["tool_call_id"] == "call-visible-activation"
+    assert json.loads(tool_event.payload["content"])["status"] == "activated"
+    assert "### 一句话结论" not in tool_event.payload["content"]
+
+
+def test_skill_activation_is_exclusive_and_settles_mixed_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """激活调用必须独占本批，普通工具和 task 都不得抢跑或悬空。"""
+    search_queries: list[str] = []
+
+    def unexpected_search(query: str, max_results: int = 5) -> str:
+        search_queries.append(query)
+        return "不应执行"
+
+    monkeypatch.setattr(web_search, "func", unexpected_search)
+    model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "web_search",
+                        "args": {"query": "不应搜索"},
+                        "id": "call-auto-skipped-search",
+                        "type": "tool_call",
+                    },
+                    _skill_activation_call(
+                        "call-auto-exclusive",
+                        "structured-explainer",
+                    ),
+                    _delegation_task_call("call-auto-skipped-task", "不应委派"),
+                ],
+            ),
+            AIMessage(content="激活后直接完成。"),
+        ]
+    )
+
+    result = build_agent_graph(model).invoke(
+        {"messages": [HumanMessage(content="结构化解释 checkpoint。")]}
+    )
+
+    assert search_queries == []
+    tool_results = [
+        message for message in result["messages"] if isinstance(message, ToolMessage)
+    ]
+    assert [message.tool_call_id for message in tool_results] == [
+        "call-auto-skipped-search",
+        "call-auto-exclusive",
+        "call-auto-skipped-task",
+    ]
+    assert json.loads(tool_results[0].text)["reason"] == (
+        "skill_activation_requested"
+    )
+    assert tool_results[1].status == "success"
+    assert json.loads(tool_results[2].text)["reason"] == (
+        "skill_activation_requested"
+    )
+
+
+def test_skill_activation_is_idempotent_but_cannot_switch_within_run() -> None:
+    """同一 Run 可重复确认同名技能，但不能借后续调用切换到另一个技能。"""
+    catalog = BuiltInSkillCatalog(
+        skills=(
+            BuiltInSkill(
+                name="alpha-skill",
+                description="Alpha 测试技能。",
+                instructions="ALPHA_SKILL_BODY",
+                source_file=Path("alpha-skill/SKILL.md"),
+            ),
+            BuiltInSkill(
+                name="beta-skill",
+                description="Beta 测试技能。",
+                instructions="BETA_SKILL_BODY",
+                source_file=Path("beta-skill/SKILL.md"),
+            ),
+        )
+    )
+    model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[_skill_activation_call("call-alpha-1", "alpha-skill")],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[_skill_activation_call("call-alpha-2", "alpha-skill")],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[_skill_activation_call("call-beta", "beta-skill")],
+            ),
+            AIMessage(content="保持 Alpha 完成。"),
+        ]
+    )
+
+    result = build_agent_graph(model, skill_catalog=catalog).invoke(
+        {"messages": [HumanMessage(content="执行需要 Alpha 的任务。")]}
+    )
+
+    assert len(model.received_histories) == 4
+    assert all(
+        "ALPHA_SKILL_BODY" in history[0].text
+        for history in model.received_histories[1:]
+    )
+    assert all("BETA_SKILL_BODY" not in history[0].text for history in model.received_histories)
+    tool_results = [
+        message
+        for message in result["messages"]
+        if isinstance(message, ToolMessage) and message.name == "activate_skill"
+    ]
+    assert [message.status for message in tool_results] == [
+        "success",
+        "success",
+        "error",
+    ]
+    assert json.loads(tool_results[-1].text)["reason"] == (
+        "skill_activation_conflict"
+    )
+
+
+def test_explicit_slash_skill_cannot_be_replaced_by_automatic_activation() -> None:
+    """显式 slash 对当前 Run 有最高优先级，模型后续激活调用只能失败关闭。"""
+    model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    _skill_activation_call(
+                        "call-after-explicit",
+                        "structured-explainer",
+                    )
+                ],
+            ),
+            AIMessage(content="继续按显式技能完成。"),
+        ]
+    )
+
+    result = build_agent_graph(model).invoke(
+        {
+            "messages": [
+                HumanMessage(
+                    content="/structured-explainer 解释 checkpoint"
+                )
+            ]
+        }
+    )
+
+    assert len(model.received_histories) == 2
+    assert all(
+        '<activated_skill name="structured-explainer">' in history[0].text
+        for history in model.received_histories
+    )
+    tool_result = next(
+        message for message in result["messages"] if isinstance(message, ToolMessage)
+    )
+    assert tool_result.status == "error"
+    assert json.loads(tool_result.text)["reason"] == "explicit_skill_active"
+
+
+def test_unknown_or_empty_skill_command_finishes_without_calling_model() -> None:
+    """确定性的 slash 错误应直接形成 Assistant 结果，不能消耗模型请求。"""
+    for user_text, expected in [
+        ("/missing-skill 执行任务", "未找到内置技能 `/missing-skill`"),
+        (
+            "/structured-explainer",
+            "请在 `/structured-explainer` 后提供任务内容",
+        ),
+    ]:
+        model = ToolAwareFakeModel(responses=[AIMessage(content="不应调用。")])
+        graph = build_agent_graph(model)
+
+        result = graph.invoke({"messages": [HumanMessage(content=user_text)]})
+
+        assert model.received_histories == []
+        assert expected in result["messages"][-1].text
+
+
+def test_skill_command_failure_reaches_async_product_event_stream() -> None:
+    """确定性技能错误必须产生 Assistant delta，真实 Web 页面才能看到原因。"""
+
+    async def collect_events() -> list:
+        """运行与 Web Run 相同的异步消息和产品事件投影链。"""
+        model = ToolAwareFakeModel(responses=[AIMessage(content="不应调用。")])
+        graph = build_agent_graph(model)
+        message_events = astream_agent_messages(
+            graph,
+            [HumanMessage(content="/missing-skill 执行任务")],
+        )
+        events = [
+            event
+            async for event in aproject_run_events(
+                message_events,
+                run_id="run-skill-failure",
+                thread_id="thread-skill-failure",
+            )
+        ]
+        assert model.received_histories == []
+        return events
+
+    run_events = asyncio.run(collect_events())
+
+    assert [event.event for event in run_events] == [
+        "run_started",
+        "ai_delta",
+        "run_completed",
+    ]
+    assert "未找到内置技能 `/missing-skill`" in (
+        run_events[1].payload["text"]
+    )
+
+
+def test_skill_activation_applies_to_all_model_calls_in_current_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同一 Run 的工具循环必须持续携带技能，不能只约束首次模型调用。"""
+    monkeypatch.setattr(
+        web_search,
+        "func",
+        lambda query, max_results=5: json.dumps(
+            {"query": query, "results": []},
+            ensure_ascii=False,
+        ),
+    )
+    model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "web_search",
+                        "args": {"query": "LangGraph checkpoint"},
+                        "id": "call-skill-search",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="按技能格式完成。"),
+        ]
+    )
+    graph = build_agent_graph(model)
+
+    graph.invoke(
+        {
+            "messages": [
+                HumanMessage(
+                    content="/structured-explainer 解释 LangGraph checkpoint"
+                )
+            ]
+        }
+    )
+
+    assert len(model.received_histories) == 2
+    assert all(
+        '<activated_skill name="structured-explainer">' in history[0].text
+        for history in model.received_histories
+    )
+
+
+def test_skill_activation_expires_on_next_run_in_same_thread() -> None:
+    """新用户消息开始的新 Run 不得继承上一轮显式技能系统指令。"""
+    model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(content="第一轮完成。"),
+            AIMessage(content="第二轮直接回答。"),
+        ]
+    )
+    graph = build_agent_graph(model, checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "skill-expiry-thread"}}
+
+    graph.invoke(
+        {
+            "messages": [
+                HumanMessage(
+                    content="/structured-explainer 解释 checkpoint"
+                )
+            ]
+        },
+        config,
+    )
+    graph.invoke(
+        {"messages": [HumanMessage(content="只回答：2 + 2 等于几？")]},
+        config,
+    )
+
+    assert '<activated_skill name="structured-explainer">' in (
+        model.received_histories[0][0].text
+    )
+    assert '<activated_skill name="structured-explainer">' not in (
+        model.received_histories[1][0].text
+    )
+    assert model.received_histories[1][-1].text == "只回答：2 + 2 等于几？"
+
+
+def test_automatic_skill_activation_expires_on_next_run_in_same_thread() -> None:
+    """自动激活只从最新 HumanMessage 后取证，下一 Run 不能继承旧工具结果。"""
+    model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    _skill_activation_call(
+                        "call-auto-expiry",
+                        "structured-explainer",
+                    )
+                ],
+            ),
+            AIMessage(content="第一轮按技能完成。"),
+            AIMessage(content="第二轮直接回答。"),
+        ]
+    )
+    graph = build_agent_graph(model, checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "auto-skill-expiry-thread"}}
+
+    graph.invoke(
+        {"messages": [HumanMessage(content="分层解释 checkpoint。")]},
+        config,
+    )
+    graph.invoke(
+        {"messages": [HumanMessage(content="只回答：3 + 3 等于几？")]},
+        config,
+    )
+
+    assert '<activated_skill name="structured-explainer">' not in (
+        model.received_histories[0][0].text
+    )
+    assert '<activated_skill name="structured-explainer">' in (
+        model.received_histories[1][0].text
+    )
+    assert '<activated_skill name="structured-explainer">' not in (
+        model.received_histories[2][0].text
+    )
+    assert model.received_histories[2][-1].text == "只回答：3 + 3 等于几？"
 
 
 def test_graph_uses_registered_tools_instead_of_prompt_context_claims() -> None:
@@ -179,9 +1011,30 @@ def test_graph_uses_registered_tools_instead_of_prompt_context_claims() -> None:
     assert captured_contexts == [
         AgentPromptContext(
             agent_name="定制 Agent",
-            available_tool_names=("web_search", "web_fetch"),
+            available_tool_names=(
+                "web_search",
+                "web_fetch",
+                "write_todos",
+                "ask_clarification",
+                "activate_skill",
+                "task",
+            ),
+            available_skills=BuiltInSkillCatalog.discover().summaries,
         )
     ]
+
+
+def test_empty_skill_catalog_compiles_without_exposing_activation_tool() -> None:
+    """没有技能时条件图仍可编译运行，模型也不应看到无意义的激活工具。"""
+    model = ToolAwareFakeModel(responses=[AIMessage(content="直接完成。")])
+
+    result = build_agent_graph(
+        model,
+        skill_catalog=BuiltInSkillCatalog(skills=()),
+    ).invoke({"messages": [HumanMessage(content="普通问题。")]})
+
+    assert "activate_skill" not in model.bound_tool_names
+    assert result["messages"][-1].text == "直接完成。"
 
 
 def test_compiled_graph_executes_web_search_and_returns_final_answer(
@@ -233,7 +1086,14 @@ def test_compiled_graph_executes_web_search_and_returns_final_answer(
         {"messages": [HumanMessage(content="搜索 Mini Deer 最新消息并附来源。")]}
     )
 
-    assert model.bound_tool_names == ["web_search", "web_fetch"]
+    assert model.bound_tool_names == [
+        "web_search",
+        "web_fetch",
+        "write_todos",
+        "ask_clarification",
+        "activate_skill",
+        "task",
+    ]
     assert called_queries == [("Mini Deer 最新消息", 3)]
     assert len(result["messages"]) == 4
     assert isinstance(result["messages"][2], ToolMessage)
@@ -243,6 +1103,45 @@ def test_compiled_graph_executes_web_search_and_returns_final_answer(
     assert result["messages"][3].text.endswith(
         "https://example.com/mini-deer"
     )
+
+
+def test_compiled_graph_exposes_and_executes_injected_mcp_tool() -> None:
+    """MCP 工具必须和内置工具共用模型绑定、ToolNode 与回环。"""
+    calls: list[tuple[int, int]] = []
+
+    def add_numbers(left: int, right: int) -> int:
+        calls.append((left, right))
+        return left + right
+
+    mcp_tool = StructuredTool.from_function(
+        add_numbers,
+        name="learning_add_numbers",
+        description="通过学习 MCP Server 把两个整数相加",
+    )
+    model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "learning_add_numbers",
+                        "args": {"left": 19, "right": 23},
+                        "id": "call-mcp-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="MCP 计算结果是 42。"),
+        ]
+    )
+
+    result = build_agent_graph(model, mcp_tools=(mcp_tool,)).invoke(
+        {"messages": [HumanMessage(content="请通过 MCP 计算 19+23。")]}
+    )
+
+    assert "learning_add_numbers" in model.bound_tool_names
+    assert calls == [(19, 23)]
+    assert result["messages"][-1].text == "MCP 计算结果是 42。"
 
 
 def test_compiled_graph_can_search_fetch_and_cite_full_page(
@@ -341,6 +1240,561 @@ def test_compiled_graph_ends_when_model_does_not_request_tool() -> None:
 
     assert len(result["messages"]) == 2
     assert result["messages"][1].text == "你好，我是 Mini Deer Agent。"
+
+
+def test_compiled_graph_delegates_with_isolated_context_and_synthesizes_result() -> None:
+    """主 Agent 应把自包含任务交给独立子图，再读取结构化结果完成回答。"""
+    delegated_prompt = "比较方案 A 和方案 B，只返回各自优缺点。"
+    model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "task",
+                        "args": {
+                            "description": "比较两个方案",
+                            "prompt": delegated_prompt,
+                            "subagent_type": "general-purpose",
+                        },
+                        "id": "call-task-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="方案 A 更简单，方案 B 扩展性更好。"),
+            AIMessage(content="综合来看，当前阶段优先选择方案 A。"),
+        ]
+    )
+
+    result = build_agent_graph(model).invoke(
+        {"messages": [HumanMessage(content="请比较方案 A 和方案 B，并给出建议。")]}
+    )
+
+    assert model.bound_tool_name_histories == [
+        [
+            "web_search",
+            "web_fetch",
+            "write_todos",
+            "ask_clarification",
+            "activate_skill",
+            "task",
+        ],
+        ["web_search", "web_fetch"],
+        [
+            "web_search",
+            "web_fetch",
+            "write_todos",
+            "ask_clarification",
+            "activate_skill",
+            "task",
+        ],
+    ]
+    assert len(model.received_histories) == 3
+    assert [type(message).__name__ for message in model.received_histories[1]] == [
+        "SystemMessage",
+        "HumanMessage",
+    ]
+    assert model.received_histories[1][1].text == delegated_prompt
+    assert "请比较方案 A 和方案 B" not in model.received_histories[1][1].text
+
+    task_result = next(
+        message
+        for message in result["messages"]
+        if isinstance(message, ToolMessage) and message.name == "task"
+    )
+    payload = json.loads(task_result.text)
+    assert payload == {
+        "version": 1,
+        "kind": "subagent_result",
+        "status": "completed",
+        "subagent_type": "general-purpose",
+        "description": "比较两个方案",
+        "result": "方案 A 更简单，方案 B 扩展性更好。",
+    }
+    assert result["messages"][-1].text == "综合来看，当前阶段优先选择方案 A。"
+
+
+def test_delegation_skips_coemitted_tools_and_settles_every_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同一响应出现 task 时只执行首个委派，其他工具必须跳过并补齐结果。"""
+    search_queries: list[str] = []
+
+    def unexpected_search(query: str, max_results: int = 5) -> str:
+        search_queries.append(query)
+        return "不应执行"
+
+    monkeypatch.setattr(web_search, "func", unexpected_search)
+    model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "web_search",
+                        "args": {"query": "不应搜索"},
+                        "id": "call-skipped-by-task",
+                        "type": "tool_call",
+                    },
+                    {
+                        "name": "task",
+                        "args": {
+                            "description": "独立分析",
+                            "prompt": "独立分析这个问题。",
+                            "subagent_type": "general-purpose",
+                        },
+                        "id": "call-priority-task",
+                        "type": "tool_call",
+                    },
+                ],
+            ),
+            AIMessage(content="子 Agent 结果。"),
+            AIMessage(content="主 Agent 已核验结果。"),
+        ]
+    )
+
+    result = build_agent_graph(model).invoke(
+        {"messages": [HumanMessage(content="分析并搜索这个问题。")]}
+    )
+
+    assert search_queries == []
+    tool_results = [
+        message for message in result["messages"] if isinstance(message, ToolMessage)
+    ]
+    assert [message.tool_call_id for message in tool_results] == [
+        "call-skipped-by-task",
+        "call-priority-task",
+    ]
+    assert tool_results[0].status == "error"
+    assert json.loads(tool_results[0].text)["reason"] == (
+        "delegation_batch_exclusive"
+    )
+    assert json.loads(tool_results[1].text)["status"] == "completed"
+
+
+def test_async_delegation_runs_three_tasks_concurrently_and_preserves_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """三个独立 task 必须重叠执行，但 ToolMessage 仍按模型调用顺序返回。"""
+    subagent_module = import_module("mini_deer_agent.agents.subagent")
+
+    async def scenario() -> None:
+        started: list[str] = []
+        completion_order: list[str] = []
+        all_started = asyncio.Event()
+        delays = {
+            "独立完成：任务一": 0.03,
+            "独立完成：任务二": 0.015,
+            "独立完成：任务三": 0.0,
+        }
+
+        async def concurrent_runner(model: Any, prompt: str) -> str:
+            del model
+            started.append(prompt)
+            if len(started) == 3:
+                all_started.set()
+            # 串行实现会在第一个任务永久等待，因此该屏障可以证明任务确实重叠启动。
+            await all_started.wait()
+            await asyncio.sleep(delays[prompt])
+            completion_order.append(prompt)
+            return f"{prompt}的结果"
+
+        monkeypatch.setattr(
+            subagent_module,
+            "async_run_subagent",
+            concurrent_runner,
+        )
+        model = ToolAwareFakeModel(
+            responses=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        _delegation_task_call("call-parallel-1", "任务一"),
+                        _delegation_task_call("call-parallel-2", "任务二"),
+                        _delegation_task_call("call-parallel-3", "任务三"),
+                    ],
+                ),
+                AIMessage(content="已综合三个独立结果。"),
+            ]
+        )
+
+        result = await asyncio.wait_for(
+            build_agent_graph(model).ainvoke(
+                {"messages": [HumanMessage(content="并发完成三个独立任务。")]}
+            ),
+            timeout=1,
+        )
+
+        assert len(started) == 3
+        assert completion_order == [
+            "独立完成：任务三",
+            "独立完成：任务二",
+            "独立完成：任务一",
+        ]
+        tool_results = [
+            message
+            for message in result["messages"]
+            if isinstance(message, ToolMessage)
+        ]
+        assert [message.tool_call_id for message in tool_results] == [
+            "call-parallel-1",
+            "call-parallel-2",
+            "call-parallel-3",
+        ]
+        assert [json.loads(message.text)["result"] for message in tool_results] == [
+            "独立完成：任务一的结果",
+            "独立完成：任务二的结果",
+            "独立完成：任务三的结果",
+        ]
+        assert result["messages"][-1].text == "已综合三个独立结果。"
+
+    asyncio.run(scenario())
+
+
+def test_delegation_limits_each_batch_and_settles_mixed_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """一批只执行前三个 task，额外 task 与混入的普通工具都必须明确跳过。"""
+    subagent_module = import_module("mini_deer_agent.agents.subagent")
+    executed_prompts: list[str] = []
+
+    def run_without_model(model: Any, prompt: str) -> str:
+        del model
+        executed_prompts.append(prompt)
+        return f"{prompt}的结果"
+
+    monkeypatch.setattr(subagent_module, "run_subagent", run_without_model)
+    model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "web_search",
+                        "args": {"query": "不应执行"},
+                        "id": "call-mixed-search",
+                        "type": "tool_call",
+                    },
+                    _delegation_task_call("call-batch-1", "批次一"),
+                    _delegation_task_call("call-batch-2", "批次二"),
+                    _delegation_task_call("call-batch-3", "批次三"),
+                    _delegation_task_call("call-batch-4", "批次四"),
+                ],
+            ),
+            AIMessage(content="已使用允许的结果。"),
+        ]
+    )
+
+    result = build_agent_graph(model).invoke(
+        {"messages": [HumanMessage(content="执行一批并发任务。")]}
+    )
+
+    assert sorted(executed_prompts) == [
+        "独立完成：批次一",
+        "独立完成：批次三",
+        "独立完成：批次二",
+    ]
+    tool_results = [
+        message for message in result["messages"] if isinstance(message, ToolMessage)
+    ]
+    assert [message.tool_call_id for message in tool_results] == [
+        "call-mixed-search",
+        "call-batch-1",
+        "call-batch-2",
+        "call-batch-3",
+        "call-batch-4",
+    ]
+    assert json.loads(tool_results[0].text)["reason"] == (
+        "delegation_batch_exclusive"
+    )
+    assert json.loads(tool_results[-1].text)["reason"] == (
+        "delegation_concurrency_limit"
+    )
+
+
+def test_delegation_enforces_six_task_total_across_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同一产品 Run 的后续批次累计到六次后，新的 task 必须失败关闭。"""
+    subagent_module = import_module("mini_deer_agent.agents.subagent")
+    executed_prompts: list[str] = []
+
+    def run_without_model(model: Any, prompt: str) -> str:
+        del model
+        executed_prompts.append(prompt)
+        return f"{prompt}的结果"
+
+    monkeypatch.setattr(subagent_module, "run_subagent", run_without_model)
+    model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    _delegation_task_call(f"call-total-{index}", f"总量{index}")
+                    for index in range(1, 4)
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    _delegation_task_call(f"call-total-{index}", f"总量{index}")
+                    for index in range(4, 7)
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    _delegation_task_call("call-total-7", "总量7")
+                ],
+            ),
+            AIMessage(content="已达到委派上限并完成综合。"),
+        ]
+    )
+
+    result = build_agent_graph(model).invoke(
+        {"messages": [HumanMessage(content="分批执行独立任务。")]}
+    )
+
+    assert len(executed_prompts) == 6
+    rejected = next(
+        message
+        for message in result["messages"]
+        if isinstance(message, ToolMessage)
+        and message.tool_call_id == "call-total-7"
+    )
+    assert rejected.status == "error"
+    assert json.loads(rejected.text)["reason"] == "delegation_total_limit"
+    assert result["messages"][-1].text == "已达到委派上限并完成综合。"
+
+
+def test_parallel_delegation_isolates_failure_and_cancels_all_children(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """单个失败不能拖垮兄弟任务，而父 Run 取消必须取消全部仍在运行的子图。"""
+    subagent_module = import_module("mini_deer_agent.agents.subagent")
+
+    async def failure_scenario() -> None:
+        async def partly_failing_runner(model: Any, prompt: str) -> str:
+            del model
+            if prompt.endswith("失败任务"):
+                raise RuntimeError("不应泄露的异常")
+            return f"{prompt}的成功结果"
+
+        monkeypatch.setattr(
+            subagent_module,
+            "async_run_subagent",
+            partly_failing_runner,
+        )
+        model = ToolAwareFakeModel(
+            responses=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        _delegation_task_call("call-success", "成功任务"),
+                        _delegation_task_call("call-failure", "失败任务"),
+                    ],
+                ),
+                AIMessage(content="已使用成功结果并说明失败。"),
+            ]
+        )
+        result = await build_agent_graph(model).ainvoke(
+            {"messages": [HumanMessage(content="并发执行，允许部分失败。")]}
+        )
+        tool_results = [
+            message
+            for message in result["messages"]
+            if isinstance(message, ToolMessage)
+        ]
+        assert json.loads(tool_results[0].text)["status"] == "completed"
+        assert json.loads(tool_results[1].text)["status"] == "failed"
+        assert "不应泄露的异常" not in tool_results[1].text
+
+    async def cancellation_scenario() -> None:
+        started = asyncio.Event()
+        started_count = 0
+        cancelled_prompts: list[str] = []
+
+        async def cancellable_runner(model: Any, prompt: str) -> str:
+            nonlocal started_count
+            del model
+            started_count += 1
+            if started_count == 3:
+                started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled_prompts.append(prompt)
+                raise
+
+        monkeypatch.setattr(
+            subagent_module,
+            "async_run_subagent",
+            cancellable_runner,
+        )
+        model = ToolAwareFakeModel(
+            responses=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        _delegation_task_call(f"call-cancel-{index}", f"取消{index}")
+                        for index in range(1, 4)
+                    ],
+                )
+            ]
+        )
+        graph_task = asyncio.create_task(
+            build_agent_graph(model).ainvoke(
+                {"messages": [HumanMessage(content="启动后取消全部任务。")]}
+            )
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+        graph_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await graph_task
+
+        assert sorted(cancelled_prompts) == [
+            "独立完成：取消1",
+            "独立完成：取消2",
+            "独立完成：取消3",
+        ]
+
+    asyncio.run(failure_scenario())
+    asyncio.run(cancellation_scenario())
+
+
+def test_clarification_ends_current_graph_without_second_model_call() -> None:
+    """澄清结果写入历史后必须直接结束，不能把问题结果再次交给模型。"""
+    model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "ask_clarification",
+                        "args": {
+                            "question": "报告的主题和用途是什么？",
+                            "clarification_type": "missing_info",
+                        },
+                        "id": "call-clarification-stop",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+    )
+
+    result = build_agent_graph(model).invoke(
+        {"messages": [HumanMessage(content="帮我生成一份报告。")]}
+    )
+
+    assert len(model.received_histories) == 1
+    assert [type(message).__name__ for message in result["messages"]] == [
+        "HumanMessage",
+        "AIMessage",
+        "ToolMessage",
+    ]
+    tool_result = result["messages"][-1]
+    assert isinstance(tool_result, ToolMessage)
+    assert tool_result.name == "ask_clarification"
+    assert json.loads(tool_result.text)["question"] == "报告的主题和用途是什么？"
+
+
+def test_clarification_skips_coemitted_tools_and_settles_every_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同一响应一旦要求澄清，其他工具不能执行且每个调用都要有结果。"""
+    search_queries: list[str] = []
+
+    def unexpected_search(query: str, max_results: int = 5) -> str:
+        search_queries.append(query)
+        return "不应执行"
+
+    monkeypatch.setattr(web_search, "func", unexpected_search)
+    model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "web_search",
+                        "args": {"query": "不应搜索"},
+                        "id": "call-skipped-search",
+                        "type": "tool_call",
+                    },
+                    {
+                        "name": "ask_clarification",
+                        "args": {
+                            "question": "请先确认报告主题？",
+                            "clarification_type": "missing_info",
+                        },
+                        "id": "call-priority-clarification",
+                        "type": "tool_call",
+                    },
+                ],
+            )
+        ]
+    )
+
+    result = build_agent_graph(model).invoke(
+        {"messages": [HumanMessage(content="生成报告并搜索资料。")]}
+    )
+
+    assert search_queries == []
+    assert len(model.received_histories) == 1
+    tool_results = [
+        message for message in result["messages"] if isinstance(message, ToolMessage)
+    ]
+    assert [message.tool_call_id for message in tool_results] == [
+        "call-skipped-search",
+        "call-priority-clarification",
+    ]
+    assert tool_results[0].status == "error"
+    assert json.loads(tool_results[0].text)["reason"] == "clarification_requested"
+    assert tool_results[1].status == "success"
+
+
+def test_same_thread_continues_after_user_answers_clarification() -> None:
+    """下一 Run 只提交回答时，checkpoint 仍应提供原请求和澄清问题。"""
+    model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "ask_clarification",
+                        "args": {
+                            "question": "报告的主题是什么？",
+                            "clarification_type": "missing_info",
+                        },
+                        "id": "call-clarification-resume",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="我会继续生成 Agent 架构报告。"),
+        ]
+    )
+    graph = build_agent_graph(model, checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "thread-clarification"}}
+
+    graph.invoke(
+        {"messages": [HumanMessage(content="帮我生成一份报告。")]},
+        config,
+    )
+    result = graph.invoke(
+        {"messages": [HumanMessage(content="主题是 Agent 架构。")]},
+        config,
+    )
+
+    assert len(model.received_histories) == 2
+    assert [message.text for message in model.received_histories[1][1:]] == [
+        "帮我生成一份报告。",
+        "",
+        result["messages"][2].text,
+        "主题是 Agent 架构。",
+    ]
+    assert result["messages"][-1].text == "我会继续生成 Agent 架构报告。"
 
 
 def test_in_memory_checkpointer_resumes_same_thread_state() -> None:

@@ -4,6 +4,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 
 from mini_deer_agent.core import Settings
+from mini_deer_agent.llms.patched import PatchedChatOpenAI
 
 
 def create_chat_model(settings: Settings | None = None) -> ChatOpenAI:
@@ -31,7 +32,10 @@ def create_chat_model(settings: Settings | None = None) -> ChatOpenAI:
     if provider == "openai":
         # 官方 OpenAI 的新文本生成调用优先使用 Responses API。
         model_kwargs["use_responses_api"] = True
-    elif provider == "openai-compatible":
+        # ChatOpenAI 在这里仅保存客户端配置；调用 invoke/stream 时才会访问网络。
+        return ChatOpenAI(**model_kwargs)
+
+    if provider == "openai-compatible":
         # 第三方兼容网关没有统一默认地址，也未必支持 Responses API。
         if settings.api_base_url is None:
             raise ValueError(
@@ -39,11 +43,11 @@ def create_chat_model(settings: Settings | None = None) -> ChatOpenAI:
             )
         model_kwargs["base_url"] = str(settings.api_base_url)
         model_kwargs["use_responses_api"] = False
-    else:
-        raise ValueError(f"Unsupported model provider: {settings.model_provider}")
+        # DeepSeek 等兼容网关在 thinking 模式返回 reasoning_content；
+        # 用 patched 子类捕获思考过程，并在多轮工具调用时回传该字段。
+        return PatchedChatOpenAI(**model_kwargs)
 
-    # ChatOpenAI 在这里仅保存客户端配置；调用 invoke/stream 时才会访问网络。
-    return ChatOpenAI(**model_kwargs)
+    raise ValueError(f"Unsupported model provider: {settings.model_provider}")
 
 
 def invoke_once(message: str, model: BaseChatModel | None = None) -> str:

@@ -2,9 +2,11 @@
 
 > 文档状态：当前有效。
 >
-> 最后更新：2026-08-30。
+> 最后更新：2026-09-03。
 >
 > 本文只记录会频繁变化的实施计划、完成进度、验证状态和近期任务。稳定的项目目标与架构约束见 `PROJECT.md`，已经由用户验证的学习结论见 `LEARNING.md`。
+>
+> 当前优先级：前端体验优化停止，下一主线为第 13 阶段「项目工作区与 Agent Coding」。独立计划见 [阶段计划](docs/plans/project-workspace-coding-stage.md)，当前仅规划、待确认，未开始实现。Agent 编排历史路线保留在 `docs/plans/agent-capability-roadmap.md`；下文旧的「下一项 12.19 / 等待指定」不再作为执行入口。
 
 ## 状态定义
 
@@ -22,17 +24,30 @@
 | ---------------- | ------ | ----------------------------------------------------------------------------------- |
 | 配置             | 已实现 | Pydantic Settings、`.env`、SecretStr 和模型配置边界                                 |
 | 模型             | 已实现 | 通过 OpenAI-compatible 接口调用 DeepSeek V4 Flash                                   |
-| Agent 图         | 已实现 | LangGraph `model → tools → model` 条件循环                                          |
-| Prompt Builder   | 已实现 | 版本化 SystemMessage 已接入并通过真实浏览器验证；只定义产品身份，不注入底层模型名称 |
-| 工具             | 已实现 | 工具注册表和真实 Open-Meteo 天气查询                                                |
+| Agent 图         | 已实现 | 主工具循环 + clarification/skill activation/policy block 专用分支 + 并发 delegation 子图 |
+| Prompt 工程      | 已实现 | SystemMessage 引入行为、工具、skills、动态时间、摘要、Durable Context 与 Memory 规则（v16） |
+| Plan mode        | 已实现 | write_todos 规划工具 + 任务清单展示，Prompt 升级 v6（12.2）                              |
+| Clarification    | 已实现 | 后端闭环（12.3）+ v1 专用交互（12.4）+ v2 完整七种字段（12.5—12.6）                    |
+| Sub-agent        | 已实现 | 12.7—12.8：独立子图、受控工具、每批并发 3 个、每 Run 累计 6 个及取消传播              |
+| Skills           | 已实现 | 12.9—12.11：内置发现、显式/自动激活、专用工具与 allowed-tools 双层权限             |
+| 动态上下文       | 已实现 | 12.12：主/子 Agent 每次调用注入宿主日期、时间、星期与 UTC 偏移，不落盘             |
+| 上下文摘要       | 已实现 | 12.13：主/子 Agent 自动压缩 checkpoint，产品历史保持完整，已完成真实线程验证       |
+| Durable Context  | 已实现 | 12.14：委派、技能引用和 Todo 在摘要后确定性续接，且不跨 Run 继承技能权限           |
+| 长期 Memory      | 已实现 | 12.15：本地单用户显式 CRUD，跨 Thread/重启持久化，禁止静默自动写入                 |
+| MCP              | 已实现 | 12.16：静态可信配置、stdio/HTTP、多服务器隔离发现、状态接口与主图工具注入           |
+| 工具             | 已实现 | 主图被动注册内置工具与启动时 MCP 快照；天气 Skill 专用 get_weather                  |
 | 网页搜索与引用   | 已实现 | 搜索来源卡、行内引用、来源面板和刷新恢复均已通过真实浏览器验证                      |
 | 网页正文读取     | 已实现 | 安全抓取、正文提取、读取卡、引用复用和刷新恢复均已通过真实浏览器验证                |
+| 文本附件         | 已实现 | 内联 UTF-8 文本附件及代码/配置类型扩展（11.6）均已通过真实浏览器验证                |
+| 历史附件正文     | 已实现 | 历史消息附件可展开查看正文，已通过真实浏览器验证（11.7）                              |
 | 中断工具历史     | 已实现 | 模型边界修复 dangling tool calls 和孤儿 ToolMessage                                 |
 | Checkpointer     | 已实现 | SQLite 跨进程恢复同一 Thread 的 LangGraph 状态                                      |
 | Run 协议         | 已实现 | version、sequence、run ID、thread ID 和稳定消息身份                                 |
 | 产品历史         | 已实现 | 独立应用 SQLite 保存 Thread、Run、Message、Tool 和统一时间线                        |
 | Web              | 已实现 | React、TypeScript、增量 SSE、事件校验、聊天和刷新恢复                               |
 | 对话窗口渲染     | 已实现 | 安全 Markdown、轮次投影、可折叠工具、粘底滚动和复制均已通过真实浏览器验证           |
+| 执行过程折叠     | 已实现 | 工具调用与中间回复折叠进「执行过程」，澄清卡与最终回答直接展示（12.17）            |
+| 思考过程展示     | 已实现 | 捕获 DeepSeek reasoning_content 并折叠展示，刷新后可恢复（12.18）                 |
 | 服务端取消       | 已实现 | 后台异步 Task、幂等取消 API、`run_interrupted` 和中断恢复                           |
 | Thread 管理      | 已实现 | 刷新续接、新建隔离、历史分页、最近列表、选择持久化和旧 Thread 切换均已验证          |
 | 会话标题         | 已实现 | 首条消息默认标题、PATCH 改名、刷新持久化和失败重试均已通过真实浏览器验证            |
@@ -46,6 +61,20 @@
 | 认证与多租户     | 规划中 | 当前仍是本地单用户开发边界                                                          |
 
 当前系统已经形成生产架构骨架，但不具备公开部署所需的完整安全性、可靠性和运维能力。
+
+## 最近完成功能点：12.18 展示 CoT（已验证）
+
+- 12.17 前端折叠：`ConversationTurn` 把工具调用与中间回复折叠进「执行过程」，澄清卡与最终回答
+  始终直接展示；折叠的是过程噪音，不是交互与交付物。
+- 12.18 思考过程捕获：新增 `PatchedChatOpenAI` 捕获 DeepSeek `reasoning_content`（流式/非流式/
+  多轮回传），投影为 `reasoning_delta` 事件，经 v8 迁移持久化到 `messages.reasoning`，前端折叠
+  展示「思考过程」并支持刷新恢复。
+- 顺带修复：子 Agent 递归上限 8 → 20（此前「调研 Rust/Go」子 Agent 触发 `GraphRecursionError`）；
+  补充 Agent 执行流日志（Run 生命周期、工具调用、子 Agent）与 logging 配置，便于卡住时定位。
+- 自动化结果：后端 `239 passed`；前端 vitest 通过；typecheck / lint / build / `git diff --check`
+  通过。
+- 用户已在真实浏览器验证思考过程折叠展示与历史恢复，并确认子 Agent 委派正常，回复「已验证」。
+- 当前暂停，等待用户指定下一项；下一连续编号是 12.19。工具循环检测和工具输出预算均继续后置。
 
 ## 当前实施点
 
@@ -144,8 +173,10 @@
    为来源卡，Assistant 回答显示行内引用与去重来源面板，刷新后从持久历史完整恢复。
 8. 功能点 11.5“网页正文抓取与深度阅读闭环”已通过用户真实浏览器验证：Agent 能执行
    `web_search → web_fetch → 最终引用回答`，网页读取卡与引用可在刷新后恢复。
-9. 下一业务功能使用连续编号 11.6；继续优先选择用户可直接使用的业务能力，进入实现前
-   仍按 A（极简设计）或 B（直接编码）开始。
+9. 功能点 11.6“扩展文本附件支持类型”已通过用户真实浏览器验证：内联文本附件从 4 类
+   扩展到代码/配置等 27 个扩展名，历史恢复复用同一媒体类型白名单。
+10. 下一业务功能使用连续编号 11.7；继续优先选择用户可直接使用的业务能力，进入实现前
+    仍按 A（极简设计）或 B（直接编码）开始。
 
 功能点 11.1 最终结果：
 
@@ -209,6 +240,19 @@
   Prettier、生产 build 和 Python `compileall` 均通过。
 - 真实公网冒烟成功读取 `https://example.com/`；用户已完成浏览器中的直接读取、搜索后
   深读、引用与刷新恢复验证，状态由“待验证”更新为“已实现”。
+
+功能点 11.6 最终结果：
+
+- 内联文本附件类型白名单从 `.txt/.md/.json/.csv` 扩展到 `.py/.js/.jsx/.ts/.tsx/.go/
+  .java/.c/.h/.cpp/.hpp/.rs/.sql/.sh/.html/.htm/.css/.scss/.yaml/.yml/.xml/.toml`。
+- 后端 `_MEDIA_TYPES_BY_EXTENSION` 与前端 `MEDIA_TYPES_BY_EXTENSION` 保持逐项一致，
+  服务端继续按扩展名推导 media_type，不信任客户端声明。
+- 新增 `isSupportedTextAttachmentMediaType` 类型守卫，历史恢复 `parseTextAttachments`
+  复用同一映射，消除第二处硬编码白名单；前端 Composer 的 `accept` 与提示文案同步扩展。
+- 自动化结果：后端 `108 passed`；前端 22 files / `156 passed`；TypeScript、ESLint、
+  Prettier、生产 build 和 `git diff --check` 均通过。
+- 用户已完成真实浏览器验证，状态由“待验证”更新为“已实现”，结论已写入
+  `LEARNING.md` 功能点 11.6。
 
 ## 实施路线
 

@@ -98,8 +98,39 @@ describe("文本附件输入", () => {
     });
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "仅支持 .txt、.md、.json、.csv",
+      "不支持该文件类型，仅支持文本类附件",
     );
     expect(screen.queryByText("brief.pdf")).not.toBeInTheDocument();
+  });
+
+  it("接受代码文件并推导对应媒体类型", async () => {
+    const onSubmit = vi.fn(() => Promise.resolve(true));
+    render(
+      <Composer
+        isActive={false}
+        onSubmit={onSubmit}
+        onCancel={() => Promise.resolve(true)}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("添加文本附件"), {
+      target: { files: [new File(["print(1)"], "main.py")] },
+    });
+
+    expect(await screen.findByText("main.py")).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox", { name: "向 Agent 提问" }), {
+      target: { value: "运行这段代码" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce());
+    expect(onSubmit).toHaveBeenCalledWith("运行这段代码", [
+      {
+        filename: "main.py",
+        mediaType: "text/x-python",
+        sizeBytes: 8,
+        content: "print(1)",
+      },
+    ]);
   });
 });

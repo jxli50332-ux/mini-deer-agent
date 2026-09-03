@@ -59,6 +59,7 @@ class _RunProjectionState:
         ] = {}
         self.provider_to_logical_id: dict[str, str] = {}
         self.anonymous_ai_generation = 0
+        self.finish_reason = "stop"
 
     def _event(
         self,
@@ -107,6 +108,17 @@ class _RunProjectionState:
                         payload={"text": message.text},
                     )
                 )
+            reasoning = message.additional_kwargs.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning:
+                # 思考过程与最终回答同属一条 assistant 消息，共享 message_id，
+                # 前端据此把两者合并到同一个消息气泡里折叠展示。
+                projected.append(
+                    self._event(
+                        "reasoning_delta",
+                        message_id=message_id,
+                        payload={"text": reasoning},
+                    )
+                )
 
             for chunk in message.tool_call_chunks:
                 index = int(chunk.get("index") or 0)
@@ -127,6 +139,13 @@ class _RunProjectionState:
                         state["logical_id"]
                     )
                 if chunk.get("name"):
+                    if state["name"] is None:
+                        # 只在工具名首次出现时记录，避免参数分片刷屏。
+                        logger.info(
+                            "模型发起工具调用：run_id=%s tool=%s",
+                            self.run_id,
+                            chunk["name"],
+                        )
                     state["name"] = str(chunk["name"])
 
                 projected.append(
@@ -146,6 +165,9 @@ class _RunProjectionState:
             return projected
 
         if isinstance(message, ToolMessage):
+            if message.name == "ask_clarification" and message.status == "success":
+                # 澄清是正常完成的 Agent 回合，不应与用户取消或执行失败混淆。
+                self.finish_reason = "clarification_requested"
             provider_id = str(message.tool_call_id)
             message_id = _public_message_id(
                 self.run_namespace,
@@ -167,6 +189,13 @@ class _RunProjectionState:
                         "content": message.text,
                     },
                 )
+            )
+            logger.info(
+                "工具返回结果：run_id=%s tool=%s tool_call_id=%s result_chars=%d",
+                self.run_id,
+                message.name,
+                message.tool_call_id,
+                len(message.text),
             )
         return projected
 
@@ -192,7 +221,7 @@ class _RunProjectionState:
         return self._event(
             "run_completed",
             message_id=None,
-            payload={"finish_reason": "stop"},
+            payload={"finish_reason": self.finish_reason},
         )
 
 

@@ -11,6 +11,7 @@ from mini_deer_agent.application import (
     RunStreamService,
     ThreadLifecycleService,
 )
+from mini_deer_agent.mcp import McpRuntime
 
 
 def get_run_stream_service(request: Request) -> RunStreamService:
@@ -84,3 +85,17 @@ def get_run_event_history_service(request: Request) -> RunEventHistoryService:
             },
         )
     return cast(RunEventHistoryService, service)
+
+
+def get_mcp_runtime(request: Request) -> McpRuntime:
+    """取得应用启动时冻结的 MCP 工具与状态快照。"""
+    runtime = getattr(request.app.state, "mcp_runtime", None)
+    if runtime is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "service_not_ready",
+                "message": "MCP runtime is not ready",
+            },
+        )
+    return cast(McpRuntime, runtime)

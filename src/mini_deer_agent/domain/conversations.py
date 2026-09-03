@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from mini_deer_agent.domain.attachments import TextAttachmentMetadata
+from mini_deer_agent.domain.attachments import TextAttachment
 
 
 type ThreadStatus = Literal["idle", "busy", "error"]
@@ -83,7 +83,7 @@ class StoredRunEventRecord:
 
 @dataclass(frozen=True, slots=True)
 class MessageHistoryItem:
-    """表示用户或模型产生的一条稳定可见消息。"""
+    """表示用户或模型产生的一条稳定消息及其结构化交互元数据。"""
 
     kind: Literal["message"]
     item_id: str
@@ -93,7 +93,10 @@ class MessageHistoryItem:
     role: Literal["user", "assistant"]
     content: str
     created_at: str
-    attachments: tuple[TextAttachmentMetadata, ...] = ()
+    reasoning: str | None = None
+    attachments: tuple[TextAttachment, ...] = ()
+    hidden_from_ui: bool = False
+    human_input_response: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)

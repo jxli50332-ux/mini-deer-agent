@@ -1,8 +1,12 @@
-import type { ChatTimelineItem } from "@/entities/message/model/types";
-import type { TextAttachmentMetadata } from "@/entities/attachment/model/text-attachments";
+import type {
+  ChatTimelineItem,
+  HumanInputResponseMetadata,
+} from "@/entities/message/model/types";
+import type { TextAttachmentContent } from "@/entities/attachment/model/text-attachments";
 import type {
   AiDeltaEvent,
   ChatRunEvent,
+  ReasoningDeltaEvent,
   ToolCallDeltaEvent,
   ToolResultEvent,
 } from "@/features/chat/model/events";
@@ -41,7 +45,9 @@ export type ChatRunAction =
       readonly userMessage: {
         readonly id: string;
         readonly content: string;
-        readonly attachments?: readonly TextAttachmentMetadata[];
+        readonly attachments?: readonly TextAttachmentContent[];
+        readonly hiddenFromUi?: boolean;
+        readonly humanInputResponse?: HumanInputResponseMetadata;
       };
     }
   | { readonly type: "run/event-received"; readonly event: ChatRunEvent }
@@ -194,6 +200,51 @@ function reduceAiDelta(state: ChatRunState, event: AiDeltaEvent): ChatRunState {
     timeline: replaceTimelineItem(state.timeline, index, {
       ...current,
       content: current.content + event.payload.text,
+    }),
+  };
+}
+
+function reduceReasoningDelta(
+  state: ChatRunState,
+  event: ReasoningDeltaEvent,
+): ChatRunState {
+  // 思考过程与最终回答共享同一 assistant 消息；先到先建，后到合并。
+  const messageId = event.messageId ?? `${event.runId}:assistant`;
+  const index = state.timeline.findIndex((item) => item.id === messageId);
+
+  if (index === -1) {
+    return {
+      ...state,
+      lastSequence: event.sequence,
+      timeline: [
+        ...state.timeline,
+        {
+          kind: "message",
+          id: messageId,
+          role: "assistant",
+          content: "",
+          reasoning: event.payload.text,
+        },
+      ],
+    };
+  }
+
+  const current = state.timeline[index];
+  if (current?.kind !== "message" || current.role !== "assistant") {
+    return protocolFailure(
+      state,
+      "message_id_collision",
+      "思考过程消息 ID 与已有时间线项目冲突",
+      event.sequence,
+    );
+  }
+
+  return {
+    ...state,
+    lastSequence: event.sequence,
+    timeline: replaceTimelineItem(state.timeline, index, {
+      ...current,
+      reasoning: (current.reasoning ?? "") + event.payload.text,
     }),
   };
 }
@@ -418,6 +469,8 @@ function reduceRunEvent(
       };
     case "ai_delta":
       return reduceAiDelta(state, event);
+    case "reasoning_delta":
+      return reduceReasoningDelta(state, event);
     case "tool_call_delta":
       return reduceToolCallDelta(state, event);
     case "tool_result":
@@ -515,6 +568,12 @@ export function chatRunReducer(
             ...(action.userMessage.attachments?.length
               ? { attachments: action.userMessage.attachments }
               : {}),
+            ...(action.userMessage.hiddenFromUi === true
+              ? { hiddenFromUi: true }
+              : {}),
+            ...(action.userMessage.humanInputResponse === undefined
+              ? {}
+              : { humanInputResponse: action.userMessage.humanInputResponse }),
           },
         ],
         error: null,

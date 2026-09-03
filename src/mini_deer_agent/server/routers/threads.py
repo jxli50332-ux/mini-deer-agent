@@ -26,7 +26,7 @@ from mini_deer_agent.server.schemas import (
     ThreadHistoryPageResponse,
     ThreadResponse,
     ThreadTitleUpdateRequest,
-    TextAttachmentMetadataResponse,
+    TextAttachmentResponse,
     ToolHistoryItemResponse,
 )
 
@@ -206,10 +206,13 @@ def _history_item_response(
             kind="message",
             role=item.role,
             content=item.content,
+            reasoning=item.reasoning,
             attachments=[
-                TextAttachmentMetadataResponse(**asdict(attachment))
+                TextAttachmentResponse(**asdict(attachment))
                 for attachment in item.attachments
             ],
+            hidden_from_ui=item.hidden_from_ui,
+            human_input_response=item.human_input_response,
             **common,
         )
     return ToolHistoryItemResponse(

@@ -318,3 +318,26 @@ def test_stream_agent_messages_keeps_tool_result_and_accumulates_by_id(
     assert [
         metadata["langgraph_node"] for message, metadata in events if message.text
     ] == ["tools", "model", "model", "model", "model"]
+
+
+def test_projector_emits_reasoning_delta_for_reasoning_content() -> None:
+    """携带 reasoning_content 的 assistant chunk 应投影出 reasoning_delta 事件。"""
+    from mini_deer_agent.streaming.projector import project_run_events
+
+    chunk = AIMessageChunk(
+        content="",
+        id="message-1",
+        additional_kwargs={"reasoning_content": "先分析问题，再回答。"},
+    )
+    events = list(
+        project_run_events(
+            [(chunk, {})],
+            run_id="11111111-1111-4111-8111-111111111111",
+            thread_id="22222222-2222-4222-8222-222222222222",
+        )
+    )
+
+    reasoning = [event for event in events if event.event == "reasoning_delta"]
+    assert len(reasoning) == 1
+    assert reasoning[0].payload["text"] == "先分析问题，再回答。"
+    assert reasoning[0].message_id is not None

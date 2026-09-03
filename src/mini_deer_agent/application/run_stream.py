@@ -1,12 +1,15 @@
 """编排一次 Agent 流式运行，不依赖 FastAPI 或具体传输协议。"""
 
 from collections.abc import AsyncIterator, Callable, Iterator
+from functools import partial
 
 from langchain_core.messages import HumanMessage
+from langchain_core.tools import BaseTool
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph.state import CompiledStateGraph
 
 from mini_deer_agent.agents import build_agent_graph
+from mini_deer_agent.application.memory import MemoryStore
 from mini_deer_agent.domain import TextAttachment
 from mini_deer_agent.streaming import (
     AgentMessageEvent,
@@ -23,32 +26,44 @@ type AgentGraphFactory = Callable[[BaseCheckpointSaver], CompiledStateGraph]
 def _human_message(
     message: str,
     attachments: tuple[TextAttachment, ...],
+    human_input_response: dict[str, object] | None = None,
 ) -> HumanMessage:
-    """构造写入 checkpoint 的用户消息；可见正文与附件元数据保持分离。"""
-    if not attachments:
+    """构造 checkpoint 用户消息；正文、附件和澄清关联保持分离。"""
+    additional_kwargs: dict[str, object] = {}
+    if attachments:
+        additional_kwargs["text_attachments"] = [
+            {
+                "filename": item.filename,
+                "media_type": item.media_type,
+                "size_bytes": item.size_bytes,
+                "content": item.content,
+            }
+            for item in attachments
+        ]
+    if human_input_response is not None:
+        additional_kwargs["hide_from_ui"] = True
+        additional_kwargs["human_input_response"] = dict(human_input_response)
+    if not additional_kwargs:
         return HumanMessage(content=message)
     return HumanMessage(
         content=message,
-        additional_kwargs={
-            "text_attachments": [
-                {
-                    "filename": item.filename,
-                    "media_type": item.media_type,
-                    "size_bytes": item.size_bytes,
-                    "content": item.content,
-                }
-                for item in attachments
-            ]
-        },
+        additional_kwargs=additional_kwargs,
     )
 
 
 def build_default_agent_graph(
     checkpointer: BaseCheckpointSaver,
+    *,
+    memory_store: MemoryStore | None = None,
+    mcp_tools: tuple[BaseTool, ...] = (),
 ) -> CompiledStateGraph:
     """使用应用持有的 checkpointer 构建默认主 Agent 图。"""
     # 默认路径在真正开始请求时才创建模型，健康检查不依赖模型密钥是否已经配置。
-    return build_agent_graph(checkpointer=checkpointer)
+    return build_agent_graph(
+        checkpointer=checkpointer,
+        memory_store=memory_store,
+        mcp_tools=mcp_tools,
+    )
 
 
 class RunStreamService:
@@ -58,11 +73,21 @@ class RunStreamService:
         self,
         checkpointer: BaseCheckpointSaver,
         *,
+        memory_store: MemoryStore | None = None,
+        mcp_tools: tuple[BaseTool, ...] = (),
         graph_factory: AgentGraphFactory = build_default_agent_graph,
     ) -> None:
         """保存 checkpoint 和可替换构图工厂，不负责 HTTP 或 Run 注册。"""
         self._checkpointer = checkpointer
-        self._graph_factory = graph_factory
+        self._graph_factory = (
+            partial(
+                graph_factory,
+                memory_store=memory_store,
+                mcp_tools=mcp_tools,
+            )
+            if graph_factory is build_default_agent_graph
+            else graph_factory
+        )
 
     def stream_messages(
         self,
@@ -85,13 +110,14 @@ class RunStreamService:
         message: str,
         thread_id: str,
         attachments: tuple[TextAttachment, ...] = (),
+        human_input_response: dict[str, object] | None = None,
     ) -> AsyncIterator[AgentMessageEvent]:
         """异步运行指定 Thread，供后台 asyncio Task 驱动。"""
         graph = self._graph_factory(self._checkpointer)
         config = {"configurable": {"thread_id": thread_id}}
         async for event in astream_agent_messages(
             graph,
-            [_human_message(message, attachments)],
+            [_human_message(message, attachments, human_input_response)],
             config,
         ):
             yield event
@@ -102,10 +128,16 @@ class RunStreamService:
         thread_id: str,
         run_id: str,
         attachments: tuple[TextAttachment, ...] = (),
+        human_input_response: dict[str, object] | None = None,
     ) -> AsyncIterator[RunEvent]:
         """把异步 LangGraph 消息投影为当前 Run 的版本化产品事件。"""
         projected_events = aproject_run_events(
-            self.astream_messages(message, thread_id, attachments),
+            self.astream_messages(
+                message,
+                thread_id,
+                attachments,
+                human_input_response,
+            ),
             run_id=run_id,
             thread_id=thread_id,
         )

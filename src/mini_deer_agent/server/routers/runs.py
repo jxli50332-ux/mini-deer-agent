@@ -68,6 +68,7 @@ async def stream_thread_run(
             str(thread_id),
             str(request.message_id),
             request.to_domain_attachments(),
+            request.to_domain_human_input_response(),
         )
     except ActiveRunConflictError as exc:
         # 并发 Run 和重复客户端消息 ID 都是稳定冲突，不能作为内部异常泄露。

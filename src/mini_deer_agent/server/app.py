@@ -1,6 +1,8 @@
 """创建 FastAPI 应用并管理后端资源的完整生命周期。"""
 
-from collections.abc import Callable
+import logging
+import sys
+from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import cast
 
@@ -18,11 +20,30 @@ from mini_deer_agent.application import (
     ThreadLifecycleService,
 )
 from mini_deer_agent.core import Settings
+from mini_deer_agent.mcp import McpRuntime, initialize_mcp_runtime
 from mini_deer_agent.persistence import (
     open_async_sqlite_checkpointer,
     open_async_sqlite_conversation_repository,
 )
-from mini_deer_agent.server.routers import health, runs, threads
+from mini_deer_agent.server.routers import health, mcp, runs, threads
+from mini_deer_agent.tools import get_reserved_agent_tool_names
+
+
+def _configure_logging() -> None:
+    """把 mini_deer_agent 的 INFO 日志接入 stderr，用于排查 Agent 执行流。
+
+    uvicorn 只配置自己的 logger，不会自动提升应用 logger 的级别；
+    这里显式把应用日志设为 INFO，并避免重复添加 handler。
+    """
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    app_logger = logging.getLogger("mini_deer_agent")
+    app_logger.setLevel(logging.INFO)
+    if not app_logger.handlers:
+        app_logger.addHandler(handler)
+    app_logger.propagate = False
 
 
 type SettingsFactory = Callable[[], Settings]
@@ -46,6 +67,7 @@ type ConversationHistoryServiceFactory = Callable[
     [ConversationRepository],
     ConversationHistoryService,
 ]
+type McpRuntimeFactory = Callable[..., Awaitable[McpRuntime]]
 
 
 def create_lifespan(
@@ -53,9 +75,10 @@ def create_lifespan(
     settings_factory: SettingsFactory,
     checkpointer_context_factory: CheckpointerContextFactory,
     conversation_repository_context_factory: ConversationRepositoryContextFactory,
-    run_stream_service_factory: RunStreamServiceFactory,
+    run_stream_service_factory: RunStreamServiceFactory | None,
     run_execution_manager_factory: RunExecutionManagerFactory,
     conversation_history_service_factory: ConversationHistoryServiceFactory,
+    mcp_runtime_factory: McpRuntimeFactory,
 ) -> Callable[[FastAPI], AbstractAsyncContextManager[None]]:
     """组合可替换的启动依赖，供生产应用和离线测试复用。"""
 
@@ -69,11 +92,25 @@ def create_lifespan(
             async with conversation_repository_context_factory(
                 str(settings.application_database_path)
             ) as conversation_repository:
+                mcp_runtime = await mcp_runtime_factory(
+                    settings.mcp_config_path,
+                    timeout_seconds=settings.mcp_server_init_timeout_seconds,
+                    reserved_tool_names=get_reserved_agent_tool_names(),
+                )
                 # 路由只能经 dependencies 模块取得服务，不能自行构建模型或数据库连接。
                 app.state.settings = settings
-                run_stream_service = run_stream_service_factory(
-                    checkpointer,
-                    conversation_repository,
+                app.state.mcp_runtime = mcp_runtime
+                run_stream_service = (
+                    run_stream_service_factory(
+                        checkpointer,
+                        conversation_repository,
+                    )
+                    if run_stream_service_factory is not None
+                    else RunStreamService(
+                        checkpointer,
+                        memory_store=conversation_repository,
+                        mcp_tools=mcp_runtime.tools,
+                    )
                 )
                 run_execution_manager = run_execution_manager_factory(
                     run_stream_service,
@@ -105,6 +142,7 @@ def create_lifespan(
                     del app.state.conversation_history_service
                     del app.state.run_execution_manager
                     del app.state.run_stream_service
+                    del app.state.mcp_runtime
                     del app.state.settings
 
     return lifespan
@@ -119,17 +157,17 @@ def create_app(
     conversation_repository_context_factory: ConversationRepositoryContextFactory = (
         open_async_sqlite_conversation_repository
     ),
-    run_stream_service_factory: RunStreamServiceFactory = (
-        lambda checkpointer, _repository: RunStreamService(checkpointer)
-    ),
+    run_stream_service_factory: RunStreamServiceFactory | None = None,
     run_execution_manager_factory: RunExecutionManagerFactory = (
         RunExecutionManager
     ),
     conversation_history_service_factory: ConversationHistoryServiceFactory = (
         ConversationHistoryService
     ),
+    mcp_runtime_factory: McpRuntimeFactory = initialize_mcp_runtime,
 ) -> FastAPI:
     """创建带版本化路由和可注入生命周期资源的 FastAPI 应用。"""
+    _configure_logging()
     application = FastAPI(
         title="Mini Deer Agent API",
         description="Mini Deer Agent 的版本化运行与流式事件接口。",
@@ -145,11 +183,13 @@ def create_app(
             conversation_history_service_factory=(
                 conversation_history_service_factory
             ),
+            mcp_runtime_factory=mcp_runtime_factory,
         ),
     )
 
     # 正式路由和兼容路由集中在工厂注册，避免模块导入时分散修改全局 app。
     application.include_router(health.router)
+    application.include_router(mcp.router)
     application.include_router(threads.router)
     application.include_router(runs.router)
     application.include_router(health.legacy_router)

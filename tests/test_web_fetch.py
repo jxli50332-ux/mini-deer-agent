@@ -31,6 +31,8 @@ def test_web_fetch_exposes_model_visible_contract() -> None:
     assert tuple(tool.name for tool in get_agent_tools()) == (
         "web_search",
         "web_fetch",
+        "write_todos",
+        "ask_clarification",
     )
 
 

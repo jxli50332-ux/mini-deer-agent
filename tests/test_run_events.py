@@ -135,3 +135,52 @@ def test_projector_redacts_internal_failure_and_ends_with_run_error(
     }
     assert "sk-private" not in str(run_events[-1].to_data())
     assert "sk-private" not in caplog.text
+
+
+def test_projector_marks_clarification_as_successful_completed_run() -> None:
+    """提出澄清是正常完成的回合，应区别于取消、失败和普通停止。"""
+    events: list[AgentMessageEvent] = [
+        (
+            AIMessageChunk(
+                content="",
+                id="message-clarification-request",
+                tool_call_chunks=[
+                    {
+                        "name": "ask_clarification",
+                        "args": '{"question":"报告主题是什么？"}',
+                        "id": "call-clarification-event",
+                        "index": 0,
+                        "type": "tool_call_chunk",
+                    }
+                ],
+            ),
+            {"langgraph_node": "model"},
+        ),
+        (
+            ToolMessage(
+                content='{"kind":"human_input_request"}',
+                name="ask_clarification",
+                tool_call_id="call-clarification-event",
+                id="clarification:call-clarification-event",
+            ),
+            {"langgraph_node": "clarification"},
+        ),
+    ]
+
+    run_events = list(
+        project_run_events(
+            events,
+            run_id="run-clarification",
+            thread_id="thread-clarification",
+        )
+    )
+
+    assert [event.event for event in run_events] == [
+        "run_started",
+        "tool_call_delta",
+        "tool_result",
+        "run_completed",
+    ]
+    assert run_events[-1].payload == {
+        "finish_reason": "clarification_requested"
+    }

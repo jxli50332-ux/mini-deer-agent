@@ -5,6 +5,8 @@ from typing import Protocol
 
 from langchain_core.messages import SystemMessage
 
+from mini_deer_agent.skills import SkillSummary
+
 
 @dataclass(frozen=True, slots=True)
 class AgentPromptContext:
@@ -12,6 +14,7 @@ class AgentPromptContext:
 
     agent_name: str = "Mini Deer Agent"
     available_tool_names: tuple[str, ...] = ()
+    available_skills: tuple[SkillSummary, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

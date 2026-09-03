@@ -10365,3 +10365,2075 @@ Python compileall：通过
 
 网页正文抓取与深度阅读闭环已经完成 DeerFlow/Mini Deer 源码对照、测试驱动实现、整库
 自动化检查、真实公网冒烟和用户浏览器验证。下一业务功能点使用连续编号 11.6。
+
+## 功能点 11.6：扩展文本附件支持类型
+
+#### 本功能点目标
+
+Mini Deer 的内联文本附件此前只接受 `.txt`、`.md`、`.json`、`.csv` 四类，无法覆盖
+Agent 最常见的代码与配置阅读场景。本功能点保持「内联文本附件」机制不变——正文仍由
+前端读取后随消息 JSON 提交、不落盘——只把类型白名单扩展到代码、Web 标记与配置文件，
+让模型能直接阅读 `.py`、`.tsx`、`.yaml` 等内容。
+
+#### 与 DeerFlow 的对应关系
+
+DeerFlow 的 `uploads` 是通用 multipart 上传，任意文件都落盘为 artifact，不设「文本/
+代码」白名单；它只有 `file_conversion.py` 的 `CONVERTIBLE_EXTENSIONS`（pdf/ppt/pptx/
+xls/xlsx/doc/docx）负责把二进制文档转成 markdown。因此 DeerFlow 没有可复用的「文本
+类型白名单」——Mini Deer 选择更轻的内联文本路线，类型清单是 Mini Deer 自己的产品
+决策，必须集中定义并保持前后端一致。
+
+#### 类型白名单的单一事实源
+
+后端 `attachments.py` 的 `_MEDIA_TYPES_BY_EXTENSION` 仍是服务端推导 media_type 的唯一
+来源；前端 `text-attachments.ts` 的 `MEDIA_TYPES_BY_EXTENSION` 与之逐项一致。媒体类型
+始终由服务端按扩展名推导，不信任客户端的 `File.type` 声明。
+
+#### 历史恢复白名单的类型守卫
+
+此前 `thread-history.ts` 的 `parseTextAttachments` 硬编码了 4 个 media_type，扩展类型时
+极易漏改。本次新增 `isSupportedTextAttachmentMediaType(value): value is
+TextAttachmentMediaType` 类型守卫，历史恢复复用同一映射做 `unknown → 字面量联合`
+的收窄，消除了第二处白名单副本。
+
+#### 完整调用链
+
+```text
+用户选文件
+    → 前端 validateFilename（扩展名 → media_type，白名单校验）
+    → 随消息 JSON 提交
+    → 后端 validate_text_attachment_batch（服务端重新推导 + 数量/大小校验）
+    → middleware 投影进模型上下文（含 HTML 转义中和）
+    → 历史恢复 parseTextAttachments（类型守卫复用映射）
+```
+
+#### 自动化与真实验证
+
+自动化结果：
+
+```text
+后端 pytest：108 passed
+前端 vitest：22 files / 156 passed
+TypeScript typecheck、ESLint、Prettier、生产 build：通过
+git diff --check：通过
+```
+
+用户已在真实浏览器完成验证并明确回复「已验证」。
+
+### 功能点 11.6 小结
+
+- 为什么内联文本附件的类型白名单必须是前后端共享的单一事实源。
+- 为什么历史恢复要用类型守卫复用映射，而不是再维护一份硬编码白名单。
+- 为什么 DeerFlow 的通用上传不设文本白名单，而内联附件路线需要自己定义类型边界。
+
+## 功能点 11.7：历史附件正文查看
+
+#### 本功能点目标
+
+内联文本附件此前只展示文件名、类型和大小，用户无法在历史消息里重新查看附件正文。
+本功能点让历史消息的附件卡片可以展开查看完整正文，补全附件闭环。
+
+#### 诊断：正文其实已持久化
+
+排查发现正文其实已经写入 SQLite 的 `text_attachments.content`，只是历史查询的
+`SELECT` 没有取出 `content`，响应 schema 也只返回元数据，前端自然没有正文可展示。
+因此这不是「没持久化」，而是「历史查询链路没有暴露 content」。
+
+#### 落地内容
+
+- 后端 `TextAttachmentMetadataResponse` 改为 `TextAttachmentResponse`，新增 `content`
+  字段；用共享 `TextAttachmentMediaType` 类型别名修复 media_type 白名单遗漏。
+- 历史查询 SQL 补 `content`，返回完整 `TextAttachment`；删除未使用的
+  `TextAttachmentMetadata`。
+- 前端 `MessageTimelineItem.attachments` 携带 `content`，历史解析校验 `content`。
+- 前端 `ConversationTurn` 用 `<details>` 折叠，点击展开 `<pre>` 查看正文。
+
+#### 自动化与真实验证
+
+自动化结果：
+
+```text
+后端 pytest：109 passed
+前端 vitest：23 files / 157 passed
+typecheck、ESLint、Prettier、生产 build：通过
+```
+
+用户已在真实浏览器验证：历史消息附件可展开查看正文，明确回复「已验证」。
+
+### 功能点 11.7 小结
+
+- 为什么「看不到正文」可能是「查询链路没暴露字段」而不是「没持久化」。
+- 为什么历史附件的 media_type 白名单要与领域模型共用单一事实源。
+- 为什么附件正文作为不可信文本，用 `<pre>` 渲染即可由 React 自动转义。
+
+# 第 12 课：Agent 编排能力学习路线
+
+> 本课是项目重心调整后的新主题：不再做次要业务功能补全，而是对照 DeerFlow 逐个落地
+> 「让 Agent 变聪明」的编排能力。完整路线见 `docs/plans/agent-capability-roadmap.md`。
+
+## 功能点 12.1：System Prompt 工程升级
+
+#### 本功能点目标
+
+Mini Deer 原来的 System Prompt（v4）只有身份、行为、工具策略、保密四个简短区块，
+缺少 DeerFlow 里「先分析、分解任务、优先澄清」的行为引导，导致同一个模型在 Mini
+Deer 里回答更短、更少结构、更少主动澄清。本功能点把 DeerFlow 的 `<thinking_style>`、
+`<response_style>`、`<critical_reminders>` 三个区块引入 Mini Deer，版本升到 v5。
+
+#### 与 DeerFlow 的对应关系
+
+DeerFlow 的 `agents/lead_agent/prompt.py` 用 `SYSTEM_PROMPT_TEMPLATE` 动态拼装 15 个
+区块，其中直接决定「思维链复杂度」的是：
+
+- `<thinking_style>`：先思考、拆解任务、优先澄清，思考用于规划、回答用于交付。
+- `<clarification_system>`：强制「CLARIFY → PLAN → ACT」，模糊需求先追问。
+- `<response_style>`：回答风格约束。
+- `<critical_reminders>`：Clarification First、Always Respond 等。
+
+Mini Deer 没有这些区块，模型自然倾向于直接给一个简短回答。
+
+#### 落地内容
+
+`templates.py` 升级为 `mini-deer-agent/system/v5`，新增：
+
+- `<thinking_style>`：先简明分析请求、拆解小步骤、优先澄清。
+- `<response_style>`：直接清晰、结论优先、避免过度格式化。
+- `<critical_reminders>`：先澄清再行动、引用必须来自真实工具返回。
+
+#### 边界
+
+阶段 1 只做 Prompt 层的行为引导，不引入 `ask_clarification` 工具（阶段 3）。因此现在
+「澄清」体现为模型在回答里先指出需要澄清的点，而不是真的中断等待回复。DeerFlow 的
+subagent / skills / memory / sandbox 区块一律不照搬，留到对应阶段。
+
+#### 自动化与真实验证
+
+自动化结果：
+
+```text
+后端 pytest：109 passed（新增 thinking/clarification 断言）
+git diff --check：通过
+```
+
+用户在真实环境验证：模型会先向用户确认模糊事项，回答比之前更强。
+
+### 功能点 12.1 小结
+
+- 为什么 Prompt 工程是「让 Agent 变聪明」成本最低、最直接的手段。
+- 为什么「先分析、分解、澄清」的行为引导能显著提升回答的结构与主动性。
+- 为什么阶段 1 只做行为引导、不引入澄清工具，避免跨阶段把职责混在一起。
+
+## 功能点 12.2：Plan mode（Todo 规划工具）
+
+#### 本功能点目标
+
+让 Agent 对 3 步以上的复杂任务先用 `write_todos` 建立任务清单、执行中实时更新，从而
+产生更长的思维链和更结构化的执行过程。
+
+#### 与 DeerFlow 的对应关系
+
+DeerFlow 的 `TodoMiddleware` 继承 LangChain 的 `TodoListMiddleware`，维护独立的 `todos`
+state channel，并额外做了「提前退出预防」和「上下文丢失检测」。Mini Deer 用手写图 +
+`MessagesState`，没有中间件机制，因此走更简单路线：`write_todos` 的结果作为 `ToolMessage`
+进入消息历史并随 checkpoint 持久化，天然「记住」todo 状态，无需额外的 state channel。
+
+#### 落地内容
+
+- 后端 `tools/todos.py` 新增 `write_todos` 结构化工具，参数为完整清单快照，返回稳定
+  JSON；注册进 `get_agent_tools()`。
+- Prompt 升级为 `mini-deer-agent/system/v6`，新增 `<planning>`：3+ 步先列清单、完成
+  立即更新、保持恰好一个 `in_progress`、简单任务不要用。
+- 前端 `todo-list.ts` 解析工具结果，`ToolActivity` 把 `write_todos` 渲染为带状态色的
+  任务清单。
+
+#### 自动化与真实验证
+
+自动化结果：
+
+```text
+后端 pytest：112 passed
+前端 vitest：24 files / 162 passed
+typecheck、ESLint、Prettier、生产 build：通过
+```
+
+用户已在真实浏览器验证：复杂任务会先列计划并展示任务清单。
+
+### 功能点 12.2 小结
+
+- 为什么 `write_todos` 结果作为 ToolMessage 持久化，就能记住 todo 状态而无需额外 state channel。
+- 为什么工具结果用稳定 JSON 才能同时服务模型读取和前端解析。
+- 为什么 Prompt 的 planning 区块（何时用 / 何时不用）是让模型正确使用工具的关键。
+
+## 功能点 12.3：Clarification 后端闭环
+
+#### 本功能点目标
+
+当用户请求缺少会影响正确性或安全性的关键条件、存在高影响歧义或需要风险确认时，
+Agent 必须调用 `ask_clarification`，展示明确问题并结束当前 Run，不能自行猜测、继续
+调用其他工具或生成假装已经执行的结果。用户通过普通输入框回答后，在同一 Thread
+创建新 Run，并利用 checkpoint 中的历史继续任务。
+
+#### 与 DeerFlow 的对应关系
+
+DeerFlow 的 `clarification_tool.py` 只定义模型可见参数；实际运行由
+`ClarificationMiddleware.wrap_tool_call()` 在工具执行前拦截。中间件构造带稳定
+`request_id` 和 `artifact.human_input` 的 `ToolMessage`，再返回
+`Command(update={"messages": [...]}, goto=END)`。`goto=END` 是关键：它让当前图直接
+结束，不把澄清结果再次送回模型循环。
+
+DeerFlow 前端回答澄清卡时仍调用新的 `sendMessage()`，并在 HumanMessage 的
+`additional_kwargs` 中附带 v1 `human_input_response`；它不是恢复原 Run。后端
+`human_input.py` 校验 `version`、`request_id`、`response_kind` 和回答值。
+
+Mini Deer 没有 DeerFlow 的 Agent middleware 栈，因此没有机械复制中间件，而是在
+手写 StateGraph 中建立等价的专用路由和结束边。
+
+#### 工具契约和稳定结果
+
+`tools/clarification.py` 定义 `ask_clarification`：
+
+- 必填 `question` 和 `clarification_type`；类型限制为 `missing_info`、
+  `ambiguous_requirement`、`approach_choice`、`risk_confirmation`、`suggestion`。
+- 可选 `context` 和 2—8 个唯一 `options`；问题、说明和选项都有长度上限。
+- `tool_call_id` 使用 `InjectedToolCallId` 由运行时注入，不暴露给模型伪造。
+- 结果是稳定的 v1 `human_input_request` JSON；`request_id` 为
+  `clarification:<tool_call_id>`，同时保留 free text / choice 模式信息，为 12.4 的
+  结构化 UI 留出兼容基础。
+
+第一版把 JSON 直接作为 `ToolMessage.content`。这样即使没有专用卡片，现有事件投影、
+产品历史和通用工具卡也能共同使用同一事实。
+
+#### 图路由和安全结束
+
+`graph.py` 把原来的单一路由升级为：
+
+```text
+model
+  ├─ ask_clarification → clarification → END
+  ├─ 其他工具调用      → tools → model
+  └─ 无工具调用        → END
+```
+
+`route_after_model()` 只要发现同一模型响应包含 `ask_clarification`，就优先进入
+`clarification` 节点。节点只执行第一个澄清调用；同批普通工具和多余澄清都不执行，
+但会得到 `status=error` 的跳过 `ToolMessage`。这既保证“先澄清、后行动”，也补齐每个
+tool call ID，避免 checkpoint 出现 dangling tool call，或前端在 Run 完成后仍显示
+永久“调用中”。
+
+澄清节点完成后通过固定边进入 `END`，因此问题结果不会再次回到 model；用户回答前，
+本 Run 不可能继续搜索、写 Todo 或生成虚假的完成声明。
+
+#### Run 终态、持久化和页面展示
+
+`streaming/projector.py` 观察到成功的 `ask_clarification` ToolMessage 后，把正常结束事件
+设置为：
+
+```text
+run_completed
+finish_reason = clarification_requested
+```
+
+持久化 Run 状态仍是 `completed`，Thread 回到 `idle`。没有使用 `run_interrupted`，因为
+后者专门表示用户取消、浏览器断开和服务关闭；澄清是一次成功完成的 Agent 回合，也不
+属于 `run_error`。
+
+完整产品链路为：
+
+```text
+AI tool call
+  → tool_call_delta
+  → clarification ToolMessage
+  → tool_result
+  → application SQLite 的 tool_executions / timeline_items
+  → run_completed(clarification_requested)
+  → ToolActivity 通用工具卡
+```
+
+`ToolActivity` 对已完成的 `ask_clarification` 保持默认展开，用户可以直接看到问题；刷新
+页面后，历史 API 从 application SQLite 读回同一工具结果并重新投影，因此问题仍存在。
+
+#### 用户回答为什么能继续
+
+前端普通 Composer 每次提交都会生成新的 user message ID，并调用同一 Thread 的 Run
+stream API；服务端为它创建新的 run ID。`RunStreamService` 只把本轮 HumanMessage
+提交给图，而 LangGraph checkpointer 根据相同 `thread_id` 恢复此前的用户请求、
+AI tool call 和 clarification ToolMessage。模型因此同时看到原任务、追问和新回答，
+可以继续执行而无需恢复已经结束的旧 Run。
+
+12.3 仍未给普通回答附加 `human_input_response`，也没有由前端使用 `request_id` 做精确
+关联；专用卡片、选项按钮、表单和多个未回答请求管理属于 12.4。
+
+#### 自动化与真实验证
+
+自动化结果：
+
+```text
+后端 pytest：120 passed
+前端 vitest：24 files / 163 passed
+TypeScript typecheck、ESLint、Prettier、生产 build：通过
+Python compileall、git diff --check：通过
+当前环境未安装 Ruff，因此未执行 Ruff
+```
+
+用户已在真实浏览器和真实模型中确认以下行为全部正常：
+
+- “帮我生成一份报告”会先调用 `ask_clarification`，通用工具卡展开并显示问题，当前
+  Run 正常结束且输入框可继续使用。
+- 通过普通输入框补充主题和用途后，新 Run 能继续原任务，不重复询问已经回答的条件。
+- 刷新页面后，澄清问题、用户回答和后续内容仍然存在。
+- “北京是中国的首都吗？”直接回答，不滥用澄清工具。
+
+### 功能点 12.3 小结
+
+- 为什么澄清不能作为普通工具执行后再回到 `model`，而必须拥有明确的图结束语义。
+- 为什么成功提出问题应记录为 `completed / clarification_requested`，而不是取消或失败。
+- 为什么同批未执行工具仍要补齐 ToolMessage，才能同时保护模型协议和前端状态。
+- 为什么普通 Composer 的下一条消息已经能依靠 Thread checkpoint 继续任务，以及
+  `human_input_response + request_id` 精确关联仍需留到 12.4。
+
+## 功能点 12.4：Clarification 结构化交互
+
+#### 本功能点目标
+
+把 12.3 中通用工具卡展示的 `human_input_request` 升级为可直接回答的专用卡片，并让
+卡片回答通过稳定的 `human_input_response.request_id` 精确关联原请求。回答仍然创建
+新的 Run；页面刷新后必须从产品历史恢复“已回答”状态，不能只依赖 React 临时状态。
+
+#### 与 DeerFlow 的对应关系
+
+DeerFlow 把 Human Input 分成三个清晰职责：
+
+- `core/messages/human-input.ts` 校验版本化请求和回答，并从包含隐藏消息的原始历史推导
+  哪个请求已经回答、哪个请求仍然打开。
+- `components/workspace/messages/human-input-card.tsx` 渲染 free text、选项和表单控件，
+  卡片本身不负责创建或恢复 Run。
+- Chat 页面调用新的 `sendMessage()`；可读正文交给模型，机器关联放入
+  `additional_kwargs.human_input_response`，同时设置 `hide_from_ui: true`，因此回答会
+  进入 checkpoint，但不会重复渲染为普通用户气泡。
+
+Mini Deer 同样采用“下一 Run + 隐藏 HumanMessage”的语义，没有把澄清误实现成旧 Run
+的 suspend/resume。
+
+#### 前端协议、状态推导和专用卡片
+
+新增 `features/chat/model/human-input.ts`，负责：
+
+- 严格解析 12.3 已发布的 v1 `free_text` / `choice_with_other` 请求。
+- 校验 v1 `text` / `option` 回答；选项回答同时保留 `option_id` 和 `value`。
+- 从原始时间线读取 `ask_clarification` 工具结果与隐藏回答：结构化回答只按
+  `request_id` 精确关闭对应卡片；普通可见 Composer 消息作为兼容路径，只关闭它之前
+  最新的未回答请求。
+- 生成模型可读正文：`针对澄清问题“...”，我的回答是：...`。
+
+`HumanInputCard` 替换通用 `ToolActivity`，展示问题、上下文、选项按钮和其他文本输入。
+提交后卡片显示“已回答”，结构化回复不产生第二个用户气泡；普通 Composer 始终保留，
+没有因为卡片存在而锁死用户。
+
+#### 从浏览器到 checkpoint 和历史恢复的完整链路
+
+```text
+HumanInputCard
+  → ChatPage.buildHumanInputResponseText()
+  → useChatRun.submit(..., humanInputResponse)
+  → POST /runs/stream 的 human_input_response
+  → RunStreamRequest v1 判别联合校验
+  → RunExecutionManager.create_run()
+  ├─ application SQLite messages：hidden_from_ui + response JSON
+  └─ LangGraph HumanMessage.additional_kwargs：
+       hide_from_ui + human_input_response
+  → 新 Run 继续原任务
+```
+
+业务数据库迁移到 v6，在 `messages` 增加 `hidden_from_ui` 和
+`human_input_response_json`。历史 API 返回这两个受控字段，前端 history parser 恢复到
+原始时间线后重新推导卡片状态。因此“已回答”是跨刷新业务事实，不是组件局部状态。
+
+隐藏回答仍留在 reducer 的原始时间线中供关联推导；`projectConversation()` 只在展示投影
+时跳过它，让下一 Run 的 Assistant 内容自然接在澄清卡之后。
+
+#### 原子边界
+
+12.4 只完成现有 v1 请求协议的专用交互：free text、选项、其他回答、隐藏响应、精确
+关联和刷新恢复。没有新增 DeerFlow v2 多字段表单协议，也没有实现同一 Run 长期挂起、
+恢复或多个未回答请求的完整管理；v2 form 作为下一个连续功能点 12.5 单独验证。
+
+#### 自动化与真实验证
+
+自动化结果：
+
+```text
+后端 pytest：124 passed
+前端 vitest：27 files / 171 passed
+TypeScript typecheck、ESLint、Prettier、生产 build、git diff --check：通过
+```
+
+用户已按真实页面验收步骤确认：专用卡片、选项/文本提交、新 Run 继续、隐藏回答、刷新
+恢复和普通 Composer 兼容入口均正常，并明确回复“已验证”。
+
+### 功能点 12.4 小结
+
+- 为什么 Human Input 的 UI 状态必须从原始历史推导，不能只保存在卡片组件中。
+- 为什么结构化回答要同时拥有模型可读正文和机器可判定的 `request_id` 元数据。
+- 为什么隐藏消息应保留在业务时间线和 checkpoint，只在展示投影阶段过滤。
+- 为什么 12.4 仍然是“新 Run 继续”，而不是同一个 Run 的暂停和恢复。
+
+## 功能点 12.5：Clarification v2 多字段表单
+
+#### 本功能点目标
+
+在已经验证的 v1 Human Input Card 上增加 v2 `form` 请求，让 Agent 能用一张卡片一次
+收集多个相关值，避免把同一组参数拆成连续追问。第一版只支持可立即验证的 `text`、
+`textarea` 和 `select`，继续复用 12.4 的隐藏回答、精确关联、新 Run 继续和刷新恢复链路。
+
+#### 与 DeerFlow 的对应关系
+
+DeerFlow 的 v2 Human Input 把表单能力分成三层：
+
+- 后端 clarification tool 接收 `fields`，字段存在时优先于顶层 `options`，并生成
+  `version: 2 / input_mode: form` 请求。
+- 前端 parser 严格绑定协议版本和输入模式，并校验字段名、字段类型、选项与必填声明。
+- 表单提交仍使用 v1 `human_input_response` 的 `text` 回答；value 同时包含可读摘要和
+  `[values: {...}]` 稳定 JSON 映射，不额外制造新的 response kind。
+
+Mini Deer 保留这一关键边界，但先收窄字段类型，避免在一个功能点内同时引入数字、
+多选、布尔和日期的输入与序列化规则。
+
+#### 后端 v2 form 契约
+
+`tools/clarification.py` 为 `ask_clarification` 增加可选 `fields`：
+
+- 允许 1—8 个字段；当前类型仅为 `text`、`textarea`、`select`。
+- 字段 `name` 使用稳定英文标识符，必须唯一，并拒绝 `constructor`、`__proto__` 等
+  会污染或混淆对象映射的保留名称。
+- `select` 必须声明 2—8 个不重复选项；非 select 字段不得携带 options。
+- 缺省 label、type、required 在工具参数校验阶段完成规范化。
+- 传入 fields 时生成 v2 form，并优先于旧的顶层 options；未传 fields 时原有 v1
+  free text / choice 协议保持不变。
+
+后端输出为稳定 JSON，每个 select 选项生成与字段名关联的 ID，例如
+`format-option-1`，使历史恢复后的页面仍能得到同一个控件契约。
+
+#### 前端解析、校验和提交
+
+`features/chat/model/human-input.ts` 现在严格区分：
+
+```text
+version 1 ↔ free_text / choice_with_other
+version 2 ↔ form
+```
+
+解析器只接受 1—8 个安全且不重名的字段；select 选项同时校验 ID 和 value 唯一性。
+读取表单值时使用 own-property 检查，不能从对象原型链读取伪造字段。
+
+`HumanInputCard` 根据字段类型渲染文本框、多行文本框和原生下拉框。提交前执行应用内
+必填校验：空提交显示“请填写所有必填字段”，缺失字段显示错误边框；可选字段允许留空，
+但整张表单不能全部为空。
+
+提交值按字段声明顺序构造，例如：
+
+```text
+项目名: Mini Deer; 输出格式: Markdown; 补充说明: 面向开发者 [values: {"project_name":"Mini Deer","format":"Markdown","notes":"面向开发者"}]
+```
+
+可读部分让模型直接理解答案，JSON 部分为后续稳定解析保留字段名。回答继续复用 v1
+`human_input_response / response_kind: text`，因此 12.4 已验证的 API、SQLite、checkpoint、
+隐藏消息、request_id 关联和刷新恢复均无需新增迁移。
+
+#### 原子边界
+
+12.5 只完成 text、textarea、select 多字段表单。没有加入 number、multi_select、checkbox、
+date，也没有改变“回答后创建下一 Run”的语义；这些扩展字段类型作为下一连续功能点
+12.6 单独进行源码对照和验证。
+
+#### 自动化与真实验证
+
+测试驱动过程先确认后端缺少 fields 契约、前端不识别 v2 form、卡片不执行必填拦截；
+实现后结果为：
+
+```text
+后端 pytest：129 passed
+前端 vitest：27 files / 174 passed
+TypeScript build、ESLint、Prettier、生产 build、git diff --check：通过
+```
+
+用户已在真实页面验证三字段表单、必填提示、填写提交、下一 Run 继续以及卡片回答状态，
+并明确回复“已验证”。
+
+### 功能点 12.5 小结
+
+- 为什么 v2 form 必须和 version 2 严格绑定，不能对未知协议做宽松猜测。
+- 为什么字段名和 select value 都必须唯一，并拒绝对象原型上的危险名称。
+- 为什么表单回答可以继续复用 v1 text response，而不必扩展整条持久化协议。
+- 为什么提交值要同时面向模型可读性和机器稳定解析。
+
+## 功能点 12.6：Clarification v2 扩展字段类型
+
+#### 本功能点目标
+
+一次补齐 DeerFlow v2 form 剩余的 `number`、`date`、`multi_select`、`checkbox`，让一张
+澄清卡片能够同时收集数字、日期、多选数组和布尔确认。继续复用已经验证的 v1 text
+回答、新 Run 继续、隐藏消息、request_id 关联与刷新恢复链路。
+
+#### 与 DeerFlow 的对应关系
+
+DeerFlow 后端把七种字段列为白名单，`select` 和 `multi_select` 共用选项规范化；前端
+则把表单值扩展为 `string | number | boolean | string[]`：
+
+- number 使用 `input[type=number]`，浏览器输入值按字符串提交。
+- date 使用 `input[type=date]`，值为 `YYYY-MM-DD` 字符串。
+- multi_select 使用一组 `aria-pressed` 按钮，值为字符串数组。
+- checkbox 使用原生复选框，初始值显式设为 `false`；required checkbox 只有值为
+  `true` 时才算完成，适合“必须同意”语义。
+
+Mini Deer 保留这些值语义和无障碍控件，但继续沿用已有的 1—8 个字段、每字段 2—8 个
+选项和英文安全字段名边界。
+
+#### 后端契约扩展
+
+`tools/clarification.py` 的 `ClarificationFormFieldType` 现在包含完整七种类型。新增的
+`_OPTION_FIELD_TYPES` 让 select 与 multi_select 共用以下规则：
+
+- 必须提供 2—8 个不重复选项。
+- 输出选项 ID 使用 `<field-name>-option-<index>`。
+- number、date、checkbox 等非选项字段携带 options 时直接拒绝，避免产生含义不明的
+  表单契约。
+
+工具说明同时明确 checkbox 默认表示“否”，只有必须同意时才把它声明为 required。
+
+#### 前端值模型、校验和控件
+
+`features/chat/model/human-input.ts` 增加标量字段、选项字段与 checkbox 字段的判别联合，
+并把表单值扩展为：
+
+```text
+string | number | boolean | string[]
+```
+
+checkbox 字段在卡片初始化时写入 `false`，因此未操作的可选 checkbox 不会从回答中
+消失。必填判断按类型执行：空字符串、空数组是缺失值；required checkbox 的 `false`
+也是缺失值；可选 checkbox 的 `false` 是有效答案。
+
+`HumanInputCard` 新增：
+
+- number 数字输入框与 date 日期输入框。
+- 带 `aria-pressed` 状态的 multi_select 多选按钮，重复点击可取消选择。
+- 带真实 checked 语义的原生 checkbox。
+- 精确到字段的错误状态；填写某个字段后只清除该字段的无效状态。
+
+表单使用 `noValidate`，由应用统一显示中文必填提示，避免浏览器原生约束校验在 React
+提交处理之前截断事件。
+
+#### 稳定提交格式
+
+可读摘要中数组使用逗号连接，布尔值显示为“是/否”；JSON 映射保留原始类型。例如：
+
+```text
+预算: 300.5; 截止日期: 2026-09-15; 发布渠道: web, email; 加急: 否; 同意发布条款: 是
+[values: {"budget":"300.5","due_date":"2026-09-15","channels":["web","email"],"urgent":false,"terms":true}]
+```
+
+number 的浏览器输入值仍是字符串，multi_select 是数组，checkbox 是布尔值。响应仍为
+`version: 1 / response_kind: text`，因此没有修改 API、数据库或 checkpoint 协议。
+
+#### 自动化与真实验证
+
+测试驱动过程先确认四种新类型被后端拒绝、前端 parser 返回 null、页面错误降级为普通
+文本框；实现后结果为：
+
+```text
+后端 pytest：132 passed
+前端 vitest：27 files / 177 passed
+TypeScript build、ESLint、Prettier、生产 build、git diff --check：通过
+```
+
+用户已在真实页面验证：五字段表单一次出现、空提交与 required checkbox 正确拦截、
+数字/日期控件、多渠道选择、可选 checkbox 默认“否”、数组和布尔 JSON 提交以及刷新后
+已回答状态，并明确回复“已验证”。
+
+#### 原子边界与后续
+
+12.6 已完成 Clarification v2 的全部七种表单字段，但仍没有实现同一 Run 的长期
+suspend/resume 或多个未回答请求的完整管理。按 Agent 能力路线，下一连续功能点 12.7
+进入 Sub-agent：先实现单个同步委派、独立 prompt、受控工具集和结果回传。
+
+### 功能点 12.6 小结
+
+- 为什么 checkbox 必须初始化为 false，不能把“未操作”和“否”混为一谈。
+- 为什么 required checkbox 的 false 是缺失值，而可选 checkbox 的 false 是有效答案。
+- 为什么多选必须以数组进入 JSON，不能只依赖逗号拼接的可读摘要。
+- 为什么扩展请求字段不要求扩展回答协议和持久化链路。
+
+## 功能点 12.7：Sub-agent 单个同步委派
+
+#### 本功能点目标
+
+让主 Agent 可以通过 `task` 把一个自包含子任务同步交给独立通用子 Agent。子 Agent
+完成后把结构化结果作为 `ToolMessage` 返回，主 Agent 必须继续核验并生成最终回答。
+第一版强调隔离、受控和可收敛，不追求 DeerFlow 的后台任务与并发调度框架。
+
+#### 与 DeerFlow 的对应关系
+
+DeerFlow 的完整实现分成 task 工具、子 Agent executor 和委派限制中间件：
+
+- `tools/builtins/task_tool.py` 定义 `description`、`prompt`、`subagent_type`，并把子任务
+  交给 executor，最终返回 `ToolMessage`。
+- `subagents/executor.py` 为子 Agent 创建独立的 SystemMessage 与 HumanMessage，只把
+  委派 prompt 作为用户上下文，不复制主对话历史；子图不挂主 Agent checkpointer。
+- `subagents/builtins/general_purpose.py` 为通用子 Agent 过滤高风险或递归工具。
+- `middlewares/subagent_limit_middleware.py` 维护并发数、累计量和委派台账；后台执行、
+  轮询和持久台账属于 DeerFlow 更完整的生产能力。
+
+Mini Deer 保留独立上下文、能力过滤和结果回传三个核心语义，明确不复制后台任务、
+轮询、并发 ledger 或专用进度协议。
+
+#### 独立子图与工具边界
+
+`agents/subagent/graph.py` 新增无 checkpointer 的受限 LangGraph：
+
+```text
+START → model → web tools → model → END
+```
+
+子图初始状态只有专用 SystemMessage 和 `task.prompt` 对应的 HumanMessage，不接收主
+Thread 历史。它复用主 Agent 的同一个模型配置，但重新绑定独立工具集合，只有
+`web_search` 和 `web_fetch`；没有 `task`、`write_todos` 或 `ask_clarification`，因此
+不能递归委派、改写主计划或绕过主 Agent 向用户追问。
+
+子图不持久化 checkpoint，并使用 `recursion_limit: 8` 限制模型/工具循环。同步入口使用
+`invoke`，异步入口直接等待 `ainvoke`，所以 Web Run 的 `CancelledError` 可以继续传播到
+子图和模型网络请求。
+
+#### task 契约与单次限制
+
+`create_task_tool(model)` 为每张主图创建一个绑定当前模型的一次性工具，公开参数为：
+
+- `description`：1—200 字符的简短任务说明。
+- `prompt`：1—8000 字符的自包含委派提示。
+- `subagent_type`：当前只能是 `general-purpose`。
+
+`RunStreamService` 每个产品 Run 都重新构建主图，因此 task 工具闭包中的原子占用标志
+对应“每 Run 一次”。同步与异步入口共用同一把短临界区 Lock；第一次调用即占用名额，
+同图第二次调用返回 `delegation_limit_reached`，不会再次启动子图。
+
+成功结果使用稳定 JSON：
+
+```json
+{
+  "version": 1,
+  "kind": "subagent_result",
+  "status": "completed",
+  "subagent_type": "general-purpose",
+  "description": "比较两个方案",
+  "result": "子 Agent 的最终结果"
+}
+```
+
+执行异常转换为 `status: failed / subagent_execution_failed`，不把 provider 异常正文交给
+模型或页面；异步取消不进入该异常包装，保持真正的 Run 取消语义。
+
+#### 主图路由和工具协议收敛
+
+主图的路由优先级变为：
+
+```text
+ask_clarification → task → 普通工具 → END
+```
+
+出现 `task` 时进入专用 delegation 节点，只执行模型响应中的第一个 task。若模型违反
+Prompt，把 task 与搜索等普通工具或第二个 task 并列发出，节点会为每个未执行调用补一条
+`tool_call_skipped` 错误 ToolMessage，保证所有 tool_call_id 都有结果，不留下悬空协议
+历史。task 结果再回到主模型，由主 Agent 核验和组织最终答案。
+
+前端无需新增协议或组件：现有 `tool_call_delta → tool_result` 事件、SQLite 工具历史和
+通用工具卡可以直接展示 task 调用与结构化结果。子图中间消息不作为独立 Assistant
+消息混入主对话。
+
+#### Prompt v8
+
+系统提示升级为 `mini-deer-agent/system/v8`，新增 delegation 规则：默认由主 Agent
+直接完成；只有隔离或独立分析明显有益时才委派；每 Run 最多一次；task 必须独占一次
+模型响应；prompt 必须自包含；主 Agent 必须核验返回结果。简单明确问题不得滥用委派。
+
+#### 自动化与真实验证
+
+测试驱动过程先确认 `task` 模块不存在，再补齐工具契约、上下文隔离、子工具白名单、
+成功结果、稳定失败、第二次调用拒绝、同步/异步入口、取消传播、主图结果回传和混合
+工具收敛。最终结果为：
+
+```text
+后端 pytest：140 passed
+前端 vitest：27 files / 177 passed
+Python compileall、TypeScript build、ESLint、Prettier、生产 build、git diff --check：通过
+当前环境未安装 Ruff，因此未执行 Ruff
+```
+
+用户已在真实页面验证：出现单个 task 通用工具卡、子 Agent 返回结果、主 Agent 再次
+核验并综合回答，子图中间回答未混入主对话；随后简单问题直接回答且没有调用 task，
+并明确回复“已验证”。
+
+#### 原子边界与后续
+
+12.7 没有实现同一 Run 多 task 并发、自定义子 Agent 类型或模型、后台任务与进度、
+子图 checkpoint、Skills/Memory 注入或文件写入。下一功能点可单独评估 12.8 受控并发
+多委派；进入实现前仍需重新对照 DeerFlow 的并发限制和结果收敛路径。
+
+### 功能点 12.7 小结
+
+- 为什么子 Agent 必须只收到自包含 prompt，不能隐式依赖主对话历史。
+- 为什么复用模型配置不等于复用工具绑定和 checkpoint。
+- 为什么 task 与其他工具并列时必须为所有未执行调用补齐 ToolMessage。
+- 为什么异步委派必须直接等待子图 ainvoke，不能用线程池伪装取消。
+- 为什么第一版先限制为每 Run 单次同步委派，而不复制完整后台任务框架。
+
+## 功能点 12.8：Sub-agent 受控并发多委派
+
+#### 本功能点目标
+
+把 12.7 的“每 Run 只能委派一次”扩展为受控的多委派：主 Agent 可以在同一模型响应中
+并发执行最多 3 个彼此独立的 `task`，每个产品 Run 累计最多接受 6 个委派，并在全部结果
+收敛后继续生成最终回答。实现必须同时保证结果顺序、失败隔离、取消传播和工具协议完整。
+
+#### 与 DeerFlow 的对应关系
+
+DeerFlow 的 `subagent_limit_middleware.py` 在 ToolNode 执行前处理委派调用：默认单响应最多
+3 个、单 Run 累计最多 6 个，并通过按 `run_id` 保存的委派台账统计累计量。它会截断超额的
+结构化调用和 provider 原始调用，随后由 LangGraph ToolNode 使用同步 executor 或异步
+`asyncio.gather` 并发执行；结果仍按输入调用顺序返回。DeerFlow 的 task executor 还保持
+每个子任务上下文独立并允许取消向下传播，Prompt 则明确禁止有前后依赖、共享可变状态或
+冲突副作用的任务并发，并要求主 Agent 使用最少数量的子 Agent、核验失败和冲突。
+
+Mini Deer 保留这些核心行为，但没有复制 durable delegation ledger。`RunStreamService`
+会为每个产品 Run 构建一张新主图，因此绑定在图上的共享 `DelegationBudget` 生命周期正好
+等于当前 Run；当前系统又没有恢复同一未完成 Run 后继续委派的语义，闭包预算已经足够。
+
+#### 每 Run 委派预算
+
+`tools/task.py` 新增线程安全的 `DelegationBudget`：
+
+- `MAX_CONCURRENT_DELEGATIONS = 3`：一次模型响应最多保留前三个合法 task。
+- `MAX_TOTAL_DELEGATIONS_PER_RUN = 6`：同一产品 Run 的多轮模型响应累计最多接受六个 task。
+- delegation 节点先为整批调用原子预留名额，再由各 task 调用领取自己的名额，避免并发
+  调用分别检查预算时发生竞态。
+- 已接受的委派即使执行失败也消耗总量名额，防止模型用失败重试绕过上限。
+
+同一张主图的同步和异步入口共享该预算；不同产品 Run 会重新构图，因此彼此不共享计数。
+
+#### 并发执行、结果顺序与取消
+
+主图 delegation 节点现在处理模型响应中的全部工具调用：
+
+```text
+model
+  → 预留本批合法 task（最多 3 个，且不超过 Run 剩余额度）
+  → task-1 ║ task-2 ║ task-3
+  → 按原始 tool_call 顺序合并全部 ToolMessage
+  → model
+```
+
+同步入口使用 `ThreadPoolExecutor`，异步入口使用 `asyncio.gather`。单个子 Agent 先完成并
+不会改变返回顺序：主模型始终收到与原始 tool_call 顺序一致的 ToolMessage。单个委派的
+普通异常继续转换为稳定的 failed `subagent_result`，不会阻断同批其他子 Agent；父 Run
+取消时 `CancelledError` 不会被包装为普通失败，异步 gather 会取消并等待其余子任务，
+避免页面已经显示停止但后台子图仍在运行。
+
+#### 工具协议收敛边界
+
+task 批次仍保持独占：若模型把 task 与 web、todo 或 clarification 等普通工具放在同一
+响应，普通工具不会执行，而是收到 `delegation_batch_exclusive` 的 skipped ToolMessage。
+本批第 4 个及之后的 task 收到 `delegation_concurrency_limit`；Run 累计额度耗尽后的 task
+收到 `delegation_total_limit`。无论执行、失败还是跳过，每个原始 tool_call_id 都恰好有
+一条结果，LangGraph 历史不会出现悬空调用。
+
+Mini Deer 与 DeerFlow 在超额调用的表示上有意不同：DeerFlow 在进入 ToolNode 前改写并
+截断 AIMessage；Mini Deer 保留模型实际发出的调用，并为拒绝项写入明确的 skipped
+ToolMessage。这更适合当前事件流、SQLite 历史和通用工具卡的可观察性。
+
+#### Prompt v9 与前端边界
+
+默认 Prompt 升级为 `mini-deer-agent/system/v9`。委派规则现在要求：每个响应最多 3 个、
+每 Run 最多 6 个；只并发互相独立且无共享可变状态、依赖关系或冲突副作用的任务；一次
+响应只能包含 task；使用能完成任务的最少子 Agent；prompt 必须自包含；主 Agent 必须检查
+失败和冲突后再综合回答。
+
+前端生产代码无需修改。既有 timeline 以 `tool_call_id` 关联调用与结果，天然支持多张 task
+卡独立结算；新增 reducer 测试证明即使两个结果反序到达，两张卡也会分别更新到正确调用。
+
+#### 自动化与真实验证
+
+测试驱动过程覆盖实际异步重叠、反序完成但输入序返回、批次并发上限、跨批累计六次、
+混合工具跳过、单个失败不影响同批结果、父取消时全部子任务取消，以及前端反序结果关联。
+最终结果为：
+
+```text
+后端 pytest：144 passed
+前端 vitest：27 files / 178 passed
+Python compileall、TypeScript build、ESLint、Prettier、生产 build、git diff --check：通过
+当前环境未安装 Ruff，因此未执行 Ruff
+```
+
+用户已在真实页面确认：同一模型响应产生两个独立 task 工具卡，两项子任务均正常返回，
+主 Agent 在结果收敛后完成综合；简单明确问题仍直接回答、不滥用委派；并发取消行为也已
+按验收步骤确认正常。用户随后明确回复“已验证”。
+
+#### 原子边界与后续
+
+12.8 没有实现后台委派或专用进度协议、可配置限额、自定义子 Agent 类型或模型、跨恢复
+Run 的 durable delegation ledger、子图 checkpoint、Skills/Memory 注入或文件写入。
+Sub-agent 阶段的同步受控委派闭环到此完成；下一连续功能点进入 12.9 Skills，先实现内置
+技能发现与显式激活，再单独评估自动激活和专用工具策略。
+
+### 功能点 12.8 小结
+
+- 为什么并发上限和单 Run 累计上限必须分开控制。
+- 为什么批次必须先原子预留预算，再让并发 task 领取名额。
+- 为什么并发完成顺序不能改变 ToolMessage 的原始调用顺序。
+- 为什么单个失败要隔离，而父 Run 取消必须传播到全部子任务。
+- 为什么拒绝调用也必须获得明确 ToolMessage，不能留下悬空协议历史。
+- 为什么当前每 Run 新构图的生命周期允许先使用图内预算，而不提前复制 durable ledger。
+
+## 功能点 12.9：Skills 内置技能发现与显式激活
+
+#### 本功能点目标
+
+建立第一个完整、可观察的 Skills 闭环：应用从随包发布的 `SKILL.md` 发现受信任内置技能，
+基础 Prompt 只暴露名称与描述；用户以严格的 `/skill-name 任务` 显式激活后，技能正文只
+进入当前产品 Run 的模型调用视图。普通请求不得因主题相似而自动加载技能。
+
+#### 与 DeerFlow 的对应关系
+
+DeerFlow 把 Skills 拆为类型、解析、存储、Prompt 目录和激活中间件：
+
+- `skills/types.py` 的 `Skill` 保存名称、描述、类别、路径、启用状态和权限元数据。
+- `skills/parser.py` 使用 YAML frontmatter 读取 `name`、`description` 等字段。
+- `LocalSkillStorage._iter_skill_files()` 扫描技能目录；含 `SKILL.md` 的目录形成包边界，
+  内部嵌套的 `SKILL.md` 不再注册为第二个运行时技能。
+- `SkillStorage.load_skills()` 合并启用状态、按名称去重并稳定排序。
+- `skills/slash.py` 只接受行首小写 hyphen-case 命令，并排除 `/new`、`/help`、`/status`
+  等产品保留命令。
+- `SkillActivationMiddleware` 在最新真实用户消息中解析 slash，校验安装、启用与 Agent
+  allowlist，安全读取正文后用隐藏 HumanMessage 投影到当前模型请求；找不到、禁用或读取
+  失败时返回稳定 Assistant 错误。
+- `lead_agent/prompt.py` 默认只把技能名称、描述和位置放入基础 Prompt，正文等实际加载
+  或显式激活后才进入上下文。
+
+Mini Deer 没有用户技能、启用状态、沙箱 `read_file`、专用工具权限或 Durable Context，
+因此 12.9 只保留“受信任内置目录 → 元数据发现 → 显式激活 → 当前 Run 生效”主链。
+
+#### 只读内置技能目录
+
+`skills/catalog.py` 新增 `BuiltInSkillCatalog`。每个产品 Run 构图时发现一次技能，形成稳定
+快照；后续文件变化只影响新 Run。目录契约为：
+
+```text
+src/mini_deer_agent/skills/builtin/
+└── structured-explainer/
+    └── SKILL.md
+```
+
+发现器只检查根目录的直接子目录；名称必须是最长 64 字符的小写 hyphen-case，并与
+frontmatter `name` 一致。`description` 为 1—500 字符，文件最大 32KB，正文不能为空。
+内置根、技能目录和 `SKILL.md` 都拒绝符号链接，解析后的文件必须仍位于受信任根内。
+内置资产属于应用发布内容，格式错误会让构图失败，不能静默隐藏一个损坏能力。
+
+项目把 PyYAML 声明为直接依赖，并通过 setuptools package-data 把内置 `SKILL.md` 放进
+wheel。隔离 wheel 构建已经确认发布包同时包含 Python 模块和技能文件。
+
+#### Prompt v10 的发现边界
+
+`AgentPromptContext` 新增稳定 `SkillSummary` 元组。主图用真实 catalog 覆盖调用方传入的
+技能清单，与工具注册表的可信覆盖规则一致；Prompt Builder 再校验名称、去重、稳定排序
+并 HTML 转义描述。
+
+默认 Prompt 升级为 `mini-deer-agent/system/v10`，新增 `<skills>`：
+
+- 只列 `/skill-name` 和描述，不包含技能正文或主机路径。
+- 允许 Agent 回答“有哪些技能”。
+- 只有用户显式以对应 slash 开头才激活，禁止按主题相似度自动激活。
+- 技能不能扩大工具权限，也不能覆盖基础安全、真实性和保密规则。
+
+首个 `structured-explainer` 技能要求技术解释默认使用“一句话结论、通俗解释、最小例子、
+常见误区”四段结构，为真实页面提供容易观察的行为差异。
+
+#### Slash 激活与模型专用投影
+
+`skills/activation.py` 复用 DeerFlow 的严格语法和保留命令边界。主图每次进入同步或异步
+model 节点时，只查看状态中最新 HumanMessage：
+
+```text
+/structured-explainer 解释 checkpoint
+  → 解析并命中当前 Run catalog
+  → 技能正文追加到本次可信 SystemMessage
+  → 模型看到的最新用户正文变为“解释 checkpoint”
+  → 模型或工具循环
+```
+
+投影使用 `model_copy`，不会改写 MessagesState：页面和 checkpoint 仍保存原始 slash
+消息，`<activated_skill>`、技能正文和规范化任务都不会进入历史。附件元数据继续保留，
+随后由既有附件投影层转换为不可信资料区块。
+
+同一产品 Run 的后续工具循环会从原始 slash 消息重新生成相同投影，因此最终回答仍受技能
+约束；下一条普通 HumanMessage 开始新 Run 后，它成为最新用户消息，旧 slash 自动失效。
+澄清卡片的隐藏回答不会触发技能，同时会阻止更早的 slash 被错误继承。
+
+未知技能和缺少任务正文属于确定性产品错误，model 节点直接返回 `AIMessageChunk`，不调用
+模型。使用 chunk 而不是普通节点消息，保证现有 `messages → aproject_run_events` 链能生成
+页面可见的 `ai_delta`，随后正常 `run_completed`。
+
+#### 与 DeerFlow 的信任差异
+
+DeerFlow 面向 public、custom、integration、legacy 等多来源技能，把 slash 正文包装为隐藏
+HumanMessage，并配合启用状态、工具策略、请求级 secrets 和 durable skill context。
+Mini Deer 12.9 只有随应用版本发布、不可由请求修改的内置技能，因此正文作为当前 Run 的
+可信 SystemMessage 片段注入，以确保工具调用后的第二次模型请求仍遵守技能。
+
+这不是未来用户技能可以直接复用的安全结论。开放自定义或外部技能前，必须重新设计安装
+审查、启用状态、指令信任级别、工具 allowlist、资源读取和密钥边界。
+
+#### 自动化与真实验证
+
+测试驱动过程先确认 `mini_deer_agent.skills` 不存在，再覆盖：直接包发现与稳定排序、嵌套
+包忽略、非法/错名发布资产拒绝、严格 slash 与保留命令、正文只进入模型视图、未知/空任务
+稳定失败、异步产品事件可见、同 Run 工具循环持续激活、下一 Run 自动失效、Prompt 元数据
+转义与禁止自动激活。最终结果为：
+
+```text
+后端 pytest：158 passed
+前端 vitest：27 files / 178 passed
+Python compileall、pip check、TypeScript、ESLint、Prettier、生产 build：通过
+隔离 wheel 构建与 SKILL.md package-data 检查：通过
+git diff --check：通过
+当前环境未安装 Ruff，因此未执行 Ruff
+```
+
+用户已在真实页面验证：可以查询 `/structured-explainer` 名称和用途；显式 slash 后回答
+使用四段结构；刷新后只保留原始用户消息和回答，没有内部激活内容；同 Thread 下一条普通
+问题不再使用技能结构；未知技能与空任务显示确定性错误且没有工具调用。用户随后明确回复
+“已验证”。
+
+#### 原子边界与后续
+
+12.9 没有实现用户/外部技能安装、启用/禁用、模型自主加载或自动激活、技能专用工具、
+`allowed-tools`、支持资源读取、请求级 secrets、子 Agent Skills、命令补全或跨 Run 激活。
+下一连续功能点可评估 12.10「Skills 受控自动激活」，开始前需重新对照 DeerFlow 的
+`describe_skill`、skill context、`read_file` 捕获与工具策略，不能只按关键词把技能正文
+无条件塞入 Prompt。
+
+### 功能点 12.9 小结
+
+- 为什么发现目录只能包含元数据，不能把全部技能正文提前放进基础 Prompt。
+- 为什么内置技能损坏应让构图失败，而不是静默缺失。
+- 为什么显式激活必须只改模型视图，不能污染 checkpoint 和页面历史。
+- 为什么同 Run 工具循环需要持续投影，而下一 Run 必须自动失效。
+- 为什么确定性 slash 错误也必须进入现有流式事件链。
+- 为什么“内置受信任”不能推广为未来用户技能的默认信任结论。
+
+## 功能点 12.10：Skills 受控自动激活
+
+#### 本功能点目标
+
+在保留 12.9 显式 slash 的前提下，让模型在普通用户请求与某个技能高度匹配、专用工作流
+确有收益时，自主激活该技能。这个“自动”必须是模型发起、页面可见、消息可审计的明确
+动作，不能是 Runtime 根据关键词静默塞入正文，也不能让普通问题因为主题相似而误触发。
+
+完整可观察闭环为：
+
+```text
+普通用户请求
+  → 模型只看到技能名称与描述
+  → 模型独占调用 activate_skill(name)
+  → 页面显示工具调用和稳定结果
+  → Runtime 校验当前 Run 的调用/结果配对
+  → 下一次模型调用获得受信任技能正文
+  → 模型按技能工作流生成最终回答
+```
+
+#### DeerFlow 源码对应关系
+
+本功能对照 DeerFlow 基线提交 `a5acc25d` 的四段链路：
+
+- `skills/describe.py` 的 `build_describe_skill_tool()` 绑定一次构建得到的 `SkillCatalog`。
+  `describe_skill` 只返回描述、allowed-tools 和容器内文件位置，不修改技能状态，也不返回
+  SKILL.md 正文。
+- 同文件的 `get_skill_index_prompt_section()` 让模型先检查名称索引，再显式执行
+  `describe_skill → read_file → follow instructions`。因此 DeerFlow 的自动发现不是隐藏的
+  关键词匹配，而是模型产生两次可观察工具动作。
+- `tool_error_handling_middleware.py` 只给成功、路径合法且位于 Skills 根内的 `read_file`
+  ToolMessage 加上生产者元数据。异常、普通文件或伪错误文本不会成为技能上下文。
+- `skill_context.py` 的 `extract_skills()` 重新配对 AIMessage 中的 read_file 调用和对应
+  ToolMessage，核对 tool_call_id、工具名、路径和生产者元数据；`render_skill_context()`
+  只渲染活动技能的名称、描述和路径提醒，不长期复制正文。
+- `durable_context_middleware.py` 把成功读取形成的紧凑 skill context 写入 AgentState，使
+  摘要后仍能知道哪些技能曾被加载，并要求真正使用前重新读取文件。
+- `skill_tool_policy_middleware.py` 区分 passive、slash 和 skill_context 三种来源。仅仅
+  安装或启用技能不会改变权限；slash 或已验证的技能上下文才会激活 allowed-tools，且
+  slash 优先，后续被动读取不能扩大用户显式技能的权限。
+
+DeerFlow 需要 `describe_skill` 与 `read_file`，是因为它支持较大的多来源技能目录、容器
+文件、支持资源和 Durable Context。Mini Deer 当前只有小型只读内置目录，基础 Prompt 已
+安全包含完整名称与描述，也没有通用文件平台。因此 12.10 没有机械复制两个工具，而是用
+一个更小的 `activate_skill(name)` 原子完成“模型明确选择 + Runtime 受信任加载”；可审计
+原则保持一致，资源读取和 allowed-tools 继续留给后续功能点。
+
+#### 激活工具与信任元数据
+
+`skills/automatic.py` 新增绑定当前产品 Run catalog 快照的 `activate_skill`。参数只允许
+最长 64 字符的小写 hyphen-case 名称；名称不存在时返回稳定 error ToolMessage。成功结果
+只包含：
+
+```json
+{
+  "version": 1,
+  "kind": "skill_activation",
+  "status": "activated",
+  "name": "structured-explainer",
+  "message": "技能已为当前 Run 激活。"
+}
+```
+
+技能正文不进入结果 JSON，而是由工具生产者在 `additional_kwargs.skill_activation` 中
+写入版本与名称。这个元数据不是为了让模型相信一段 JSON 文本，而是给 Runtime 一个稳定
+的生产者标记。
+
+`find_automatic_skill_name()` 只检查最新 HumanMessage 开始的窗口，并逐项核对：
+
+1. 先出现名称为 `activate_skill`、带稳定 ID 和精确 name 参数的 AI tool call。
+2. 后出现相同 tool_call_id、相同工具名、非 error 的 ToolMessage。
+3. ToolMessage 必须带版本为 1、名称与请求完全一致的生产者元数据。
+4. 该名称必须仍存在于当前 Run 的受信任 catalog 快照。
+5. 当前窗口最终只能得到一个唯一技能名；异常历史出现多个名字时失败关闭。
+
+因此，仅伪造工具结果正文、缺少元数据、错配 ID/名称或引用未知技能都不能让正文进入
+SystemMessage。新 HumanMessage 会自然切断旧窗口，所以相同 CompiledGraph、共享
+checkpointer 和其他 Thread 都不会继承上一 Run 的自动激活。
+
+#### 专用图路由与完整协议结算
+
+主图增加 `skill_activation` 专用节点，条件优先级现在是：
+
+```text
+ask_clarification
+  → activate_skill
+  → task
+  → 普通 tools
+  → END
+```
+
+clarification 继续拥有最高优先级，因为缺少关键条件时不能先激活技能或执行任务。模型响应
+包含 activate_skill 时，专用节点只考虑第一个激活调用，并按原顺序为同批每个 tool call
+生成 ToolMessage：
+
+- 首个合法激活正常执行。
+- 并列 web、todo、task 或额外激活以 `skill_activation_requested` 明确跳过。
+- 同 Run 再次激活相同名称正常返回成功，语义幂等。
+- 尝试切换或叠加另一名称以 `skill_activation_conflict` 失败。
+- 最新用户消息已经显式 slash 激活时，以 `explicit_skill_active` 拒绝模型自动激活。
+- 参数 Schema 不合法时转换为 `invalid_skill_activation_call`，不让整个 Run 崩溃。
+
+所有跳过项仍携带原 tool_call_id，避免下一次模型调用面对悬空工具协议。空技能目录不会把
+activate_skill 注册给模型，但图仍保留一个防御节点；即使模型意外生成未注册调用，也能
+稳定返回不存在错误，条件图本身可以正常编译。
+
+#### 正文投影、Prompt v11 与页面可见性
+
+12.9 的 `project_skill_activation()` 扩展为显式和自动两种来源：
+
+- 最新普通用户消息是合法 slash 时，仍直接清理模型任务视图并注入正文，优先级最高。
+- 没有 slash 时，只有上述严格配对函数返回唯一技能，才把正文追加到可信 SystemMessage。
+- 自动激活不会修改原用户正文；原始 HumanMessage、AI tool call 和 ToolMessage 留在
+  checkpoint，正文和 `<activated_skill>` 仍只存在于模型调用视图。
+- 同 Run 后续工具循环会从已记录的激活结果重复生成投影；下一 Run 的新 HumanMessage
+  使旧结果立即过期。
+- 澄清卡片隐藏回答不会被当作 slash，但当前新 Run 后续仍允许模型自主激活合适技能。
+
+默认 Prompt 升级为 `mini-deer-agent/system/v11`。它明确要求：slash 优先；普通请求只有
+高置信匹配且工作流收益明确时才调用；简单问题或仅主题词相似时直接回答；activate_skill
+必须独占一次响应；成功结果回来后正文才可用；每 Run 最多一个且不得切换。
+
+前端生产代码无需新增技能专用组件。既有 `tool_result` 事件、application SQLite、历史 API、
+reducer 和通用 ToolActivity 已能按 tool_call_id 显示 `activate_skill` 参数、完成状态与结果；
+新增异步产品流测试证明激活结果真实进入版本化 tool_result，而技能正文没有泄露到事件。
+
+#### 测试驱动、自动化与真实验证
+
+TDD 红灯首先表现为 `mini_deer_agent.skills` 无法导入 `create_skill_activation_tool`，证明新
+测试没有误用旧能力。随后测试覆盖：工具 Schema、成功/未知结果、正文不泄露、生产者元数据
+防伪、自动正文投影、模型两阶段调用、产品 tool_result 可见、独占批次全部结算、同名幂等、
+切换拒绝、slash 优先、自动激活下一 Run 失效、空目录编译，以及旧 web/task/clarification
+路由回归。最终结果为：
+
+```text
+后端 pytest：167 passed
+前端 vitest：27 files / 178 passed
+Python compileall、pip check、TypeScript、ESLint、Prettier、生产 build：通过
+wheel 中 automatic.py 与 structured-explainer/SKILL.md 检查：通过
+git diff --check：通过
+当前环境未安装 Ruff，因此未执行 Ruff
+```
+
+用户在真实页面按验收清单确认：不带 slash 的高匹配技术解释会显示 `activate_skill` 工具
+卡，参数命中 `structured-explainer`，最终回答使用四段结构；同 Thread 下一条简单算术
+问题不再出现激活工具卡，也不继承四段结构；显式 slash 仍直接使用技能，并且不会额外调用
+activate_skill。用户随后明确回复“已确认”。
+
+#### 原子边界与后续
+
+12.10 没有实现用户/外部技能安装、启用/禁用、资源文件读取、多个同时激活技能、跨摘要
+Durable Context、请求级 secrets、子 Agent Skills 或 `allowed-tools`。它也没有声称 Prompt
+规则本身就是权限控制；当前所有激活技能仍使用同一主 Agent 工具集合。
+
+下一连续功能点可评估 12.11「Skills 专用工具与 allowed-tools 最小策略」：选择一个能在
+页面立即观察的内置技能/工具组合，同时过滤模型可见 Schema 和实际执行路径，并保留
+clarification 等框架安全工具。开始前必须重新对照 DeerFlow 工具策略，不能只在 Prompt
+中声称工具受限。
+
+### 功能点 12.10 小结
+
+- 为什么受控自动激活应是可见的模型工具动作，而不是隐藏关键词路由。
+- 为什么工具结果不能直接返回技能正文，Runtime 必须从受信任 catalog 投影。
+- 为什么激活状态应从当前 Run 的严格消息配对推导，而不是保存在全局可变变量中。
+- 为什么激活调用必须独占一次响应，并为所有未执行调用补齐 ToolMessage。
+- 为什么显式 slash 必须优先于模型自动选择，且同 Run 不能切换技能。
+- 为什么模型可见工具 Schema 与真实执行权限必须在后续 allowed-tools 功能中同时约束。
+
+## 功能点 12.11：Skills 专用工具与 allowed-tools 最小策略
+
+#### 本功能点目标
+
+在 12.9—12.10 已完成的显式/自动激活主链上，为内置技能增加真正的最小工具权限：技能
+仅仅被安装或出现在基础 Prompt 目录中时不能获得专用能力；只有当前 Run 已通过 slash 或
+严格工具留痕激活它后，模型才看得到该技能允许的专用工具，而且实际执行路径必须复核同一
+权限，不能只靠 Prompt 或隐藏 Schema。
+
+第一个可观察闭环选择 `/weather-briefing` 与现成的 `get_weather`：
+
+```text
+普通天气请求
+  → 模型只看到技能名称与描述
+  → activate_skill("weather-briefing")
+  → 下一次模型调用只看到框架控制工具 + get_weather
+  → get_weather 返回真实 Open-Meteo 结果
+  → 模型生成简洁天气说明
+```
+
+显式 `/weather-briefing 城市天气` 跳过激活工具，从首次模型调用起直接使用相同权限集合。
+
+#### DeerFlow 源码对应关系
+
+本功能继续对照 DeerFlow 基线提交 `a5acc25d`：
+
+- `skills/frontmatter.py` 把 `allowed-tools` 列入允许的 frontmatter 属性；`skills/types.py`
+  用 `tuple[str, ...] | None` 保存声明。
+- `skills/parser.py` 的 `parse_allowed_tools()` 区分三种语义：省略字段为 `None`，YAML 列表
+  转为元组，显式空列表保留为空元组；非法类型、非字符串或空名称拒绝。
+- `skills/tool_policy.py` 只在活动技能存在显式声明时收紧工具，合并活动技能声明并始终
+  保留少量框架安全工具；仅安装/启用而未激活的技能不会改变权限。
+- `agents/middlewares/skill_tool_policy_middleware.py` 在模型阶段过滤 `request.tools`，并在
+  工具执行阶段再次拒绝越权调用。它还处理 slash 优先、活动路径校验、动态 registry、
+  tool search 提升过滤、决策令牌和 registry 失败关闭。
+- Lead Agent 与 Sub-agent 都把 Skill Activation Middleware 和 Skill Tool Policy
+  Middleware 相邻组装；`task` 不享受豁免，受限技能若需要委派必须显式声明。
+
+DeerFlow 支持多个来源、动态启用和多个活动技能，因此需要路径、owner token、动态 registry
+与多技能并集。Mini Deer 当前只有一次构图得到的只读内置快照、每 Run 最多一个活动技能，
+12.11 只实现这个边界内可验证的单技能策略，没有提前复制多来源复杂度。
+
+#### allowed-tools 解析与发布资产校验
+
+`BuiltInSkill` 新增 `allowed_tools: tuple[str, ...] | None`。内置 `SKILL.md` 解析保持三种精确
+语义：
+
+- 省略 `allowed-tools`：`None`，兼容旧技能，继续使用被动主 Agent 工具集合。
+- `allowed-tools: []`：显式受限，只保留框架控制工具。
+- 非空列表：只增加声明的已注册工具，再保留框架控制工具。
+
+名称必须是最长 128 字符的 `A-Za-z0-9_.-` 标识符；标量、非字符串、空白项、非法字符和
+重复项都会让受信任发布资产失败。目录解析无法预知完整运行时 registry，因此主图构建时
+再校验每个声明名称；引用未知工具会抛出 `SkillCatalogError`，不能静默忽略或放宽权限。
+
+`SkillSummary` 仍只有名称和描述。基础 Prompt、技能列表接口与工具卡不会暴露正文、主机
+路径或 allowed-tools 内部策略。
+
+#### 被动注册表、专用注册表与单一权限决策
+
+工具注册拆为两层：
+
+- `get_agent_tools()` 返回普通 Run 可见的 web、todo、clarification、activate_skill 与 task。
+- `get_skill_tools()` 返回专用 `get_weather`；它进入执行 registry，但不会进入普通模型 schema。
+
+`skills/tool_policy.py` 生成不可变 `SkillToolPolicyDecision`。当前显式白名单始终保留
+`write_todos`、`ask_clarification` 和 `activate_skill` 三个框架控制工具；实际结果按执行
+registry 顺序生成，保证 Prompt、测试和模型绑定稳定。`structured-explainer` 没有声明字段，
+因此保留 12.10 的普通工具行为，但也不会得到只存在于专用 registry 的天气工具。
+
+每次同步或异步模型调用都会重新解析当前 Run 的活动技能，再使用原始 chat model 的
+`bind_tools()` 绑定本次实际集合。这样，新 HumanMessage 开始下一 Run 后会立即重新绑定普通
+集合，不依赖上一次调用留下的可变状态。
+
+默认 Prompt 升级为 `mini-deer-agent/system/v12`：基础 `<skills>` 说明活动技能可能通过
+`allowed-tools` 收紧能力；受限技能激活后，Runtime 在技能正文后追加
+`<active_skill_tool_policy>`，列出本次模型调用的实际可用工具，并明确该清单覆盖基础通用
+目录。高度匹配且依赖当前不可见专用工具的任务，即使简短也应先激活对应技能。
+
+#### 执行端失败关闭
+
+主图路由优先级升级为：
+
+```text
+ask_clarification
+  → activate_skill
+  → skill_policy_block
+  → task
+  → 普通 tools
+  → END
+```
+
+澄清与激活继续使用各自的独占节点。其他 tool call 在进入 delegation 或 ToolNode 前，使用
+与模型绑定相同的权限决策复核名称。任何一个调用越权时，整个批次零执行：越权调用返回
+`tool_call_blocked / skill_tool_not_allowed`，同批本来获准的调用返回
+`tool_call_skipped / skill_policy_batch_rejected`。所有结果保留原 tool_call_id 并回到模型，
+既避免部分副作用，也允许模型根据稳定错误收敛。
+
+因此，即使模型伪造一个未出现在 Schema 中的 `get_weather`，普通 Run 也不会执行；天气
+技能伪造 `web_search` 或 `task` 时同样不会绕过限制或消耗委派预算。
+
+#### 天气技能与产品可见性
+
+`weather-briefing/SKILL.md` 声明 `allowed-tools: [get_weather]`。正文要求缺少/歧义城市先
+澄清，实时天气必须调用工具，回答只依据成功结果，并准确包含地点、状况、温度、体感、
+风速、数据时间与来源。现有 `get_weather` 已具备 Open-Meteo 同步、异步与取消语义，因此
+本功能没有复制第二个天气实现。
+
+前端无需增加专用组件：现有通用 ToolActivity、RunEvent、application SQLite 和历史恢复
+链已经能显示 `activate_skill` 与 `get_weather` 的调用、结果和状态。
+
+#### 测试驱动、自动化与真实验证
+
+TDD 红灯首先证明旧实现没有 `allowed_tools` 字段、不会拒绝非法声明、没有打包天气技能、
+Prompt 仍是 v11，并且伪造天气调用只会落入通用未知工具错误。随后测试覆盖：三态解析、
+非法/重复/未知工具失败、被动不可见、自动和 slash 权限绑定、同步/异步天气执行、显式空
+白名单、越权混合批次零执行、旧技能兼容、下一 Run 失效，以及既有 web、delegation、
+clarification 与产品流回归。最终结果为：
+
+```text
+后端 pytest：183 passed
+前端 vitest：27 files / 178 passed
+Python compileall、pip check、TypeScript、ESLint、Prettier、生产 build：通过
+隔离 wheel 同时包含 structured-explainer 与 weather-briefing 的 SKILL.md：通过
+git diff --check：通过
+工作区没有遗留 build/；当前环境未安装 Ruff，因此未执行 Ruff
+```
+
+用户已在真实页面按验收清单验证：普通“北京现在天气怎么样”能走
+`activate_skill → get_weather → 最终回答`，显式 `/weather-briefing` 可直接调用天气工具，
+同 Thread 下一条普通消息不继承天气权限，既有结构化解释、搜索、澄清和委派没有回退。
+用户随后明确回复“已验证”。
+
+#### 原子边界与后续
+
+12.11 没有实现多活动技能白名单并集、用户/外部技能安装、启用/禁用、支持资源、动态
+registry、tool search、请求级 secrets、子 Agent Skills 或跨摘要 Durable Context。框架安全
+工具集合也是 Mini Deer 当前产品边界，不应直接推广为未来不可信技能的默认授权。
+
+Skills 阶段的内置发现、显式激活、受控自动激活和专用工具最小权限闭环到此完成。下一连续
+功能点进入 12.12「动态日期/时间上下文」：先对照 DeerFlow 的
+`dynamic_context_middleware.py`，再确认如何把服务端可信时间只投影到当前模型调用、不污染
+checkpoint，并用真实页面日期/时间问题验证。尚未开始实现。
+
+### 功能点 12.11 小结
+
+- 为什么可发现技能不能自动获得专用工具，权限必须由当前 Run 的可信激活触发。
+- 为什么省略、显式空列表和非空 allowed-tools 必须保留不同语义。
+- 为什么模型可见 Schema 和实际执行路径必须复用同一权限决策。
+- 为什么受限批次出现一个越权调用时，当前最小实现选择整个批次零执行。
+- 为什么旧技能兼容集合不能包含专用 registry，避免未声明能力侧漏。
+- 为什么下一 Run 必须重新绑定普通工具，而不能依赖模型对象上的历史绑定状态。
+
+## 功能点 12.12：动态日期/时间上下文
+
+#### 本功能点目标
+
+让模型在每次调用时获得 Runtime 生成的可信当前日期、时间、星期和宿主时区信息，解决大
+模型无法可靠感知“现在”的问题。相对时间问题不应依赖训练数据中的过期日期，也不应仅为
+确认宿主当前时间而调用联网工具；主 Agent 与通用子 Agent 必须遵守同一契约。
+
+动态事实只属于本次模型请求，不能成为用户可见消息，也不能进入 LangGraph checkpoint、
+application SQLite 或历史 API。这样既能刷新时间，又不会用内部系统上下文污染真实对话。
+
+#### DeerFlow 源码对应关系
+
+本功能对照 DeerFlow 基线提交 `a5acc25d`：
+
+- `agents/middlewares/dynamic_context_middleware.py` 把当前日期格式化为带英文星期的
+  `<system-reminder>`。首轮注入时使用服务端来源标记和权威 `reminder_date` 元数据，不能
+  通过解析可能被用户影响的 Memory 文本判断日期。
+- DeerFlow 的主 Agent 是长寿命 checkpoint 图，因此日期在会话内冻结；跨午夜时再向最新
+  合法 HumanMessage 前插入新提醒。它还要交换原用户消息 ID，并跳过旧摘要、提醒和
+  `__user` 后缀消息，防止重复执行或后缀递归增长。
+- 可受用户影响的 Memory 被分离为隐藏 HumanMessage，不提升到 SystemMessage 权限；异步
+  入口把可能阻塞的 Memory/Tokenizer 工作放入线程并设置超时。
+- `system_message_coalescing_middleware.py` 在真正请求 provider 前，把静态 Prompt 和历史中
+  的 SystemMessage 合并成唯一首位系统消息，并只保留最新日期提醒；checkpoint 本身不因
+  这一步被重写。
+- `SubagentDateContextMiddleware` 为一次性子 Agent 注入日期，不复制主 Agent 的会话冻结和
+  跨午夜状态机。
+
+DeerFlow 当前实际只注入服务端本地日期和英文星期，并没有显式 IANA 时区配置。Mini Deer
+的产品边界更小：既有 `prepare_model_messages()` 已经保证唯一首位 SystemMessage，而每个
+产品 Run 会重新构图。因此本功能无需复制持久化提醒、ID 交换、跨午夜扫描、Memory 超时或
+第二层系统消息合并中间件。
+
+#### Mini Deer 的可信时间投影
+
+新增 `agents/middleware/dynamic_context.py`，定义可注入的 `DynamicContextClock` 和默认
+`current_local_datetime()`。默认时钟使用：
+
+```python
+datetime.now().astimezone()
+```
+
+它返回带宿主本地时区和 UTC 偏移的 aware datetime。当前 Windows 环境实测为
+`UTC+08:00`；标准库 `ZoneInfo("Asia/Shanghai")` 因环境没有 `tzdata` 而不可用，所以
+12.12 没有增加依赖或伪造 IANA 名称，而是准确报告宿主实际名称与数字偏移。
+
+每次投影形成以下模型专用区块：
+
+```text
+<dynamic_context source="runtime">
+<current_datetime>2026-08-31T22:27:40+08:00</current_datetime>
+<current_date>2026-08-31</current_date>
+<current_time>22:27:40</current_time>
+<current_weekday>星期一 / Monday</current_weekday>
+<timezone_name>宿主返回的本地名称</timezone_name>
+<utc_offset>UTC+08:00</utc_offset>
+</dynamic_context>
+```
+
+微秒没有交互价值，会在渲染前移除；时区名称经过 HTML 转义。时钟返回非 datetime 或没有
+UTC 偏移的 naive datetime 时直接失败，避免把无法定位的墙上时间冒充可信事实。
+
+投影使用 `SystemMessage.model_copy()`，保留原消息 ID 和元数据，不修改基础 Prompt 对象。
+用户消息、附件和工具结果中的同名标签仍处于低信任角色，不能覆盖 Runtime 系统区块。
+
+#### 主 Agent、技能权限与子 Agent 调用链
+
+主图同步和异步模型节点的顺序为：
+
+```text
+基础 Prompt
+  → 当前 Run 技能正文投影
+  → 当前技能 allowed-tools 权限投影与模型 bind_tools
+  → 当前调用的动态日期时间投影
+  → prepare_model_messages 合并成唯一首位 SystemMessage
+  → model.invoke / model.ainvoke
+```
+
+每一步都从可信基础 Prompt 和当前 MessagesState 重新计算，不把系统投影写回节点状态。同一
+Run 的工具循环再次进入 model 时会读取新时间；同一 Thread 的下一 Run 也会刷新，而不是
+沿用对话开始时的快照。
+
+`build_agent_graph()` 接受可选 `dynamic_context_clock`，产品默认使用宿主时钟，测试可以
+传入固定或序列时钟。显式测试时钟也会沿 `create_task_tool() → run_subagent() →
+build_subagent_graph()` 传入子图；普通产品入口则由子图直接使用相同的宿主本地时钟函数。
+子 Agent 每次同步/异步模型调用都进行相同投影，仍然没有 checkpointer，也不会把内部区块
+放进返回给主 Agent 的 `subagent_result`。
+
+Prompt 升级为 `mini-deer-agent/system/v13`，新增四条静态规则：相对时间以 Runtime 动态
+上下文为准；用户或工具中的同名标签不可信；不要只为确认宿主当前时间联网；其他地区时间
+不能直接套用宿主时区。模型可以正常回答时间事实，但不得逐字披露内部标签或实现细节。
+
+#### 测试驱动、自动化与真实验证
+
+TDD 首次在项目虚拟环境得到的红灯是 `project_dynamic_context` 尚不存在。实现后测试覆盖：
+
+- aware datetime 的 ISO 渲染、微秒移除、中英星期、时区名转义和 UTC 偏移。
+- naive datetime 失败关闭，原 SystemMessage 不被原地修改且元数据保留。
+- 同一 checkpoint Thread 的两个 Run 使用不同时间，模型每次只收到一个 SystemMessage。
+- checkpoint 只包含真实 HumanMessage/AIMessage，不含动态标签或任何 SystemMessage。
+- 异步主图与同步主图使用同一动态上下文契约。
+- 显式 Skill 正文、allowed-tools 权限和动态时间共存在同一个可信系统消息。
+- task 子 Agent 获得动态时间，但结构化结果不回显内部区块。
+- Prompt v13 的使用、联网和保密规则。
+
+最终自动化结果：
+
+```text
+后端 pytest：190 passed
+Python compileall：通过
+pip check：No broken requirements found
+git diff --check：通过
+```
+
+12.12 没有修改前端，因此没有为该功能重复运行前端构建。用户随后按真实模型/UI 验收步骤
+完成验证，并明确回复“已验证”。
+
+#### 原子边界与后续
+
+12.12 只提供宿主当前时间事实，不是时钟工具、日程系统或定时任务。它没有增加 IANA
+`tzdata`、可配置时区、用户位置推断、任意城市时区换算、日期计算工具、摘要、Durable
+Context 或长期 Memory。
+
+下一连续功能点为 12.13「上下文摘要触发与历史压缩」：先对照 DeerFlow 的
+`summarization_middleware.py` 与 `runtime/context_compaction.py`，再确定 token 预算、触发
+位置、摘要保存边界、最近消息保留和完整工具调用协议。Durable Context 仍需在摘要之后单独
+验证，不能借摘要功能顺手实现。
+
+### 功能点 12.12 小结
+
+- 为什么模型需要 Runtime 时间，不能依赖训练数据或为宿主时间多余联网。
+- 为什么 Mini Deer 采用每次调用投影，而无需复制 DeerFlow 的持久化日期提醒状态机。
+- 为什么时钟必须返回带 UTC 偏移的 aware datetime。
+- 为什么动态事实要与技能和权限合并成唯一 SystemMessage，但不能进入 checkpoint。
+- 为什么主 Agent 与子 Agent 必须使用同一上下文契约。
+- 为什么宿主时区不等于任意目标地区时区，12.12 不应虚构 IANA 名称。
+
+## 功能点 12.13：上下文摘要触发与历史压缩
+
+### 目标与 DeerFlow 对照结论
+
+12.13 的目标不是删除页面历史，而是在 Agent checkpoint 接近上下文预算时，用累计摘要替换
+较早消息，让长 Thread 可以继续运行。对照 DeerFlow 提交 `a5acc25d` 后确认，其自动摘要的
+关键语义包括：消息数/token 数 OR 触发、已有摘要累计折叠、保留近期窗口、摘要调用禁止流式
+外显、成功后才删除旧消息，以及失败时保持原历史。DeerFlow 还提供手动 compaction、专用模型
+选择和 Durable Context；这些不属于 Mini Deer 12.13。
+
+Mini Deer 的产品历史与 Agent 状态本来就分库：`application.sqlite` 保存页面需要的完整
+Thread/Run/Message/Tool 时间线，`checkpoints.sqlite` 保存 LangGraph 下一次运行需要的状态。
+因此压缩只能作用于后者，不能把历史 API 改成返回摘要。
+
+### 状态、策略与安全分区
+
+新增 `MiniDeerAgentState(MessagesState)`，在标准 `messages` reducer 之外持久化可选
+`summary_text`。`ContextSummaryPolicy` 定义开关、token 阈值、消息阈值、保留消息数和摘要
+输入预算。当前产品默认值为：约 50000 tokens 或 40 条 checkpoint 消息命中任一条件即尝试
+压缩；至少保留 10 条消息；摘要输入约 25000 tokens。配置可由
+`MINI_DEER_CONTEXT_SUMMARY_*` 环境变量覆盖。
+
+保留窗口不是简单截取最后 N 条。切点若落在 AIMessage 或 ToolMessage 中间，会向前回退到
+HumanMessage，从而保留一个完整用户回合。若整个候选窗口只有同一用户回合，找不到安全切点，
+本轮不压缩；这会让一个超长工具链暂时超过 10 条，但不会破坏 tool call/result 协议。
+
+token 计数使用 `count_tokens_approximately()`，并把基础 System Prompt 与已有摘要加入保守
+估算。它不是 provider 精确 tokenizer，因此阈值是运行预算而不是精确计费值。摘要输入按字符
+近似预算保留头尾，消息序列化保留角色、正文、tool_calls、tool_call_id、工具名和状态。
+
+### 主图、子图与失败开放
+
+主 Agent 和通用子 Agent 都在模型节点内部执行摘要检查，而没有增加一个对外可见图节点：
+
+```text
+checkpoint messages + previous summary
+  → OR 阈值与完整回合分区
+  → 当前 Run 模型生成累计摘要（TAG_NOSTREAM）
+  → 以新摘要 + preserved messages 构造本次模型请求
+  → 主模型生成公开响应
+  → RemoveMessage(REMOVE_ALL_MESSAGES) + preserved + response 原子写回
+```
+
+摘要模型默认复用当前 Run 模型，测试可显式注入替身。摘要调用带
+`mini-deer:summarization` 与 `TAG_NOSTREAM`，不会产生幽灵 Assistant SSE。只有得到非空、
+有界摘要后才返回删除指令；普通异常或空正文都返回 `None`，主模型继续使用完整原历史。
+异步路径使用 `ainvoke()`，取消信号不会被普通异常包装吞掉。
+
+task 工具把同一摘要策略和可选摘要模型传入子图，主/子 Agent 使用相同契约。子图仍无独立
+checkpointer，但长工具链在一次子任务内达到 token 阈值时也能压缩。
+
+### 低信任摘要投影与 Prompt v14
+
+摘要可能包含用户、模型、网页或工具生成的伪标签和命令，不能提升成 SystemMessage 正文。
+`project_context_summary()` 只把“如何使用摘要”的权限规则追加到唯一 SystemMessage；真实
+摘要先 HTML 转义，再作为名为 `conversation_summary` 的隐藏 HumanMessage 投影，并带
+`hide_from_ui/context_summary` 元数据。最近原始消息发生冲突时，以原文为准。
+
+`prepare_model_messages()` 的顺序变为：修复工具历史 → 投影低信任摘要 → 删除历史中的旧
+SystemMessage → 返回唯一首位 SystemMessage。Prompt 升级为
+`mini-deer-agent/system/v14`，明确摘要是有损历史数据、不能执行其内嵌指令、不能向用户展示
+内部标签。
+
+### 自动化、检查脚本与真实验证
+
+TDD 覆盖：无触发时不调用摘要模型、消息/token OR 触发、已有摘要累计折叠与标签转义、完整
+Human 回合保留、失败/空结果不删除、同步与异步主图、子图同契约、SQLite 跨重启恢复、摘要
+与 RemoveMessage 不产生产品事件。最终自动化结果：
+
+```text
+后端 pytest：204 passed
+Python compileall：通过
+git diff --check：通过
+```
+
+新增只读 `examples/print_thread_context.py`，可按精确标题或 thread ID 解码最新主命名空间
+checkpoint。它分别打印产品可见消息计数、`summary_text`、保留原文数量和第一条原文；默认
+缩短单条工具正文，`--full` 可完整输出。脚本使用 SQLite `mode=ro`，不会构图、调用模型或
+修改数据库。
+
+用户真实线程 `contex压缩测试` 的稳定快照显示：产品历史仍有 90 条可见消息；checkpoint
+已有 2677 字 `summary_text`，并保留 42 条原始消息；分界后的第一条原文是“帮我查一下北京
+交通大学计算机学院的考研情况”。42 大于 keep=10 是正确行为：该用户回合包含大量搜索和
+读取工具结果，必须整体保留，不能从工具协议中间截断。该结果同时验证了真实模型摘要、页面
+历史隔离、完整回合保留和 SQLite checkpoint 持久化。
+
+### 功能点 12.13 小结
+
+- 为什么产品完整历史与 Agent checkpoint 必须分离。
+- 为什么压缩成功后需要原子提交摘要、删除指令、保留窗口和公开响应。
+- 为什么摘要正文只能作为低信任数据，不能成为系统权限。
+- 为什么 keep 是最小保留预算，而不是必须精确等于 N 条。
+- 为什么摘要失败时宁可暂时保留超长历史，也不能先删后补。
+- 为什么下一步仍需 Durable Context：委派台账、技能状态等结构化事实不能只依赖自然语言摘要。
+
+下一连续功能点为 12.14「Durable Context 压缩后关键状态续接」。
+
+## 功能点 12.14：Durable Context 压缩后关键状态续接
+
+### 目标与 DeerFlow 对照结论
+
+12.13 的自然语言摘要只能尽量保留事实，不能作为委派状态、技能权限或 Todo 清单的精确数据
+源。12.14 的目标是在原始 AIMessage/ToolMessage 被压缩后，仍以独立 checkpoint 通道保存这些
+状态，并在模型真正需要时安全投影。
+
+DeerFlow 的 `durable_context_middleware.py` 与 `thread_state.py` 把 `delegations`、
+`skill_context` 和 `summary_text` 作为独立 ThreadState 字段。`delegation_ledger.py` 从 task
+调用和结果生成状态、结果简述与哈希，`after_model` 会在 task 刚发出时先保存
+`in_progress`，避免工具完成前的 checkpoint 丢失委派事实；结果到达后再升级终态。终态不会
+回退，台账最多 50 条。`skill_context.py` 只接受受信任文件工具附带的生产者元数据，保存技能
+名称、路径与描述，不保存正文，最多 8 条。模型调用时由可信 SystemMessage 解释使用规则，
+真实状态则作为隐藏 HumanMessage 数据注入，不把临时投影写回 state。
+
+DeerFlow 的 Todo 不属于 DurableContextMiddleware 三个字段，而是由标准 Todo state 和
+`todo_middleware.py` 独立维护；原始 `write_todos` 调用被摘要删除后，middleware 会从 state
+恢复准确清单。这个行为说明“关键结构化状态”不仅包括 delegation 和 skill，也包括当前计划。
+
+### Mini Deer 不能照搬的语义
+
+Mini Deer 的 `RunStreamService` 每个产品 Run 都重新构图，委派预算闭包只属于当前 Run；Skills
+12.9—12.11 又已经通过真实验证确定“下一 Run 失效”。同时，12.13 会保留整个最新 Human
+回合，因此当前 Run 的 task、activate_skill 与 write_todos 协议通常仍在原始窗口中。
+
+如果直接照搬 DeerFlow 并把旧技能当成持续活动状态，会导致下一条普通用户消息继承技能正文、
+格式与 allowed-tools，破坏已验证边界；如果让历史委派继续占用预算或绝对禁止重试，也会阻止
+用户明确要求刷新资料。因此 Mini Deer 使用 Human message ID 作为 turn ID，把当前回合恢复
+与跨回合历史观察严格区分。
+
+### 独立状态通道与 reducer
+
+新增 `agents/durable_state.py`，`MiniDeerAgentState` 现在包含：
+
+```text
+messages
+summary_text
+delegations   -> 最多 50 条，按 tool_call_id 合并，终态不回退
+skill_context -> 最多 8 条，按 turn_id + skill name 去重
+todos         -> 最近一次成功提交的完整 Todo 快照
+```
+
+委派条目保存 `id/turn_id/description/subagent_type/status`，终态可附带最长 2000 字结果简述、
+完整结果 SHA-256 和错误码。哈希用于确认结果身份，不把无界子 Agent 正文长期复制到 prompt。
+
+技能条目只保存名称、catalog 描述、`builtin://<name>/SKILL.md` 引用、激活来源和 turn ID；
+`SKILL.md` 正文、allowed-tools 以及主机绝对路径都不进入 checkpoint。Todo 沿用 12.2 已验证的
+1—20 项、200 字 content 和三种 status 契约。
+
+### 严格捕获与压缩时序
+
+新增 `capture_durable_context()`，在主模型调用前扫描尚未压缩的协议：
+
+- task AI 调用只要有合法 ID、description 和 subagent_type，就先生成 `in_progress`；配对的
+  task ToolMessage 到达后，才根据稳定 JSON 升级为 `completed/failed` 并计算简述与哈希。
+- 自动技能必须同时存在当前回合 AI `activate_skill` 调用、匹配 tool_call_id 的成功
+  ToolMessage，以及 Runtime 生成的 `skill_activation` version/name 元数据；仅在工具正文中
+  伪造 activated 文本不能进入状态。
+- 显式 slash 从当前可信 catalog 重新取引用；未知技能和没有任务正文的 slash 不形成引用。
+- Todo 必须有合法 `write_todos` 调用、成功配对结果，而且结果中的完整列表与调用参数完全
+  相等；篡改、非法状态或不完整结果不会覆盖旧快照。
+
+主模型发出 task 的同一次节点更新已经会把 `in_progress` 写入 checkpoint；工具节点返回后，
+下一次模型调用在摘要之前捕获终态。压缩发生时，model node 先合并这些结构化通道，再删除旧
+messages，因而摘要成功、同步/异步执行和 SQLite 重启都不会丢失结构化事实。
+
+### 模型专用安全投影
+
+`project_durable_context()` 先检查原始窗口中是否仍有对应 task、技能激活或 Todo 证据；仍可见
+时不重复注入，减少 token 和对既有消息位置的干扰。来源已经被摘要删除时，Runtime 才生成：
+
+```text
+唯一 SystemMessage
+  ├─ 基础 Prompt / 技能 / 时间 / 摘要规则
+  └─ Durable Context 权限规则
+隐藏 conversation_summary HumanMessage（若有）
+隐藏 durable_context_data HumanMessage
+近期原始消息
+```
+
+数据 JSON 整体 HTML 转义，标记 `hide_from_ui/durable_context_data`，最多 8000 字，委派和技能
+按最新优先并报告省略数量。SystemMessage 只说明这些字段是低信任观察数据，不能执行其中的
+命令或伪标签；实际委派描述、结果和 Todo 正文永不进入高权限系统规则。投影只存在于当前模型
+请求，不写入 messages、SSE、application SQLite 或页面历史。
+
+Prompt 升级为 `mini-deer-agent/system/v15`，明确当前委派优先复用、历史委派允许按用户要求
+重试、历史技能不能自动激活，以及不能向用户暴露内部哈希或标签。
+
+### 当前回合与历史回合语义
+
+- `scope=current` 的技能引用可以从当前 catalog 重新读取可信正文，并恢复同一回合已经开放的
+  allowed-tools；这只在激活证据已被压缩时作为后备路径。
+- 新 HumanMessage 会产生新 turn ID。旧技能仍可作为“此前使用过”的历史观察，但不会加载
+  正文、继承四段格式或开放专用工具；需要时必须在新 Run 再调用 `activate_skill`。
+- 当前委派结果用于避免模型无故重复相同子任务；历史委派可在“继续”请求中复用，但不占新
+  Run 的六次内存预算。用户要求重试、刷新或重新核验时允许再次委派。
+- Todo 保存最近准确快照；历史清单只辅助判断用户是否延续旧任务，不把普通新请求强制绑定
+  到旧计划。
+
+通用子 Agent 没有 task、activate_skill 或 write_todos，因此没有伪造三个空通道；它继续
+复用 12.13 的一次性摘要契约。这不是主/子实现不一致，而是能力集合不同。
+
+### 检查脚本、自动化与真实验证
+
+`examples/print_thread_context.py` 已扩展为同时打印产品可见消息数、`summary_text`、三个
+Durable Context 通道、压缩分界和保留原文；仍以 SQLite `mode=ro` 打开数据库，不构图、不
+调用模型、不修改 checkpoint。
+
+TDD 覆盖：严格调用/结果配对、技能正文不落盘、伪造元数据与错配 Todo 拒绝、委派终态不回退、
+50/8 容量、压缩后注入、同步/异步一致、当前回合技能恢复、新 Human 回合失效、SQLite 跨重启
+恢复和只读脚本。最终检查：
+
+```text
+后端 pytest：213 passed
+Python compileall：通过
+pip check：No broken requirements found
+git diff --check：通过
+```
+
+12.14 没有修改前端。用户按真实模型/UI 验收清单确认：结构化状态在原始工具消息压缩后仍可
+从脚本看到并被后续请求使用；新 Run 的普通回答没有继承旧技能格式或权限；要求复用既有两个
+子 Agent 结论时没有产生新的 task 工具卡。用户随后明确回复“已验证继续”。
+
+### 功能点 12.14 小结
+
+- 为什么自然语言摘要不能代替结构化状态通道。
+- 为什么 task 发出后要先记录 `in_progress`，终态又不能回退。
+- 为什么技能引用可以持久化，但技能正文和权限不能无条件跨 Run 持久化。
+- 为什么 Todo 结果必须与调用参数完整匹配后才能成为可信快照。
+- 为什么 Durable Context 数据必须保持 Human 低信任等级、转义和限长。
+- 为什么历史委派可复用但不能占用新 Run 预算或禁止用户明确重试。
+
+下一连续功能点为 12.15「本地单用户长期 Memory 显式管理」：先对照 DeerFlow Memory 的存储、
+工具和模型投影链路，再确认键值契约、敏感信息边界、跨 Thread 读取和删除语义。模型自动提取
+仍须后置，不能与显式 Memory 第一版混在一起。
+
+## 功能点 12.15：本地单用户长期 Memory 显式管理
+
+### 目标与 DeerFlow 对照结论
+
+12.15 的目标是在不同 Thread 之间保存用户明确要求长期记住的事实，并让用户能够读取、修改和
+删除，而不是让模型自动分析所有聊天内容。这个能力和 12.13/12.14 的 checkpoint Context 有
+本质区别：Context 用于延续一个 Thread 的 Agent 执行状态，Memory 是独立于任何 Thread 的
+产品级长期事实。
+
+DeerFlow 的 Memory 同时存在两种运行模式：
+
+- tool mode 向 Lead Agent 注册 `memory_search`、`memory_add`、`memory_update`、
+  `memory_delete`，由模型按需检索并显式管理事实；
+- middleware mode 在每次运行后异步接收对话，由 LLM 自动提取或修订事实；摘要删除旧消息前，
+  `summarization_hook.py` 还会先把待压缩内容交给 Memory 队列。
+
+两种模式共享 `MemoryManager` 抽象和后端。DeerMem 后端进一步实现多用户/Agent scope、全局摘要、
+Markdown fact 文件、revision 与冲突重试、FTS5/BM25 检索、容量淘汰、陈旧度审查、合并和迁移；
+mem0、Honcho、OpenViking 等后端则通过同一管理接口替换。工具模式只自动注入全局摘要，Agent
+facts 留在 `memory_search` 后面；中间件模式才会把筛选后的 facts 一并投影。
+
+Mini Deer 当前是本地单用户产品，也没有远程 Memory、向量索引或自动抽取的质量评估。直接
+复制整套 DeerMem 会让学习目标被多后端、文件事务、迁移和自动推断风险淹没。因此 12.15 只
+采用 DeerFlow tool mode 的四工具交互，并把第一版事实存进已有业务 SQLite。自动抽取继续
+后置，不能把“模型认为有用”误当成用户授权。
+
+### 为什么 Memory 属于 application SQLite
+
+Mini Deer 已经有两个职责明确的数据库：
+
+```text
+data/checkpoints.sqlite
+  └─ 单 Thread 的 messages / summary / durable execution state
+
+data/application.sqlite
+  ├─ Thread / Run / Message / Tool 产品历史
+  └─ memory_facts：本地用户跨 Thread 的长期事实
+```
+
+如果把 Memory 放进 checkpoint，它会被 `thread_id` 隔离，无法在新 Thread 读取；删除 Thread
+还可能让长期事实一起消失。12.15 将业务库 schema 从 v6 升级到 v7，`memory_facts` 不带 Thread
+外键，因此删除任意 Thread 不会级联删除 Memory，关闭仓储或重启进程后也能从同一数据库恢复。
+
+`MemoryFact` 保存：
+
+```text
+fact_id       fact_<uuid hex>
+content       去除首尾空白后的事实正文，最长 2000 字
+category      preference/correction/context/goal/behavior/identity/
+              constraint/decision/other
+confidence    0.0—1.0
+source        固定 manual
+created_at    UTC ISO 时间
+updated_at    UTC ISO 时间
+```
+
+`source=manual` 表示事实来自用户明确授权的工具写入路径，不代表用户直接编辑了数据库。创建时间
+在更新时保持不变，更新时间反映最近修改。
+
+### 去重、查询与事务语义
+
+展示正文与去重 key 分开保存。仓储对正文执行 `strip()` 后展示，同时以
+`strip().casefold()` 生成 `content_key`。数据库对 `content_key` 建 UNIQUE 约束，而不是仅在
+工具调用前先查一遍，因此两个并发新增或把不同 fact 更新成同一正文时也不能同时成功。
+
+第一版没有模糊语义搜索。`memory_search` 对 query 同样 `strip().casefold()`，然后使用 SQLite
+`instr(content_key, ?)` 做字面包含匹配。它比 `LIKE` 更符合当前契约：用户查询中的 `%` 和 `_`
+只是普通字符，不会意外扩张匹配范围。查询可用 category 精确过滤，默认最多 10 条、允许
+1—50 条；空 query 会按 `updated_at DESC, fact_id DESC` 稳定列出最近 Memory。query 最长
+500 字，避免无界检索参数。
+
+创建、更新、删除都在业务仓储已有的 `RLock` 和 SQLite 事务内执行。更新只改变明确提供的字段；
+三个字段都省略会被拒绝。不存在的 fact ID、重复正文、非法 category、空白/过长正文和区间外
+confidence 都转换为稳定领域错误，工具不会把失败伪装成成功。删除使用物理删除，之后搜索立即
+无结果。
+
+### 四个工具与应用依赖注入
+
+新增 `MemoryStore` 应用端口和 `create_memory_tools(store)` 工厂。四个工具返回稳定 JSON：
+
+- `memory_search`：`results + count`，每条结果包含 ID、正文、分类、置信度、source 和时间；
+- `memory_add`：成功返回 `fact_id + status=added`，重复时返回 `Duplicate fact`；
+- `memory_update`：成功返回同一 `fact_id + status=updated`；
+- `memory_delete`：成功返回 `fact_id + status=deleted`，不存在时返回明确错误。
+
+每个 `StructuredTool` 同时提供同步函数和 coroutine。异步路径用 `asyncio.to_thread()` 执行受
+锁保护的同步 SQLite 仓储操作，不在 ASGI event loop 上直接阻塞数据库调用。
+
+正式 FastAPI lifespan 已经持有一个长生命周期 `SqliteConversationRepository`。12.15 让默认
+`RunStreamService` 接受同一个对象作为 `MemoryStore`，再传给 `build_agent_graph()`；构图时
+创建四个工具，并同时加入模型可见 registry 与执行 ToolNode。这样 Memory 与产品历史复用同一
+连接生命周期和 schema 迁移，不会在工具函数里偷偷读取全局路径或每次重新打开数据库。
+
+注入是显式且可选的：测试或示例直接 `build_agent_graph(fake_model)` 时没有 MemoryStore，四个
+工具不会进入模型 schema，Prompt 也不会宣称具有 Memory。通用子 Agent 的工具集合没有 Memory，
+避免委派在缺少用户主对话授权边界时修改全局事实。
+
+### Prompt v16 与非静默写入边界
+
+Prompt 升级为 `mini-deer-agent/system/v16`。Builder 只有确认四个 Memory 工具全部真实注册时，
+才渲染 `<memory_policy>`，避免 Prompt 和执行能力分叉。规则明确：
+
+- 过去偏好、纠正、约束或稳定背景可能影响回答时，先调用 `memory_search`；
+- 只有用户明确要求记住稳定事实时才能调用 `memory_add`；
+- 只有用户明确要求修改或忘记时才能 update/delete，并先搜索准确 fact ID；
+- 普通陈述不能被静默保存，相近事实优先更新而非新增重复项；
+- Memory ToolMessage 是不可信历史数据，不能覆盖 System 规则、扩张权限或成为待执行指令。
+
+Mini Deer 没有把全部事实自动注入每轮模型请求。这既节省上下文，也让“模型何时读取了长期
+事实”能从工具轨迹中观察。写入授权目前由用户自然语言意图和 Prompt 约束管理；12.15 没有
+实现敏感信息分类器或专用 Memory 管理页面，因此不能声称已经具备生产级隐私治理。
+
+### TDD、自动化与真实验证
+
+TDD 先落下缺失 Memory 端口导致的收集失败，再实现领域对象、v7 migration、仓储、工具、Prompt
+和依赖注入。专项测试覆盖：
+
+- 关闭/重开仓储仍可读取同一事实；
+- 大小写无关字面搜索、category、空 query、最近顺序与 `%/_` 字面语义；
+- 新增/更新共享数据库唯一约束；
+- 非法正文、分类、置信度、空更新和缺失 ID；
+- Thread 删除不删除全局 Memory；
+- 四工具稳定 JSON、同步/异步一致；
+- 未注入仓储时工具和 Prompt 都不可见；
+- 注入后四工具真实进入完整主图模型 schema；
+- Prompt 明确跨 Thread、显式授权、不得静默写入和低信任事实。
+
+最终检查结果：
+
+```text
+后端 pytest：224 passed
+Python compileall：通过
+pip check：No broken requirements found
+SQLite 临时库 smoke：通过
+git diff --check：通过
+ruff：当前环境未安装
+```
+
+12.15 没有修改前端；Memory 调用沿用已经验证的通用工具卡展示。用户在真实模型/UI 中依次完成：
+
+1. 明确要求记住测试代号，观察到 `memory_add`；
+2. 新 Thread 询问，`memory_search` 返回旧值；
+3. 明确要求修改，经过 search/update 后新 Thread 只返回新值；
+4. 发送普通“喝咖啡”陈述，没有产生任何 Memory 写入；
+5. 明确要求忘记，经过 search/delete 后新 Thread 搜索无结果。
+
+用户随后明确回复“已验证”，因此跨 Thread、新旧值切换、删除立即失效和非静默写入均可记录为
+真实验证结论，而不是只根据单元测试推断。
+
+### 功能点 12.15 小结
+
+- 为什么长期 Memory 不能放进单 Thread checkpoint。
+- 为什么第一版采用显式工具模式，而不是未经评估的自动抽取。
+- 为什么数据库唯一约束比“先搜索再新增”更能保证并发去重。
+- 为什么 `instr(casefold key)` 更适合字面包含契约，且不会误解 `%/_`。
+- 为什么 Memory 工具和 Prompt 必须随同一个存储依赖一起出现或一起消失。
+- 为什么长期事实仍是低信任数据，能影响回答但不能提升为系统指令。
+- 为什么删除 Thread 与删除 Memory 是两个独立产品动作。
+
+12.15 完成后曾建议 12.16 进入工具循环检测；用户根据当前工具数量与 Agent 复杂度重新评估后，
+决定把循环检测后置，并将 12.16 改为 MCP 接入。这个变更说明路线服务于真实需求，编号和文档必须
+跟随已确认的实施事实，而不能让旧建议覆盖用户的新决定。
+
+## 功能点 12.16：MCP 外部工具接入
+
+### 为什么当前先接 MCP
+
+Mini Deer 已有手写 `model → tools → model` 循环，但工具数量仍少，现阶段很难自然出现重复工具
+调用形成的闭环。循环检测继续做下去只能主要依赖人为构造测试；MCP 则能立即扩展真实工具集合，
+让现有 Agent 循环、权限和流式工具展示在更接近实际使用的条件下接受验证。因此用户明确决定先
+接入 MCP，循环检测与工具输出预算后置。
+
+MCP 不会替换 LangGraph 循环。MCP Server 只负责公布工具名称、说明、参数 schema 和执行结果；
+Mini Deer 仍负责把工具交给模型、执行模型生成的 `tool_calls`、产生 `ToolMessage`，再回到模型
+生成最终回答。它扩展的是工具来源，不是另建一套 Agent Runtime。
+
+### DeerFlow 对照与 Mini 第一版取舍
+
+DeerFlow 使用 `langchain-mcp-adapters` 的 `MultiServerMCPClient`，并在此之上实现：
+
+- `extensions_config.json` 多服务器配置、stdio/HTTP/SSE 和环境变量解析；
+- 按服务器并行发现、初始化超时和失败隔离；
+- 默认 `<server>_` 工具名前缀、非法名称过滤与 MCP 元数据；
+- stdio 持久 session pool、按 user/thread scope 复用进程；
+- 配置签名缓存与热更新、Gateway 管理 API、密钥遮罩和 stdio 注册防御；
+- HTTP/SSE OAuth、路由提示、长任务轮询和结果持久化。
+
+这些能力解决的是完整扩展平台、多人环境和长期运行问题。Mini Deer 当前是本地单用户、单进程
+学习项目，没有 MCP 管理面板、OAuth 提供方或需要维持远程 task 的业务。12.16 因此只保留工具
+接入正确性所需的配置、发现、隔离、名称安全、生命周期和状态观察，不复制热更新、session pool
+与长任务系统。
+
+### 静态可信配置
+
+`Settings` 新增：
+
+```text
+MINI_DEER_MCP_CONFIG_PATH=mcp_servers.json
+MINI_DEER_MCP_SERVER_INIT_TIMEOUT_SECONDS=10
+```
+
+默认文件不存在表示 MCP 未配置，应用照常启动。配置文件使用 `mcpServers`：
+
+```json
+{
+  "mcpServers": {
+    "learning": {
+      "enabled": true,
+      "transport": "stdio",
+      "command": "python",
+      "args": ["examples/mcp_learning_server.py"]
+    },
+    "docs": {
+      "transport": "http",
+      "url": "https://example.invalid/mcp",
+      "headers": {"Authorization": "Bearer ${DOCS_TOKEN}"}
+    }
+  }
+}
+```
+
+stdio 使用 `command/args/env`，HTTP 使用 `url/headers`。`env` 和 `headers` 的字符串值可以引用
+`$NAME` 或 `${NAME}`；缺少环境变量时配置被明确拒绝，避免把未解析占位符发给外部服务。命令、
+参数和 URL 不做模板替换，防止配置解析器无意成为命令拼接器。禁用项不会连接，因此允许暂时缺少
+命令或密钥。
+
+配置是本机管理员维护的可信文件，没有任何 HTTP 写接口。stdio 本质上会启动本地进程，所以
+第一版不能把配置写权限开放给不可信用户，也不能把它误称为已具备 Sandbox 或工具审批。
+
+### 启动发现、故障隔离与稳定快照
+
+FastAPI lifespan 打开两份 SQLite 后调用 `initialize_mcp_runtime()`。所有启用服务器共用一个
+`MultiServerMCPClient(tool_name_prefix=True)`，但 `get_tools(server_name=...)` 按服务器并行执行，
+每个任务各自经过 `asyncio.wait_for()`。一个服务器连接失败或超时只产生 `failed` 状态，健康
+服务器的工具仍会注册，应用也可以正常 ready。
+
+发现结果只在启动时冻结一次，并同时保存：
+
+```text
+McpRuntime
+├─ configured / config_path
+├─ tools
+└─ servers[]
+   ├─ name / transport
+   ├─ disabled | loaded | failed
+   ├─ tool_names
+   └─ bounded error
+```
+
+`GET /api/v1/mcp/status` 从这个快照投影状态，不重新连接服务器，也不返回 command、args、env、
+headers 等配置内容。工具和状态由同一次发现产生，避免“接口说已加载、Agent 却使用另一份列表”。
+配置改动需要重启后端，这比当前阶段引入文件签名缓存、跨 Worker 失效和 session teardown 更清晰。
+
+### 名称安全、工具注册与 Skills 权限
+
+服务器名和最终工具名只允许字母、数字、下划线和连字符。适配器默认加 `<server>_` 前缀，例如
+MCP Server 的 `add_numbers` 在 Mini Deer 中成为 `learning_add_numbers`。前缀避免两个服务器都
+提供 `search` 时直接冲突；Mini 仍在边界再次检查：
+
+- 非法工具名；
+- 同一服务器重复名称；
+- 不同服务器经前缀组合后仍然重复；
+- 覆盖 `web_search`、`task`、`activate_skill`、四个 `memory_*` 等内置/动态工具。
+
+任一名称问题会拒绝该服务器整组工具，不会留下部分注册状态。通过检查的工具由 lifespan 传给
+`RunStreamService`，再传入 `build_agent_graph(mcp_tools=...)`。构图仍只生成一份 registry，模型
+绑定、Prompt 的可用工具目录、Skills allowed-tools 决策和 `ToolNode` 都复用同一批对象。
+
+普通 Run 可以使用 MCP；当某个 Skill 带 `allowed-tools` 时，现有 fail-closed 策略仍然生效，只有
+明确写入该技能白名单的 MCP 名称才会开放。MCP 的到来不能绕过 Skills 权限。通用子 Agent 第一版
+也不继承 MCP，避免委派范围被静默扩大。
+
+### session 与同步/异步边界
+
+第一版沿用 `MultiServerMCPClient` 的短生命周期调用方式：工具发现和每次工具调用分别建立 session。
+这让 shutdown 不需要维护持久进程表，适合无状态 MCP Server；代价是 stdio 每次调用会重新启动
+子进程，依赖 session 内状态的服务器暂不适用。
+
+上游 MCP `StructuredTool` 主要提供 coroutine，Web Run 通过异步 `ToolNode` 直接调用。Mini Deer
+仍保留同步学习脚本，因此发现阶段为缺少 `func` 的工具补上同步包装：无事件循环时使用
+`asyncio.run()`，已有事件循环线程中则换一个短生命周期线程运行。两条入口最终调用同一个上游
+coroutine，不维护两份 MCP 协议实现。
+
+### TDD、自动化与真实验证
+
+测试先固定以下契约：
+
+- 配置缺失、stdio/HTTP、环境变量引用、禁用项和非法传输字段；
+- 一个服务器失败或超时不会丢失健康服务器；
+- 前缀启用、非法名称与内置名称冲突失败关闭；
+- lifespan 状态快照与 `/api/v1/mcp/status` 不泄露密钥；
+- MCP 工具真实进入模型 schema、ToolNode 并回到模型生成最终回答；
+- FastMCP stdio 子进程真实完成 initialize、tools/list、异步 tools/call 和同步 tools/call。
+
+最终检查：
+
+```text
+后端 pytest：237 passed
+真实 stdio MCP SDK smoke：通过
+Python compileall：通过
+pip check：No broken requirements found
+git diff --check：通过
+```
+
+12.16 没有修改前端，MCP 调用复用已有通用工具活动展示。仓库提供
+`mcp_servers.example.json` 与 `examples/mcp_learning_server.py`，其中包含
+`learning_add_numbers` 和 `learning_reverse_text`。用户按真实启动清单观察到状态为 loaded，
+并完成 Agent 工具调用验证，随后明确回复“已验证，先更新”。
+
+### 功能点 12.16 小结
+
+- MCP 扩展的是工具来源，不替代 Agent 图或工具循环。
+- 外部服务器失败应被隔离，而配置结构错误应尽早暴露。
+- 前缀降低冲突概率，但不能替代最终注册表的全局唯一校验。
+- MCP 工具必须进入现有 Skills 权限链，不能旁路执行。
+- 状态接口应和 Agent 使用同一次启动快照，并避免回传密钥与命令配置。
+- stateless session 简化第一版生命周期，但不支持高效复用或 session 内状态。
+- stdio 配置是本地代码执行能力，只能作为可信运维输入。
+
+当前按用户要求先完成记录，不继续新功能。下一连续编号是 12.17，主题等待用户指定；工具循环
+检测、工具输出预算和 MCP 高级能力均保持后置。
+
+## 功能点 12.17：前端折叠展示（执行过程折叠）
+
+### 目标
+
+Mini Deer 原本把工具调用和模型中间回复在对话框里逐条平铺弹出，与 DeerFlow 的观感差距很大。
+本功能点把一次 Run 内「思考/工具调用/中间回复」折叠成「执行过程」，只把最终回答和澄清交互
+直接展示，让界面一眼看到结果而不是执行噪音。
+
+### 实现
+
+`ConversationTurn.tsx` 把一轮的 `turn.steps` 分成三类：
+
+- 澄清卡（`ask_clarification` 对应的工具项）：直接展示，因为它是用户交互，不能折叠。
+- 最终回复（最后一条 assistant 消息）：直接展示，是交付物。
+- 其余中间步骤（工具调用 + 中间 assistant 回复）：折叠进 `<details>` 的「执行过程（N 步）」。
+
+折叠块样式复用左箭头 + 缩进过程线，展开后可逐条查看工具卡和中间回复。`styles.css` 新增
+`.turn-process` 系列样式。
+
+### 边界
+
+本次只折叠「工具调用 + 中间回复」，**思考过程（reasoning）尚未捕获**——那是 12.18 的活。
+澄清卡、最终回答始终直接可见，避免把交互和交付物误折叠。
+
+### 小结
+
+- 折叠的是「过程噪音」，不是「交互」和「交付物」；分类依据是时间线项的语义角色。
+- 前端折叠只是展示层行为，不改变 reducer 的时间线模型，风险面小。
+
+## 功能点 12.18：展示 CoT（思考过程捕获与折叠）
+
+### 为什么之前看不到思考过程
+
+DeepSeek 在 thinking 模式通过 OpenAI-compatible 接口返回
+`choices[].delta.reasoning_content`（流式）或 `choices[].message.reasoning_content`（非流式）。
+标准 `langchain_openai.ChatOpenAI` 会**静默丢弃**这个 provider 专属字段，所以思考过程从未进入
+事件流。同时，多轮工具调用时若不把历史 `reasoning_content` 回传给 API，DeepSeek 会返回 400。
+
+### DeerFlow 对照
+
+DeerFlow 用 `langchain_deepseek.ChatDeepSeek` 并写 `patched_deepseek.py` 修复多轮回传；对同为
+OpenAI-compatible 的 MiniMax/StepFun，则用 `PatchedChatMiniMax` / `PatchedChatStepFun` 这两个
+`ChatOpenAI` 子类，在流式 `_convert_chunk_to_generation_chunk`、非流式 `_create_chat_result`
+里把 provider 字段捕获进 `additional_kwargs.reasoning_content`，并在 `_get_request_payload` 里
+回写历史 assistant 消息。Mini Deer 用的是 `ChatOpenAI` 连 DeepSeek，所以参照 StepFun 这个
+`ChatOpenAI` 子类模式。
+
+### 实现（贯穿全链路）
+
+**模型层**：新建 `llms/patched.py` 的 `PatchedChatOpenAI`，三个钩子分别捕获流式/非流式
+reasoning_content 并在多轮请求时回传。`factory.py` 在 `openai-compatible` 分支返回该子类
+（对不输出 reasoning 的网关也无副作用）。
+
+**事件层**：`events.py` 的 `RunEventName` 加 `reasoning_delta`；`projector.py` 把
+`additional_kwargs.reasoning_content` 投影为 `reasoning_delta`，且与最终回答共享同一
+assistant `message_id`，前端据此合并到同一消息气泡。
+
+**持久化**：`conversations.py` 新增 v8 迁移——`messages` 加 `reasoning` 列，并把 `run_events`
+的 `event` CHECK 通过「建新表 → 复制 → 删旧表 → 重命名」重建以纳入 `reasoning_delta`。
+`reasoning_delta` 事件累积到 `messages.reasoning`，历史查询返回该字段。
+
+**前端**：`events.ts` 加 `reasoning_delta` 解码；`types.ts` 的 `MessageTimelineItem` 加
+`reasoning`；`reducer.ts` 的 `reduceReasoningDelta` 把思考过程与最终回答合并到同一条 assistant
+消息；`ConversationTurn.tsx` 用 `<details>` 折叠「思考过程」；`thread-history.ts` 解析历史
+`reasoning` 字段。
+
+### 关键取舍
+
+- 思考过程与最终回答**共用同一 assistant 消息**，而不是独立时间线项：语义上二者是同一次回答
+  的两部分，且历史恢复时天然对齐。
+- `reasoning_delta` 的 `message_id` 与 `ai_delta` 一致，让前端先到先建、后到合并。
+- 思考过程持久化到 `messages.reasoning`，刷新后仍可折叠查看；原始事件同时进 `run_events`。
+
+### TDD、自动化与真实验证
+
+```
+后端 pytest：239 passed（新增 projector 投影 + reasoning 持久化 2 个测试）
+前端 vitest：通过（新增 events 解码 + reducer 合并测试）
+typecheck / lint / build：通过
+git diff --check：通过
+```
+
+用户重启前后端（v8 迁移自动执行）后，用「调研 Rust 和 Go 生态对比」验证：回复气泡内出现
+「思考过程」折叠块、展开可见分步推理、刷新后历史仍在；并确认此前修复的子 Agent 递归上限
+（8 → 20）已让该调研任务正常收敛。用户回复「已验证」。
+
+### 功能点 12.18 小结
+
+- provider 专属字段是静默丢失的重灾区；先对照 DeerFlow 的 patched 模式，再决定捕获点。
+- 流式、非流式、多轮回传三个钩子缺一不可，否则思考过程或工具循环必有一个出问题。
+- 思考过程与最终回答共享 message_id，是「先到先建、后到合并」的前提。
+- SQLite 无法改 CHECK 约束，只能重建表；迁移要幂等且保留外键与索引。
+- reasoning 持久化让刷新后仍可查看，不牺牲历史恢复能力。
+
+当前已按用户要求完成 12.18 记录。下一连续编号是 12.19，主题等待用户指定。

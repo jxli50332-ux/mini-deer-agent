@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from mini_deer_agent.api import app
 from mini_deer_agent.core import Settings
+from mini_deer_agent.mcp import McpRuntime, McpServerStatus
 from mini_deer_agent.server import create_app
 
 
@@ -23,6 +24,7 @@ def test_openapi_exposes_only_versioned_public_contract() -> None:
 
     assert documented_paths == {
         "/api/v1/health",
+        "/api/v1/mcp/status",
         "/api/v1/ready",
         "/api/v1/threads",
         "/api/v1/threads/{thread_id}",
@@ -45,6 +47,7 @@ def test_health_is_live_without_starting_lifespan() -> None:
         assert client.get("/health").json() == {"status": "ok"}
         # 未进入 TestClient 上下文时 lifespan 尚未运行，就绪探针必须明确失败。
         assert client.get("/api/v1/ready").status_code == 503
+        assert client.get("/api/v1/mcp/status").status_code == 503
     finally:
         client.close()
 
@@ -100,6 +103,7 @@ def test_lifespan_initializes_and_closes_shared_resources_once(
     )
 
     assert not hasattr(application.state, "run_stream_service")
+    assert not hasattr(application.state, "mcp_runtime")
     with TestClient(application) as client:
         assert lifecycle_events == [
             f"open:{database_path}",
@@ -110,7 +114,14 @@ def test_lifespan_initializes_and_closes_shared_resources_once(
         assert hasattr(application.state, "run_execution_manager")
         assert hasattr(application.state, "conversation_history_service")
         assert hasattr(application.state, "run_event_history_service")
+        assert application.state.mcp_runtime.tools == ()
         assert client.get("/api/v1/ready").json() == {"status": "ready"}
+        assert client.get("/api/v1/mcp/status").json() == {
+            "configured": False,
+            "config_path": str(settings.mcp_config_path.resolve()),
+            "tool_names": [],
+            "servers": [],
+        }
 
     assert lifecycle_events == [
         f"open:{database_path}",
@@ -123,3 +134,57 @@ def test_lifespan_initializes_and_closes_shared_resources_once(
     assert not hasattr(application.state, "run_execution_manager")
     assert not hasattr(application.state, "conversation_history_service")
     assert not hasattr(application.state, "run_event_history_service")
+    assert not hasattr(application.state, "mcp_runtime")
+
+
+def test_mcp_status_projects_lifespan_runtime_without_secrets(
+    tmp_path: Path,
+) -> None:
+    """状态接口只暴露连接结果与工具名，不回传命令、环境变量或请求头。"""
+    runtime = McpRuntime(
+        configured=True,
+        config_path=(tmp_path / "mcp.json").resolve(),
+        tools=(),
+        servers=(
+            McpServerStatus(
+                name="docs",
+                transport="http",
+                state="loaded",
+                tool_names=("docs_search",),
+            ),
+            McpServerStatus(
+                name="broken",
+                transport="stdio",
+                state="failed",
+                error="connection refused",
+            ),
+        ),
+    )
+
+    async def create_runtime(*args, **kwargs) -> McpRuntime:
+        return runtime
+
+    application = create_app(mcp_runtime_factory=create_runtime)
+
+    with TestClient(application) as client:
+        assert client.get("/api/v1/mcp/status").json() == {
+            "configured": True,
+            "config_path": str(runtime.config_path),
+            "tool_names": [],
+            "servers": [
+                {
+                    "name": "docs",
+                    "transport": "http",
+                    "state": "loaded",
+                    "tool_names": ["docs_search"],
+                    "error": None,
+                },
+                {
+                    "name": "broken",
+                    "transport": "stdio",
+                    "state": "failed",
+                    "tool_names": [],
+                    "error": "connection refused",
+                },
+            ],
+        }

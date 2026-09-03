@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from pydantic import AnyHttpUrl, SecretStr
+from pydantic import AnyHttpUrl, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -26,3 +26,13 @@ class Settings(BaseSettings):
     checkpoint_database_path: Path = Path("data/checkpoints.sqlite")
     # 产品历史与 LangGraph checkpoint 分库保存，避免 API 依赖框架内部表结构。
     application_database_path: Path = Path("data/application.sqlite")
+    # 摘要只压缩 Agent checkpoint；产品历史仍由 application SQLite 完整保存。
+    context_summary_enabled: bool = True
+    context_summary_trigger_tokens: int = Field(default=50000, ge=1)
+    context_summary_trigger_messages: int = Field(default=40, ge=2)
+    context_summary_keep_messages: int = Field(default=10, ge=1)
+    context_summary_input_tokens: int = Field(default=25000, ge=1)
+    # MCP 配置属于可信的本地运维输入；文件不存在表示当前未启用 MCP。
+    mcp_config_path: Path = Path("mcp_servers.json")
+    # 每个服务器独立受限，避免一个挂起的外部进程阻止应用启动。
+    mcp_server_init_timeout_seconds: float = Field(default=10.0, gt=0)

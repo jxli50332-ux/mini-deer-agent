@@ -22,11 +22,20 @@ function wirePage() {
         thread_sequence: 3,
         role: "user",
         content: "查询天气",
+        hidden_from_ui: true,
+        human_input_response: {
+          version: 1,
+          kind: "human_input_response",
+          request_id: "clarification:call-1",
+          response_kind: "text",
+          value: "北京",
+        },
         attachments: [
           {
             filename: "weather.csv",
             media_type: "text/csv",
             size_bytes: 28,
+            content: "city,temp\n北京,24",
           },
         ],
         created_at: "2026-08-26T08:00:00+00:00",
@@ -68,8 +77,19 @@ describe("Thread history API client", () => {
     });
     expect(page.items[0]).toMatchObject({
       kind: "message",
+      hiddenFromUi: true,
+      humanInputResponse: {
+        request_id: "clarification:call-1",
+        response_kind: "text",
+        value: "北京",
+      },
       attachments: [
-        { filename: "weather.csv", mediaType: "text/csv", sizeBytes: 28 },
+        {
+          filename: "weather.csv",
+          mediaType: "text/csv",
+          sizeBytes: 28,
+          content: "city,temp\n北京,24",
+        },
       ],
     });
   });

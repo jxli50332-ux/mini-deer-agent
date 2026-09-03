@@ -13,6 +13,7 @@ type AgentMessageEvent = tuple[BaseMessage, dict[str, Any]]
 # 判别联合类型限制公开协议的事件名称，拼写错误会在类型检查阶段暴露。
 type RunEventName = Literal[
     "run_started",
+    "reasoning_delta",
     "ai_delta",
     "tool_call_delta",
     "tool_result",

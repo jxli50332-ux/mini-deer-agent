@@ -1,4 +1,10 @@
-import { useCallback, useLayoutEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 
 import type { ChatTimelineItem } from "@/entities/message/model/types";
 
@@ -7,6 +13,7 @@ const BOTTOM_THRESHOLD_PX = 64;
 interface ConversationScrollOptions {
   readonly threadId: string;
   readonly items: readonly ChatTimelineItem[];
+  readonly isStreaming?: boolean;
 }
 
 interface ScrollMetrics {
@@ -35,6 +42,7 @@ function prefersReducedMotion(): boolean {
 export function useConversationScroll({
   threadId,
   items,
+  isStreaming = false,
 }: ConversationScrollOptions) {
   const viewportRef = useRef<HTMLElement>(null);
   const metricsRef = useRef<ScrollMetrics | null>(null);
@@ -127,6 +135,43 @@ export function useConversationScroll({
       scrollTop: viewport.scrollTop,
     };
   }, [items, threadId]);
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (
+      viewport === null ||
+      !isStreaming ||
+      typeof MutationObserver === "undefined"
+    ) {
+      return;
+    }
+
+    // reasoning token 可能更新同一条 timeline item，未必总能触发 items 身份变化。
+    // 观察聊天 DOM 能让粘底模式在文字持续增长时仍跟随最新 COT；用户一旦上滚就停止抢位。
+    const observer = new MutationObserver(() => {
+      if (!followsLatestRef.current) {
+        setHasUnseenContent(true);
+        return;
+      }
+      const top = bottomScrollTop(viewport);
+      viewport.scrollTop = top;
+      setHasUnseenContent(false);
+      const metrics = metricsRef.current;
+      if (metrics !== null && metrics.threadId === threadId) {
+        metricsRef.current = {
+          ...metrics,
+          scrollHeight: viewport.scrollHeight,
+          scrollTop: top,
+        };
+      }
+    });
+    observer.observe(viewport, {
+      childList: true,
+      characterData: true,
+      subtree: true,
+    });
+    return () => observer.disconnect();
+  }, [isStreaming, threadId]);
 
   return {
     setViewport,

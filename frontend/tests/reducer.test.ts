@@ -20,7 +20,12 @@ function requestRun(state = createInitialChatRunState()): ChatRunState {
       id: "user-1",
       content: "查询北京天气",
       attachments: [
-        { filename: "weather.csv", mediaType: "text/csv", sizeBytes: 28 },
+        {
+          filename: "weather.csv",
+          mediaType: "text/csv",
+          sizeBytes: 28,
+          content: "city,temp",
+        },
       ],
     },
   });
@@ -53,6 +58,19 @@ function aiDelta(
   return {
     ...baseEvent(sequence),
     event: "ai_delta",
+    messageId,
+    payload: { text },
+  };
+}
+
+function reasoningDelta(
+  sequence: number,
+  text: string,
+  messageId: string | null = "assistant-1",
+): ChatRunEvent {
+  return {
+    ...baseEvent(sequence),
+    event: "reasoning_delta",
     messageId,
     payload: { text },
   };
@@ -129,7 +147,12 @@ describe("Chat run reducer", () => {
         role: "user",
         content: "查询北京天气",
         attachments: [
-          { filename: "weather.csv", mediaType: "text/csv", sizeBytes: 28 },
+          {
+            filename: "weather.csv",
+            mediaType: "text/csv",
+            sizeBytes: 28,
+            content: "city,temp",
+          },
         ],
       },
     ]);
@@ -153,6 +176,21 @@ describe("Chat run reducer", () => {
       content: "北京天气",
     });
     expect(state.lastSequence).toBe(3);
+  });
+
+  it("把 reasoning delta 与最终回答合并到同一条 assistant 消息", () => {
+    let state = receive(requestRun(), started());
+    state = receive(state, reasoningDelta(2, "先分析。"));
+    state = receive(state, reasoningDelta(3, "再回答。"));
+    state = receive(state, aiDelta(4, "结论。"));
+
+    const assistant = state.timeline.find(
+      (item) => item.kind === "message" && item.role === "assistant",
+    );
+    expect(assistant).toMatchObject({
+      reasoning: "先分析。再回答。",
+      content: "结论。",
+    });
   });
 
   it("messageId 缺失时使用 run 内稳定回退 ID", () => {
@@ -181,6 +219,69 @@ describe("Chat run reducer", () => {
       result: "北京 24°C",
       status: "completed",
     });
+  });
+
+  it("并发 task 使用各自 toolCallId 独立收敛，不会覆盖兄弟工具卡", () => {
+    let state = receive(requestRun(), started());
+    state = receive(state, {
+      ...baseEvent(2),
+      event: "tool_call_delta",
+      messageId: "assistant-parallel-task",
+      payload: {
+        toolCallId: "call-task-1",
+        name: "task",
+        argumentsDelta: '{"description":"任务一"}',
+        index: 0,
+      },
+    });
+    state = receive(state, {
+      ...baseEvent(3),
+      event: "tool_call_delta",
+      messageId: "assistant-parallel-task",
+      payload: {
+        toolCallId: "call-task-2",
+        name: "task",
+        argumentsDelta: '{"description":"任务二"}',
+        index: 1,
+      },
+    });
+    // 即使第二个任务先返回，也只能结束自己的卡片。
+    state = receive(state, {
+      ...baseEvent(4),
+      event: "tool_result",
+      messageId: "tool-task-2",
+      payload: {
+        toolCallId: "call-task-2",
+        name: "task",
+        content: '{"status":"completed","result":"结果二"}',
+      },
+    });
+    state = receive(state, {
+      ...baseEvent(5),
+      event: "tool_result",
+      messageId: "tool-task-1",
+      payload: {
+        toolCallId: "call-task-1",
+        name: "task",
+        content: '{"status":"completed","result":"结果一"}',
+      },
+    });
+    state = receive(state, completed(6));
+
+    const taskItems = state.timeline.filter((item) => item.kind === "tool");
+    expect(taskItems).toMatchObject([
+      {
+        toolCallId: "call-task-1",
+        result: '{"status":"completed","result":"结果一"}',
+        status: "completed",
+      },
+      {
+        toolCallId: "call-task-2",
+        result: '{"status":"completed","result":"结果二"}',
+        status: "completed",
+      },
+    ]);
+    expect(state.phase).toBe("completed");
   });
 
   it("忽略已经处理的重复 sequence，但拒绝 sequence 缺口", () => {
@@ -365,7 +466,12 @@ describe("Chat run reducer", () => {
         role: "user",
         content: "查询北京天气",
         attachments: [
-          { filename: "weather.csv", mediaType: "text/csv", sizeBytes: 28 },
+          {
+            filename: "weather.csv",
+            mediaType: "text/csv",
+            sizeBytes: 28,
+            content: "city,temp",
+          },
         ],
       },
     ]);

@@ -172,4 +172,53 @@ describe("工具活动卡", () => {
       "该地址被网页读取安全策略拒绝。",
     );
   });
+
+  it("write_todos 结果显示为任务清单", () => {
+    const { container } = render(
+      <ToolActivity
+        item={toolItem({
+          name: "write_todos",
+          input: '{"todos":[{"content":"分析","status":"completed"}]}',
+          result: JSON.stringify({
+            todos: [
+              { content: "分析需求", status: "completed" },
+              { content: "实现功能", status: "in_progress" },
+              { content: "验证结果", status: "pending" },
+            ],
+          }),
+        })}
+      />,
+    );
+
+    fireEvent.click(container.querySelector("summary")!);
+    expect(screen.getByText("分析需求")).toBeInTheDocument();
+    expect(screen.getByText("实现功能")).toBeInTheDocument();
+    expect(screen.getByText("进行中")).toBeInTheDocument();
+  });
+
+  it("ask_clarification 完成后仍展开通用工具卡并显示问题", () => {
+    const { container } = render(
+      <ToolActivity
+        item={toolItem({
+          name: "ask_clarification",
+          input:
+            '{"question":"报告的主题和用途是什么？","clarification_type":"missing_info"}',
+          result: JSON.stringify({
+            version: 1,
+            kind: "human_input_request",
+            source: "ask_clarification",
+            request_id: "clarification:call-1",
+            clarification_type: "missing_info",
+            question: "报告的主题和用途是什么？",
+            input_mode: "free_text",
+          }),
+        })}
+      />,
+    );
+
+    expect(container.querySelector("details")).toHaveAttribute("open");
+    const questionCopies = screen.getAllByText(/报告的主题和用途是什么/);
+    expect(questionCopies).toHaveLength(2);
+    expect(questionCopies[1]).toBeVisible();
+  });
 });

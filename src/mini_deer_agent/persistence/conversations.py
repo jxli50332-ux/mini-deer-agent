@@ -15,14 +15,23 @@ from mini_deer_agent.application.conversations import (
     ActiveRunConflictError,
     ActiveThreadDeleteConflictError,
 )
+from mini_deer_agent.application.memory import (
+    DuplicateMemoryFactError,
+    MemoryFactNotFoundError,
+)
 from mini_deer_agent.application.run_events import RunEventSequenceError
 from mini_deer_agent.domain import (
     ConversationHistoryPage,
     MessageHistoryItem,
+    MAX_MEMORY_CONTENT_LENGTH,
+    MAX_MEMORY_QUERY_LENGTH,
+    MAX_MEMORY_SEARCH_LIMIT,
+    MEMORY_CATEGORIES,
+    MemoryCategory,
+    MemoryFact,
     RunRecord,
     StoredRunEventRecord,
     TextAttachment,
-    TextAttachmentMetadata,
     ThreadRecord,
     TimelineHistoryItem,
     ToolExecutionHistoryItem,
@@ -31,7 +40,7 @@ from mini_deer_agent.domain import (
 from mini_deer_agent.streaming.events import RunEvent
 
 
-_LATEST_MIGRATION_VERSION = 5
+_LATEST_MIGRATION_VERSION = 8
 
 _SCHEMA_STATEMENTS = (
     """
@@ -122,7 +131,8 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
             version TEXT NOT NULL,
             event TEXT NOT NULL CHECK (
                 event IN (
-                    'run_started', 'ai_delta', 'tool_call_delta', 'tool_result',
+                    'run_started', 'reasoning_delta', 'ai_delta',
+                    'tool_call_delta', 'tool_result',
                     'run_error', 'run_interrupted', 'run_completed'
                 )
             ),
@@ -161,12 +171,138 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
         ON text_attachments(thread_id, message_id, position)
         """,
     ),
+    6: (
+        """
+        ALTER TABLE messages ADD COLUMN hidden_from_ui INTEGER NOT NULL DEFAULT 0
+        CHECK (hidden_from_ui IN (0, 1))
+        """,
+        """
+        ALTER TABLE messages ADD COLUMN human_input_response_json TEXT
+        """,
+    ),
+    7: (
+        """
+        CREATE TABLE IF NOT EXISTS memory_facts (
+            fact_id TEXT PRIMARY KEY,
+            content TEXT NOT NULL,
+            content_key TEXT NOT NULL UNIQUE,
+            category TEXT NOT NULL CHECK (
+                category IN (
+                    'preference', 'correction', 'context', 'goal',
+                    'behavior', 'identity', 'constraint', 'decision', 'other'
+                )
+            ),
+            confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+            source TEXT NOT NULL DEFAULT 'manual' CHECK (source = 'manual'),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_memory_facts_recent
+        ON memory_facts(updated_at DESC, fact_id DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_memory_facts_category_recent
+        ON memory_facts(category, updated_at DESC, fact_id DESC)
+        """,
+    ),
+    8: (
+        # assistant 消息持久化思考过程，供历史恢复时折叠展示。
+        """
+        ALTER TABLE messages ADD COLUMN reasoning TEXT
+        """,
+        # run_events 的 event CHECK 需要加入 reasoning_delta；SQLite 无法修改
+        # 已有 CHECK 约束，只能重建表。先建新表并复制数据，再原子替换。
+        """
+        CREATE TABLE run_events_v8 (
+            run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+            thread_id TEXT NOT NULL REFERENCES threads(thread_id) ON DELETE CASCADE,
+            sequence INTEGER NOT NULL CHECK (sequence >= 1),
+            version TEXT NOT NULL,
+            event TEXT NOT NULL CHECK (
+                event IN (
+                    'run_started', 'reasoning_delta', 'ai_delta',
+                    'tool_call_delta', 'tool_result',
+                    'run_error', 'run_interrupted', 'run_completed'
+                )
+            ),
+            message_id TEXT,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (run_id, sequence)
+        )
+        """,
+        """
+        INSERT INTO run_events_v8 (
+            run_id, thread_id, sequence, version, event,
+            message_id, payload_json, created_at
+        )
+        SELECT
+            run_id, thread_id, sequence, version, event,
+            message_id, payload_json, created_at
+        FROM run_events
+        """,
+        """
+        DROP TABLE run_events
+        """,
+        """
+        ALTER TABLE run_events_v8 RENAME TO run_events
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_run_events_thread_run_sequence
+        ON run_events(thread_id, run_id, sequence)
+        """,
+    ),
 }
 
 
 def _utc_now() -> str:
     """返回可按字符串比较的 UTC ISO 时间。"""
     return datetime.now(UTC).isoformat()
+
+
+def _normalize_memory_content(value: str) -> tuple[str, str]:
+    """返回可展示正文和用于并发安全去重、字面查询的 casefold key。"""
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError("memory content must not be empty")
+    if len(normalized) > MAX_MEMORY_CONTENT_LENGTH:
+        raise ValueError(
+            f"memory content must not exceed {MAX_MEMORY_CONTENT_LENGTH} characters"
+        )
+    return normalized, normalized.casefold()
+
+
+def _normalize_memory_category(value: str) -> MemoryCategory:
+    """校验稳定分类，避免任意标签悄悄扩张存储契约。"""
+    normalized = value.strip().casefold()
+    if normalized not in MEMORY_CATEGORIES:
+        raise ValueError(
+            "memory category must be one of: " + ", ".join(MEMORY_CATEGORIES)
+        )
+    return cast(MemoryCategory, normalized)
+
+
+def _normalize_memory_confidence(value: float) -> float:
+    """拒绝 bool、NaN、无穷及区间外的置信度。"""
+    normalized = float(value)
+    if isinstance(value, bool) or not 0 <= normalized <= 1:
+        raise ValueError("memory confidence must be a number between 0 and 1")
+    return normalized
+
+
+def _memory_fact_from_row(row: sqlite3.Row) -> MemoryFact:
+    """把内部 SQLite 行映射为不可变领域对象。"""
+    return MemoryFact(
+        fact_id=str(row["fact_id"]),
+        content=str(row["content"]),
+        category=cast(MemoryCategory, row["category"]),
+        confidence=float(row["confidence"]),
+        source="manual",
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
 
 
 class SqliteConversationRepository:
@@ -229,6 +365,191 @@ class SqliteConversationRepository:
         # 迁移后收集查询规划统计，索引只围绕当前正式查询创建。
         self._connection.execute("PRAGMA optimize")
 
+    def search_memory_facts(
+        self,
+        query: str,
+        *,
+        category: str | None = None,
+        limit: int = 10,
+    ) -> tuple[MemoryFact, ...]:
+        """按规范化字面包含查询全局事实，空查询稳定返回最近记录。"""
+        normalized_query = query.strip()
+        if len(normalized_query) > MAX_MEMORY_QUERY_LENGTH:
+            raise ValueError(
+                f"memory query must not exceed {MAX_MEMORY_QUERY_LENGTH} characters"
+            )
+        if isinstance(limit, bool) or not 1 <= limit <= MAX_MEMORY_SEARCH_LIMIT:
+            raise ValueError(
+                f"memory search limit must be between 1 and {MAX_MEMORY_SEARCH_LIMIT}"
+            )
+        normalized_category = (
+            _normalize_memory_category(category)
+            if category is not None
+            else None
+        )
+        conditions: list[str] = []
+        parameters: list[object] = []
+        if normalized_query:
+            # instr 不把 %, _ 当通配符；content_key 已 casefold，查询语义稳定且字面化。
+            conditions.append("instr(content_key, ?) > 0")
+            parameters.append(normalized_query.casefold())
+        if normalized_category is not None:
+            conditions.append("category = ?")
+            parameters.append(normalized_category)
+        where_clause = (
+            "WHERE " + " AND ".join(conditions) if conditions else ""
+        )
+        parameters.append(limit)
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT fact_id, content, category, confidence, source,
+                       created_at, updated_at
+                FROM memory_facts
+                {where_clause}
+                ORDER BY updated_at DESC, fact_id DESC
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+        return tuple(_memory_fact_from_row(row) for row in rows)
+
+    def create_memory_fact(
+        self,
+        content: str,
+        *,
+        category: str = "context",
+        confidence: float = 1.0,
+    ) -> MemoryFact:
+        """原子创建单用户全局事实，由唯一 key 阻止并发重复写入。"""
+        normalized_content, content_key = _normalize_memory_content(content)
+        normalized_category = _normalize_memory_category(category)
+        normalized_confidence = _normalize_memory_confidence(confidence)
+        fact_id = f"fact_{uuid4().hex}"
+        now = _utc_now()
+        try:
+            with self._lock, self._connection:
+                self._connection.execute(
+                    """
+                    INSERT INTO memory_facts(
+                        fact_id, content, content_key, category, confidence,
+                        source, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'manual', ?, ?)
+                    """,
+                    (
+                        fact_id,
+                        normalized_content,
+                        content_key,
+                        normalized_category,
+                        normalized_confidence,
+                        now,
+                        now,
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            if "memory_facts.content_key" in str(exc):
+                raise DuplicateMemoryFactError("Duplicate fact") from exc
+            raise
+        return MemoryFact(
+            fact_id=fact_id,
+            content=normalized_content,
+            category=normalized_category,
+            confidence=normalized_confidence,
+            source="manual",
+            created_at=now,
+            updated_at=now,
+        )
+
+    def update_memory_fact(
+        self,
+        fact_id: str,
+        *,
+        content: str | None = None,
+        category: str | None = None,
+        confidence: float | None = None,
+    ) -> MemoryFact:
+        """在一个事务内读取并局部更新事实，保留创建时间与未提供字段。"""
+        if content is None and category is None and confidence is None:
+            raise ValueError("memory update requires at least one changed field")
+        normalized_content: str | None = None
+        content_key: str | None = None
+        if content is not None:
+            normalized_content, content_key = _normalize_memory_content(content)
+        normalized_category = (
+            _normalize_memory_category(category)
+            if category is not None
+            else None
+        )
+        normalized_confidence = (
+            _normalize_memory_confidence(confidence)
+            if confidence is not None
+            else None
+        )
+        try:
+            with self._lock, self._connection:
+                existing = self._connection.execute(
+                    """
+                    SELECT fact_id, content, content_key, category, confidence,
+                           source, created_at, updated_at
+                    FROM memory_facts
+                    WHERE fact_id = ?
+                    """,
+                    (fact_id,),
+                ).fetchone()
+                if existing is None:
+                    raise MemoryFactNotFoundError(fact_id)
+                updated_at = _utc_now()
+                self._connection.execute(
+                    """
+                    UPDATE memory_facts
+                    SET content = ?, content_key = ?, category = ?,
+                        confidence = ?, updated_at = ?
+                    WHERE fact_id = ?
+                    """,
+                    (
+                        normalized_content
+                        if normalized_content is not None
+                        else existing["content"],
+                        content_key
+                        if content_key is not None
+                        else existing["content_key"],
+                        normalized_category
+                        if normalized_category is not None
+                        else existing["category"],
+                        normalized_confidence
+                        if normalized_confidence is not None
+                        else existing["confidence"],
+                        updated_at,
+                        fact_id,
+                    ),
+                )
+                row = self._connection.execute(
+                    """
+                    SELECT fact_id, content, category, confidence, source,
+                           created_at, updated_at
+                    FROM memory_facts
+                    WHERE fact_id = ?
+                    """,
+                    (fact_id,),
+                ).fetchone()
+        except sqlite3.IntegrityError as exc:
+            if "memory_facts.content_key" in str(exc):
+                raise DuplicateMemoryFactError("Duplicate fact") from exc
+            raise
+        if row is None:  # pragma: no cover - 同一事务内的防御性不变量
+            raise MemoryFactNotFoundError(fact_id)
+        return _memory_fact_from_row(row)
+
+    def delete_memory_fact(self, fact_id: str) -> None:
+        """物理删除明确指定的全局事实；不存在时不伪装成功。"""
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "DELETE FROM memory_facts WHERE fact_id = ?",
+                (fact_id,),
+            )
+            if cursor.rowcount != 1:
+                raise MemoryFactNotFoundError(fact_id)
+
     @staticmethod
     def _allocate_sequence(cursor: sqlite3.Cursor, thread_id: str) -> int:
         """在当前事务中原子分配一个 Thread 全局时间线序号。"""
@@ -253,8 +574,9 @@ class SqliteConversationRepository:
         user_message_id: str,
         user_message: str,
         attachments: tuple[TextAttachment, ...] = (),
+        human_input_response: dict[str, object] | None = None,
     ) -> None:
-        """原子写入 Thread、Run、用户消息和附件，拒绝并发活动 Run。"""
+        """原子写入 Run、用户消息、附件和澄清元数据，拒绝并发活动 Run。"""
         now = _utc_now()
         title = default_thread_title(user_message)
         try:
@@ -285,9 +607,28 @@ class SqliteConversationRepository:
                     """,
                     (user_message_id, thread_id, run_id, sequence, now, now),
                 )
+                response_json = (
+                    json.dumps(
+                        human_input_response,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    if human_input_response is not None
+                    else None
+                )
                 cursor.execute(
-                    "INSERT INTO messages(item_id, role, content) VALUES (?, 'user', ?)",
-                    (user_message_id, user_message),
+                    """
+                    INSERT INTO messages(
+                        item_id, role, content, hidden_from_ui,
+                        human_input_response_json
+                    ) VALUES (?, 'user', ?, ?, ?)
+                    """,
+                    (
+                        user_message_id,
+                        user_message,
+                        1 if human_input_response is not None else 0,
+                        response_json,
+                    ),
                 )
                 for position, attachment in enumerate(attachments):
                     cursor.execute(
@@ -415,6 +756,42 @@ class SqliteConversationRepository:
                     WHERE run_id = ?
                     """,
                     (started_at, now, event.run_id),
+                )
+                return True
+
+            if event.event == "reasoning_delta":
+                # 思考过程与最终回答共享同一 assistant 消息；先到先建消息，
+                # 后续 ai_delta 继续追加 content。
+                item_id = event.message_id or f"{event.run_id}:assistant"
+                created = self._ensure_timeline_item(
+                    cursor,
+                    item_id=item_id,
+                    thread_id=event.thread_id,
+                    run_id=event.run_id,
+                    kind="message",
+                    now=now,
+                )
+                text = str(event.payload.get("text") or "")
+                if created:
+                    cursor.execute(
+                        """
+                        INSERT INTO messages(item_id, role, content, reasoning)
+                        VALUES (?, 'assistant', '', ?)
+                        """,
+                        (item_id, text),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        UPDATE messages
+                        SET reasoning = COALESCE(reasoning, '') || ?
+                        WHERE item_id = ?
+                        """,
+                        (text, item_id),
+                    )
+                cursor.execute(
+                    "UPDATE timeline_items SET updated_at = ? WHERE item_id = ?",
+                    (now, item_id),
                 )
                 return True
 
@@ -811,6 +1188,9 @@ class SqliteConversationRepository:
                        timeline_items.run_id, timeline_items.thread_sequence,
                        timeline_items.kind, timeline_items.created_at,
                        messages.role, messages.content,
+                       messages.reasoning,
+                       messages.hidden_from_ui,
+                       messages.human_input_response_json,
                        tool_executions.tool_call_id, tool_executions.name,
                        tool_executions.input, tool_executions.result,
                        tool_executions.status AS tool_status
@@ -831,13 +1211,13 @@ class SqliteConversationRepository:
             for row in selected_rows
             if row["kind"] == "message"
         ]
-        attachments_by_message: dict[str, list[TextAttachmentMetadata]] = {}
+        attachments_by_message: dict[str, list[TextAttachment]] = {}
         if message_ids:
             placeholders = ",".join("?" for _ in message_ids)
             with self._lock:
                 attachment_rows = self._connection.execute(
                     f"""
-                    SELECT message_id, filename, media_type, size_bytes
+                    SELECT message_id, filename, media_type, size_bytes, content
                     FROM text_attachments
                     WHERE message_id IN ({placeholders})
                     ORDER BY message_id, position
@@ -847,10 +1227,11 @@ class SqliteConversationRepository:
             for attachment_row in attachment_rows:
                 message_id = str(attachment_row["message_id"])
                 attachments_by_message.setdefault(message_id, []).append(
-                    TextAttachmentMetadata(
+                    TextAttachment(
                         filename=str(attachment_row["filename"]),
                         media_type=str(attachment_row["media_type"]),
                         size_bytes=int(attachment_row["size_bytes"]),
+                        content=str(attachment_row["content"]),
                     )
                 )
         items: list[TimelineHistoryItem] = []
@@ -863,14 +1244,23 @@ class SqliteConversationRepository:
                 "created_at": str(row["created_at"]),
             }
             if row["kind"] == "message":
+                response_json = cast(str | None, row["human_input_response_json"])
+                response = json.loads(response_json) if response_json is not None else None
+                if response is not None and not isinstance(response, dict):
+                    raise RuntimeError(
+                        "Stored human input response must be a JSON object"
+                    )
                 items.append(
                     MessageHistoryItem(
                         kind="message",
                         role=cast(Any, row["role"]),
                         content=str(row["content"]),
+                        reasoning=cast(str | None, row["reasoning"]),
                         attachments=tuple(
                             attachments_by_message.get(str(row["item_id"]), [])
                         ),
+                        hidden_from_ui=bool(row["hidden_from_ui"]),
+                        human_input_response=cast(dict[str, Any] | None, response),
                         **common,
                     )
                 )

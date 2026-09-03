@@ -5,6 +5,8 @@ interface ThreadHeaderProps {
   readonly phase: ChatRunPhase;
   readonly threadId: string;
   readonly runId: string | null;
+  readonly navigationOpen: boolean;
+  readonly onOpenNavigation: () => void;
 }
 
 const PHASE_LABELS: Record<ChatRunPhase, string> = {
@@ -17,9 +19,25 @@ const PHASE_LABELS: Record<ChatRunPhase, string> = {
   cancelled: "已取消",
 };
 
-export function ThreadHeader({ phase, threadId, runId }: ThreadHeaderProps) {
+export function ThreadHeader({
+  phase,
+  threadId,
+  runId,
+  navigationOpen,
+  onOpenNavigation,
+}: ThreadHeaderProps) {
   return (
     <header className="thread-header" data-phase={phase}>
+      <button
+        type="button"
+        className="mobile-navigation-toggle"
+        aria-label="打开会话导航"
+        aria-controls="conversation-navigation"
+        aria-expanded={navigationOpen}
+        onClick={onOpenNavigation}
+      >
+        ☰
+      </button>
       <div className="thread-header__identity">
         <p className="thread-header__eyebrow">当前线程</p>
         <h1>Mini Deer 对话</h1>

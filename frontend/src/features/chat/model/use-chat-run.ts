@@ -19,6 +19,7 @@ import {
   type ChatStreamRequest,
 } from "@/features/chat/api/chat-stream";
 import type { ChatRunEvent } from "@/features/chat/model/events";
+import type { HumanInputResponse } from "@/features/chat/model/human-input";
 import {
   chatRunReducer,
   createInitialChatRunState,
@@ -49,8 +50,13 @@ export interface UseChatRunResult {
   readonly submit: (
     message: string,
     attachments?: readonly PreparedTextAttachment[],
+    submitOptions?: ChatSubmitOptions,
   ) => Promise<boolean>;
   readonly cancel: () => Promise<boolean>;
+}
+
+export interface ChatSubmitOptions {
+  readonly humanInputResponse?: HumanInputResponse;
 }
 
 interface ActiveOperation {
@@ -157,6 +163,7 @@ export function useChatRun(options: UseChatRunOptions): UseChatRunResult {
     async (
       rawMessage: string,
       attachments: readonly PreparedTextAttachment[] = [],
+      submitOptions: ChatSubmitOptions = {},
     ): Promise<boolean> => {
       if (activeOperationRef.current !== null) {
         return false;
@@ -189,12 +196,19 @@ export function useChatRun(options: UseChatRunOptions): UseChatRunResult {
           id: userMessageId,
           content: message,
           attachments: attachments.map(
-            ({ filename, mediaType, sizeBytes }) => ({
+            ({ filename, mediaType, sizeBytes, content }) => ({
               filename,
               mediaType,
               sizeBytes,
+              content,
             }),
           ),
+          ...(submitOptions.humanInputResponse === undefined
+            ? {}
+            : {
+                hiddenFromUi: true,
+                humanInputResponse: submitOptions.humanInputResponse,
+              }),
         },
       });
 
@@ -211,6 +225,9 @@ export function useChatRun(options: UseChatRunOptions): UseChatRunResult {
             filename,
             content,
           })),
+          ...(submitOptions.humanInputResponse === undefined
+            ? {}
+            : { humanInputResponse: submitOptions.humanInputResponse }),
           signal: operation.controller.signal,
           onRunId: (runId) => {
             // 响应头先建立取消寻址；旧 operation 的回调不能覆盖当前 Run。

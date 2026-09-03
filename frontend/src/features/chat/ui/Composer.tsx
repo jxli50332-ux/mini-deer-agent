@@ -10,11 +10,15 @@ import {
   prepareSelectedTextAttachments,
   type PreparedTextAttachment,
 } from "@/entities/attachment/model/text-attachments";
+import type { TodoList } from "@/entities/todo/model/todo-list";
+import { TodoPanel } from "@/features/chat/ui/TodoPanel";
 
 interface ComposerProps {
   readonly isActive: boolean;
   readonly isStopping?: boolean;
   readonly disabled?: boolean;
+  readonly todoList?: TodoList | null;
+  readonly todoSourceStepId?: string;
   readonly onSubmit: (
     message: string,
     attachments: readonly PreparedTextAttachment[],
@@ -26,6 +30,8 @@ export function Composer({
   isActive,
   isStopping = false,
   disabled = false,
+  todoList = null,
+  todoSourceStepId,
   onSubmit,
   onCancel,
 }: ComposerProps) {
@@ -91,6 +97,14 @@ export function Composer({
 
   return (
     <footer className="composer-region">
+      {todoList !== null && todoList.items.length > 0 && (
+        <TodoPanel
+          todoList={todoList}
+          {...(todoSourceStepId === undefined
+            ? {}
+            : { sourceStepId: todoSourceStepId })}
+        />
+      )}
       <form
         className="composer"
         aria-label="发送消息"
@@ -104,7 +118,7 @@ export function Composer({
             className="visually-hidden"
             type="file"
             multiple
-            accept=".txt,.md,.json,.csv,text/plain,text/markdown,application/json,text/csv"
+            accept=".txt,.md,.json,.csv,.py,.js,.jsx,.ts,.tsx,.html,.htm,.css,.scss,.yaml,.yml,.xml,.toml,.sh,.sql,.go,.java,.c,.h,.cpp,.hpp,.rs"
             aria-label="添加文本附件"
             disabled={disabled || isActive || isPreparingAttachments}
             onChange={(event) => void handleAttachmentSelection(event)}
@@ -116,7 +130,7 @@ export function Composer({
           >
             {isPreparingAttachments ? "正在读取…" : "+ 文本附件"}
           </label>
-          <span>支持 TXT、Markdown、JSON、CSV；最多 3 个</span>
+          <span>支持代码、配置等文本文件；最多 3 个</span>
         </div>
         {attachments.length > 0 && (
           <ul className="composer__attachment-list" aria-label="待发送附件">

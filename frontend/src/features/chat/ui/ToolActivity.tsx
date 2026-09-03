@@ -1,5 +1,9 @@
 import type { ToolTimelineItem } from "@/entities/message/model/types";
 import { parseWebSearchResult } from "@/entities/search/model/web-search-result";
+import {
+  parseTodoList,
+  type TodoStatus,
+} from "@/entities/todo/model/todo-list";
 import { parseWebFetchResult } from "@/entities/web-page/model/web-fetch-result";
 
 interface ToolActivityProps {
@@ -31,7 +35,15 @@ export function ToolActivity({ item }: ToolActivityProps) {
     failed: "失败",
     cancelled: "已取消",
   }[item.status];
-  const shouldStartOpen = item.status !== "completed";
+  const todoStatusLabel: Record<TodoStatus, string> = {
+    pending: "未开始",
+    in_progress: "进行中",
+    completed: "已完成",
+  };
+  // 澄清问题就是本轮交付物；即使 Run 已完成也保持通用工具卡展开，
+  // 用户可以直接看到问题并通过普通输入框回答。
+  const shouldStartOpen =
+    item.status !== "completed" || item.name === "ask_clarification";
   const formattedInput = formatToolContent(item.input);
   const formattedResult =
     item.result === null ? null : formatToolContent(item.result);
@@ -42,6 +54,10 @@ export function ToolActivity({ item }: ToolActivityProps) {
   const webFetchResult =
     item.name === "web_fetch" && item.result !== null
       ? parseWebFetchResult(item.result)
+      : null;
+  const todoList =
+    item.name === "write_todos" && item.result !== null
+      ? parseTodoList(item.result)
       : null;
 
   return (
@@ -151,6 +167,22 @@ export function ToolActivity({ item }: ToolActivityProps) {
                       </>
                     )}
                   </div>
+                ) : todoList !== null ? (
+                  <ol className="todo-list" aria-label="任务清单">
+                    {todoList.items.map((todo, index) => (
+                      <li
+                        key={`${index}:${todo.content}`}
+                        data-status={todo.status}
+                      >
+                        <span className="todo-list__status">
+                          {todoStatusLabel[todo.status]}
+                        </span>
+                        <span className="todo-list__content">
+                          {todo.content}
+                        </span>
+                      </li>
+                    ))}
+                  </ol>
                 ) : formattedResult.length > 0 ? (
                   <pre className="tool-activity__content">
                     {formattedResult}

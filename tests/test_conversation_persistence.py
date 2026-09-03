@@ -34,7 +34,7 @@ FINAL_ASSISTANT_ID = "55555555-5555-4555-8555-555555555555"
 def test_user_message_and_text_attachments_are_persisted_atomically(
     tmp_path: Path,
 ) -> None:
-    """附件内容跟随所属用户消息落库，历史查询只公开安全元数据。"""
+    """附件内容跟随所属用户消息落库，历史查询公开完整附件内容供前端查看。"""
     database_path = tmp_path / "attachments.sqlite"
     attachments = validate_text_attachment_batch(
         [("brief.md", "代号：云杉"), ("facts.json", '{"year": 2026}')]
@@ -57,11 +57,13 @@ def test_user_message_and_text_attachments_are_persisted_atomically(
     assert len(history.items) == 1
     message = history.items[0]
     assert isinstance(message, MessageHistoryItem)
-    assert [(item.filename, item.media_type, item.size_bytes) for item in message.attachments] == [
-        ("brief.md", "text/markdown", len("代号：云杉".encode("utf-8"))),
-        ("facts.json", "application/json", len('{"year": 2026}'.encode("utf-8"))),
+    assert [
+        (item.filename, item.media_type, item.size_bytes, item.content)
+        for item in message.attachments
+    ] == [
+        ("brief.md", "text/markdown", len("代号：云杉".encode("utf-8")), "代号：云杉"),
+        ("facts.json", "application/json", len('{"year": 2026}'.encode("utf-8")), '{"year": 2026}'),
     ]
-    assert all(not hasattr(item, "content") for item in message.attachments)
 
     with sqlite3.connect(database_path) as connection:
         stored = connection.execute(
@@ -228,6 +230,67 @@ def test_sqlite_repository_materializes_runs_messages_tools_and_pages(
         "idx_timeline_items_thread_sequence" in str(row)
         for row in query_plan
     )
+
+
+def test_reasoning_delta_is_persisted_and_restored_in_history(
+    tmp_path: Path,
+) -> None:
+    """思考过程应持久化到消息 reasoning 字段，并在历史恢复时返回。"""
+    database_path = tmp_path / "reasoning.sqlite"
+    with open_sqlite_conversation_repository(database_path) as repository:
+        repository.create_run(
+            thread_id=THREAD_ID,
+            run_id=RUN_ID,
+            user_message_id=MESSAGE_ID,
+            user_message="分析架构",
+        )
+        repository.apply_run_event(
+            event(
+                "run_started",
+                1,
+                payload={"created_at": "2026-08-30T08:00:00+00:00"},
+            )
+        )
+        repository.apply_run_event(
+            event(
+                "reasoning_delta",
+                2,
+                message_id=ASSISTANT_ID,
+                payload={"text": "先拆解"},
+            )
+        )
+        repository.apply_run_event(
+            event(
+                "reasoning_delta",
+                3,
+                message_id=ASSISTANT_ID,
+                payload={"text": "再综合"},
+            )
+        )
+        repository.apply_run_event(
+            event(
+                "ai_delta",
+                4,
+                message_id=ASSISTANT_ID,
+                payload={"text": "结论如下。"},
+            )
+        )
+        repository.apply_run_event(
+            event("run_completed", 5, payload={"finish_reason": "stop"})
+        )
+
+        page = repository.list_history(
+            THREAD_ID,
+            limit=10,
+            before_sequence=None,
+        )
+        assistant = next(
+            item
+            for item in page.items
+            if item.kind == "message" and item.role == "assistant"
+        )
+        assert assistant.reasoning == "先拆解再综合"
+        assert assistant.content == "结论如下。"
 
 
 def test_delete_thread_cascades_through_complete_business_history(
@@ -579,7 +642,16 @@ def test_repository_lists_recent_threads_with_stable_order_and_limit(
             """,
             (20,),
         ).fetchall()
-    assert migration_versions == [(1,), (2,), (3,), (4,), (5,)]
+    assert migration_versions == [
+        (1,),
+        (2,),
+        (3,),
+        (4,),
+        (5,),
+        (6,),
+        (7,),
+        (8,),
+    ]
     assert any("idx_threads_recent" in str(row) for row in query_plan)
 
 
