@@ -711,6 +711,125 @@ textarea:disabled {
   gap: 26px;
 }
 
+.run-changes {
+  width: min(calc(100% - 44px), 712px);
+  margin-left: 44px;
+  color: #3f5148;
+  background: #f7f9f6;
+  border: 1px solid #dce5de;
+  border-radius: 12px;
+}
+
+.run-changes__summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  cursor: pointer;
+  list-style: none;
+  font-size: 0.76rem;
+  font-weight: 650;
+}
+
+.run-changes__summary::-webkit-details-marker {
+  display: none;
+}
+
+.run-changes__summary span:last-child {
+  color: #7d8b83;
+  font-size: 0.68rem;
+  font-weight: 500;
+}
+
+.run-changes__list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0 14px 12px;
+  list-style: none;
+}
+
+.run-changes__list li {
+  min-width: 0;
+}
+
+.run-changes__item-main {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  gap: 10px;
+  align-items: baseline;
+  font-size: 0.72rem;
+}
+
+.run-changes__kind {
+  color: #65766d;
+}
+
+.run-changes__path {
+  display: flex;
+  min-width: 0;
+  gap: 6px;
+  align-items: center;
+  overflow-wrap: anywhere;
+}
+
+.run-changes__path code {
+  color: #263e32;
+  font: inherit;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
+.run-changes__diff {
+  margin: 7px 0 0 74px;
+  overflow: hidden;
+  background: #fff;
+  border: 1px solid #e1e6e2;
+  border-radius: 7px;
+}
+
+.run-changes__diff > summary {
+  padding: 6px 9px;
+  cursor: pointer;
+  color: #65766d;
+  font-size: 0.68rem;
+}
+
+.run-changes__diff-content {
+  border-top: 1px solid #e8ece9;
+}
+
+.run-changes__diff-content pre {
+  margin: 0;
+  padding: 6px 9px;
+  overflow-x: auto;
+  font:
+    0.68rem/1.5 ui-monospace,
+    SFMono-Regular,
+    Consolas,
+    monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.run-changes__diff-content pre[data-diff="removed"] {
+  color: #8a3f3a;
+  background: #fff2f0;
+}
+
+.run-changes__diff-content pre[data-diff="added"] {
+  color: #28643f;
+  background: #eef9f1;
+}
+
+.run-changes__diff-content small {
+  display: block;
+  padding: 5px 9px;
+  color: #8b918d;
+  font-size: 0.64rem;
+}
+
 .turn-process {
   align-self: flex-start;
   max-width: 78%;

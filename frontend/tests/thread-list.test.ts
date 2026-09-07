@@ -23,6 +23,7 @@ function wireThread(
     thread_id: threadId,
     title,
     status: "idle",
+    project_id: null,
     created_at: "2026-08-26T08:00:00+00:00",
     updated_at: updatedAt,
   };
@@ -40,6 +41,7 @@ describe("最近 Thread 列表 client", () => {
         threadId: OTHER_THREAD_ID,
         title: "北京天气",
         status: "idle",
+        projectId: null,
         createdAt: "2026-08-26T08:00:00+00:00",
         updatedAt: "2026-08-26T09:00:00+00:00",
       },
@@ -47,6 +49,7 @@ describe("最近 Thread 列表 client", () => {
         threadId: THREAD_ID,
         title: "北京天气",
         status: "idle",
+        projectId: null,
         createdAt: "2026-08-26T08:00:00+00:00",
         updatedAt: "2026-08-26T08:30:00+00:00",
       },
@@ -67,6 +70,29 @@ describe("最近 Thread 列表 client", () => {
         },
       ]),
     ).toThrow("title 必须是非空字符串或 null");
+  });
+
+  it("校验 nullable 项目归属，并保留普通聊天的 null", () => {
+    expect(
+      parseThreadList([wireThread(THREAD_ID, "2026-08-26T09:00:00+00:00")])[0]
+        ?.projectId,
+    ).toBeNull();
+    expect(
+      parseThreadList([
+        {
+          ...wireThread(THREAD_ID, "2026-08-26T09:00:00+00:00"),
+          project_id: OTHER_THREAD_ID,
+        },
+      ])[0]?.projectId,
+    ).toBe(OTHER_THREAD_ID);
+    expect(() =>
+      parseThreadList([
+        {
+          ...wireThread(THREAD_ID, "2026-08-26T09:00:00+00:00"),
+          project_id: "string",
+        },
+      ]),
+    ).toThrow("project_id 必须是 UUID 或 null");
   });
 
   it("拒绝重复身份、非法状态和无效时间", () => {

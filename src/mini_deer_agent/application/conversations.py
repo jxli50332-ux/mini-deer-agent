@@ -44,6 +44,16 @@ class ConversationRepository(MemoryStore, Protocol):
     ) -> None:
         """原子创建 Thread、Run、本轮用户消息、附件与澄清响应。"""
 
+    def create_project_thread(
+        self, *, thread_id: str, project_id: str
+    ) -> ThreadRecord:
+        """创建空闲项目 Thread，已有 Thread 只能按原 Project 幂等读取。"""
+
+    def list_project_threads(
+        self, project_id: str, *, limit: int
+    ) -> tuple[ThreadRecord, ...]:
+        """只返回归属于指定 Project 的最近 Thread。"""
+
     def apply_run_event(self, event: RunEvent) -> bool:
         """物化 RunEvent；返回 False 表示终态竞争使事件不再可写。"""
 

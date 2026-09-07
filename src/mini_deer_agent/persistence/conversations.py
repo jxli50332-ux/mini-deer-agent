@@ -15,6 +15,7 @@ from mini_deer_agent.application.conversations import (
     ActiveRunConflictError,
     ActiveThreadDeleteConflictError,
 )
+from mini_deer_agent.application.workspaces import ThreadProjectConflictError
 from mini_deer_agent.application.memory import (
     DuplicateMemoryFactError,
     MemoryFactNotFoundError,
@@ -38,9 +39,13 @@ from mini_deer_agent.domain import (
     default_thread_title,
 )
 from mini_deer_agent.streaming.events import RunEvent
+from mini_deer_agent.persistence.workspaces import (
+    PROJECT_SCHEMA_STATEMENTS,
+    SqliteProjectRepository,
+)
 
 
-_LATEST_MIGRATION_VERSION = 8
+_LATEST_MIGRATION_VERSION = 11
 
 _SCHEMA_STATEMENTS = (
     """
@@ -254,6 +259,32 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
         ON run_events(thread_id, run_id, sequence)
         """,
     ),
+    9: PROJECT_SCHEMA_STATEMENTS,
+    10: (
+        # 不设 projects 外键：解除登记不能级联清空历史 Thread 的原项目身份。
+        "ALTER TABLE threads ADD COLUMN project_id TEXT",
+        """
+        CREATE INDEX idx_threads_project_recent
+        ON threads(project_id, updated_at DESC, thread_id DESC)
+        """,
+    ),
+    11: (
+        "DROP INDEX idx_projects_created",
+        "ALTER TABLE projects RENAME TO projects_v10",
+        PROJECT_SCHEMA_STATEMENTS[0],
+        """
+        INSERT INTO projects (
+            project_id, name, root_path, root_key, root_identity, access_mode,
+            status, status_reason, created_at, updated_at
+        )
+        SELECT
+            project_id, name, root_path, root_key, root_identity, 'read_write',
+            status, status_reason, created_at, updated_at
+        FROM projects_v10
+        """,
+        "DROP TABLE projects_v10",
+        PROJECT_SCHEMA_STATEMENTS[1],
+    ),
 }
 
 
@@ -313,6 +344,8 @@ class SqliteConversationRepository:
         self._connection = connection
         self._lock = RLock()
         self._setup()
+        # 独立项目子仓储复用同一连接与锁，不另外启动迁移或恢复活动 Run。
+        self.projects = SqliteProjectRepository(connection, self._lock)
 
     def _setup(self) -> None:
         """应用幂等迁移，并把上次异常退出的活动 Run 标记为 interrupted。"""
@@ -586,7 +619,10 @@ class SqliteConversationRepository:
                     """
                     INSERT INTO threads(thread_id, title, status, next_sequence, created_at, updated_at)
                     VALUES (?, ?, 'busy', 1, ?, ?)
-                    ON CONFLICT(thread_id) DO UPDATE SET status = 'busy', updated_at = excluded.updated_at
+                    ON CONFLICT(thread_id) DO UPDATE SET
+                        status = 'busy',
+                        title = COALESCE(threads.title, excluded.title),
+                        updated_at = excluded.updated_at
                     """,
                     (thread_id, title, now, now),
                 )
@@ -1053,29 +1089,86 @@ class SqliteConversationRepository:
             error_code=cast(str | None, row["error_code"]),
         )
 
-    def get_thread(self, thread_id: str) -> ThreadRecord | None:
-        """按主键查询 Thread 元数据。"""
-        with self._lock:
+    def create_project_thread(
+        self, *, thread_id: str, project_id: str
+    ) -> ThreadRecord:
+        """原子创建项目 Thread；同 ID 只能保持原归属，不能绑定或重绑。"""
+        now = _utc_now()
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO threads(
+                    thread_id, title, status, next_sequence,
+                    created_at, updated_at, project_id
+                ) VALUES (?, NULL, 'idle', 1, ?, ?, ?)
+                ON CONFLICT(thread_id) DO NOTHING
+                """,
+                (thread_id, now, now, project_id),
+            )
             row = self._connection.execute(
-                "SELECT thread_id, title, status, created_at, updated_at FROM threads WHERE thread_id = ?",
+                """
+                SELECT thread_id, title, status, created_at, updated_at, project_id
+                FROM threads WHERE thread_id = ?
+                """,
                 (thread_id,),
             ).fetchone()
-        if row is None:
-            return None
+            if row is None:
+                raise RuntimeError("Thread insert did not produce a readable record")
+            if row["project_id"] != project_id:
+                raise ThreadProjectConflictError(
+                    f"Thread {thread_id} already belongs to another context"
+                )
+        return self._thread_from_row(row)
+
+    def list_project_threads(
+        self, project_id: str, *, limit: int
+    ) -> tuple[ThreadRecord, ...]:
+        """使用 Project 最近活动索引返回严格归属的 Thread。"""
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT thread_id, title, status, created_at, updated_at, project_id
+                FROM threads
+                WHERE project_id = ?
+                ORDER BY updated_at DESC, thread_id DESC
+                LIMIT ?
+                """,
+                (project_id, limit),
+            ).fetchall()
+        return tuple(self._thread_from_row(row) for row in rows)
+
+    @staticmethod
+    def _thread_from_row(row: sqlite3.Row) -> ThreadRecord:
+        """集中映射 Thread 字段，防止全局列表与项目列表遗漏归属。"""
         return ThreadRecord(
             thread_id=str(row["thread_id"]),
             title=cast(str | None, row["title"]),
             status=cast(Any, row["status"]),
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
+            project_id=cast(str | None, row["project_id"]),
         )
+
+    def get_thread(self, thread_id: str) -> ThreadRecord | None:
+        """按主键查询 Thread 元数据。"""
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT thread_id, title, status, created_at, updated_at, project_id
+                FROM threads WHERE thread_id = ?
+                """,
+                (thread_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._thread_from_row(row)
 
     def list_threads(self, *, limit: int) -> tuple[ThreadRecord, ...]:
         """使用最近活动索引稳定倒序查询产品 Thread。"""
         with self._lock:
             rows = self._connection.execute(
                 """
-                SELECT thread_id, title, status, created_at, updated_at
+                SELECT thread_id, title, status, created_at, updated_at, project_id
                 FROM threads
                 ORDER BY updated_at DESC, thread_id DESC
                 LIMIT ?
@@ -1083,13 +1176,7 @@ class SqliteConversationRepository:
                 (limit,),
             ).fetchall()
         return tuple(
-            ThreadRecord(
-                thread_id=str(row["thread_id"]),
-                title=cast(str | None, row["title"]),
-                status=cast(Any, row["status"]),
-                created_at=str(row["created_at"]),
-                updated_at=str(row["updated_at"]),
-            )
+            self._thread_from_row(row)
             for row in rows
         )
 

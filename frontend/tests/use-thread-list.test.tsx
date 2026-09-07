@@ -13,6 +13,7 @@ const THREAD: ThreadSummary = {
   threadId: "11111111-1111-4111-8111-111111111111",
   title: "原始标题",
   status: "idle",
+  projectId: null,
   createdAt: "2026-08-26T08:00:00+00:00",
   updatedAt: "2026-08-26T09:00:00+00:00",
 };

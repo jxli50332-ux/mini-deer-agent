@@ -651,6 +651,9 @@ def test_repository_lists_recent_threads_with_stable_order_and_limit(
         (6,),
         (7,),
         (8,),
+        (9,),
+        (10,),
+        (11,),
     ]
     assert any("idx_threads_recent" in str(row) for row in query_plan)
 
@@ -823,7 +826,7 @@ def test_v1_stream_can_be_queried_after_run_completion(tmp_path: Path) -> None:
         """注入静态图，同时保留真实业务仓储和应用服务。"""
         return RunStreamService(
             checkpointer,
-            graph_factory=lambda _saver: cast(
+            graph_factory=lambda _saver, _file_access: cast(
                 CompiledStateGraph,
                 StaticMessageGraph(),
             ),
@@ -979,7 +982,7 @@ def test_closing_stream_marks_run_interrupted_and_releases_thread(
         ) as repository:
             service = RunStreamService(
                 cast(Any, object()),
-                graph_factory=lambda _saver: cast(
+                graph_factory=lambda _saver, _file_access: cast(
                     CompiledStateGraph,
                     BlockingGraph(),
                 ),

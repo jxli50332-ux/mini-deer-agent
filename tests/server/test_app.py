@@ -25,6 +25,12 @@ def test_openapi_exposes_only_versioned_public_contract() -> None:
     assert documented_paths == {
         "/api/v1/health",
         "/api/v1/mcp/status",
+        "/api/v1/projects",
+        "/api/v1/projects/pick-directory",
+        "/api/v1/projects/{project_id}",
+        "/api/v1/projects/{project_id}/threads",
+        "/api/v1/projects/{project_id}/directory",
+        "/api/v1/projects/{project_id}/file",
         "/api/v1/ready",
         "/api/v1/threads",
         "/api/v1/threads/{thread_id}",

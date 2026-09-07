@@ -1,7 +1,7 @@
 """定义 Prompt Builder 与 Agent Runtime 之间的稳定契约。"""
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 from langchain_core.messages import SystemMessage
 
@@ -15,6 +15,17 @@ class AgentPromptContext:
     agent_name: str = "Mini Deer Agent"
     available_tool_names: tuple[str, ...] = ()
     available_skills: tuple[SkillSummary, ...] = ()
+    readonly_project_id: str | None = None
+    readonly_file_access_source: (
+        Literal["project", "explicit", "workspace"] | None
+    ) = None
+    readonly_file_target_kind: (
+        Literal["directory", "file", "roots"] | None
+    ) = None
+    readonly_project_root_entries: (
+        tuple[tuple[str, Literal["directory", "file"]], ...] | None
+    ) = None
+    readonly_project_root_truncated: bool = False
 
 
 @dataclass(frozen=True, slots=True)

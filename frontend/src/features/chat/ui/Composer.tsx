@@ -1,4 +1,6 @@
 import {
+  useEffect,
+  useRef,
   useState,
   type ChangeEvent,
   type FormEvent,
@@ -19,6 +21,11 @@ interface ComposerProps {
   readonly disabled?: boolean;
   readonly todoList?: TodoList | null;
   readonly todoSourceStepId?: string;
+  readonly draftInsertion?: {
+    readonly id: number;
+    readonly text: string;
+  } | null;
+  readonly onDraftInsertionApplied?: (id: number) => void;
   readonly onSubmit: (
     message: string,
     attachments: readonly PreparedTextAttachment[],
@@ -32,10 +39,14 @@ export function Composer({
   disabled = false,
   todoList = null,
   todoSourceStepId,
+  draftInsertion = null,
+  onDraftInsertionApplied = () => undefined,
   onSubmit,
   onCancel,
 }: ComposerProps) {
   const [draft, setDraft] = useState("");
+  const textarea = useRef<HTMLTextAreaElement>(null);
+  const lastAppliedInsertionId = useRef<number | null>(null);
   const [attachments, setAttachments] = useState<
     readonly PreparedTextAttachment[]
   >([]);
@@ -47,6 +58,22 @@ export function Composer({
     !isActive &&
     !isPreparingAttachments &&
     normalizedDraft.length > 0;
+
+  useEffect(() => {
+    if (
+      draftInsertion === null ||
+      draftInsertion.id === lastAppliedInsertionId.current
+    ) {
+      return;
+    }
+    lastAppliedInsertionId.current = draftInsertion.id;
+    setDraft((current) => {
+      const separator = current.length === 0 ? "" : "\n\n";
+      return `${current}${separator}${draftInsertion.text}`.slice(0, 32_768);
+    });
+    textarea.current?.focus();
+    onDraftInsertionApplied(draftInsertion.id);
+  }, [draftInsertion, onDraftInsertionApplied]);
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -163,6 +190,7 @@ export function Composer({
         )}
         <div className="composer__input-row">
           <textarea
+            ref={textarea}
             id="chat-message"
             name="message"
             rows={2}

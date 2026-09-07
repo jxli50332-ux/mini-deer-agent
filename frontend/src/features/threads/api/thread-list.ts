@@ -107,7 +107,16 @@ function parseTitle(record: UnknownRecord): string | null {
   return title;
 }
 
-function parseThreadSummary(value: unknown): ThreadSummary {
+function parseProjectId(record: UnknownRecord): string | null {
+  const projectId = record.project_id;
+  if (projectId === null) return null;
+  if (typeof projectId !== "string" || !UUID_PATTERN.test(projectId)) {
+    invalidResponse("project_id 必须是 UUID 或 null");
+  }
+  return projectId.toLowerCase();
+}
+
+export function parseThreadSummary(value: unknown): ThreadSummary {
   if (!isRecord(value)) {
     invalidResponse("Thread 列表项必须是 JSON object");
   }
@@ -119,6 +128,7 @@ function parseThreadSummary(value: unknown): ThreadSummary {
     threadId,
     title: parseTitle(value),
     status: parseStatus(value),
+    projectId: parseProjectId(value),
     createdAt: parseTimestamp(value, "created_at"),
     updatedAt: parseTimestamp(value, "updated_at"),
   };

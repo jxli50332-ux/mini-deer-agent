@@ -2,8 +2,8 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
-  useReducer,
   useRef,
+  useState,
 } from "react";
 
 import type { ChatTimelineItem } from "@/entities/message/model/types";
@@ -23,6 +23,7 @@ import type { HumanInputResponse } from "@/features/chat/model/human-input";
 import {
   chatRunReducer,
   createInitialChatRunState,
+  type ChatRunAction,
   type ChatRunFailure,
   type ChatRunState,
 } from "@/features/chat/model/reducer";
@@ -31,6 +32,11 @@ export type ChatStreamRunner = (
   request: ChatStreamRequest,
 ) => AsyncIterable<ChatRunEvent>;
 export type ChatRunCanceller = (request: ChatRunCancelRequest) => Promise<void>;
+const TERMINAL_EVENT_NAMES = new Set([
+  "run_completed",
+  "run_error",
+  "run_interrupted",
+]);
 
 export interface UseChatRunOptions {
   readonly threadId: string;
@@ -38,11 +44,16 @@ export interface UseChatRunOptions {
   readonly cancelRunner?: ChatRunCanceller;
   readonly runReconciler?: ChatRunReconciler;
   readonly createMessageId?: () => string;
+  readonly onRunRequested?: (threadId: string) => void;
+  readonly onRunStarted?: (threadId: string, runId: string) => void;
+  readonly onRunSettled?: (threadId: string, runId: string) => void;
+  readonly onEventReceived?: (event: ChatRunEvent) => void;
 }
 
 export interface UseChatRunResult {
   readonly state: ChatRunState;
   readonly isActive: boolean;
+  readonly activeThreadIds: readonly string[];
   readonly hydrateHistory: (
     threadId: string,
     timeline: readonly ChatTimelineItem[],
@@ -120,41 +131,64 @@ function isTerminalRun(detail: ChatRunDetail): boolean {
  */
 export function useChatRun(options: UseChatRunOptions): UseChatRunResult {
   const { threadId } = options;
+  const onRunRequested = options.onRunRequested;
+  const onRunStarted = options.onRunStarted;
+  const onRunSettled = options.onRunSettled;
+  const onEventReceived = options.onEventReceived;
   const streamRunner = options.streamRunner ?? streamChatRun;
   const cancelRunner = options.cancelRunner ?? cancelChatRun;
   const runReconciler =
     options.runReconciler ?? reconcileChatRunAfterDisconnect;
   const createMessageId = options.createMessageId ?? defaultCreateMessageId;
-  const [state, dispatch] = useReducer(
-    chatRunReducer,
-    threadId,
-    createInitialChatRunState,
+  const [renderedState, setRenderedState] = useState(() =>
+    createInitialChatRunState(threadId),
   );
+  const [activeThreadIds, setActiveThreadIds] = useState<readonly string[]>([]);
 
-  const activeOperationRef = useRef<ActiveOperation | null>(null);
+  const statesRef = useRef(
+    new Map<string, ChatRunState>([
+      [threadId, createInitialChatRunState(threadId)],
+    ]),
+  );
+  const activeOperationsRef = useRef(new Map<string, ActiveOperation>());
   const nextOperationIdRef = useRef(1);
   const currentThreadIdRef = useRef(threadId);
   const previousThreadIdRef = useRef(threadId);
 
   useLayoutEffect(() => {
-    // ref 只在提交阶段同步，避免 render 阶段读写可变外部状态。
+    // 切换只替换当前视图；其他 Thread 的状态和 SSE 消费继续独立推进。
     currentThreadIdRef.current = threadId;
     if (previousThreadIdRef.current === threadId) {
       return;
     }
-
-    // 切换线程时先断开旧流，再清空旧状态；旧 promise 即使稍后恢复也不能派发事件。
-    activeOperationRef.current?.controller.abort();
-    activeOperationRef.current = null;
     previousThreadIdRef.current = threadId;
-    dispatch({ type: "thread/reset", threadId });
+    const next =
+      statesRef.current.get(threadId) ?? createInitialChatRunState(threadId);
+    statesRef.current.set(threadId, next);
+    setRenderedState(next);
   }, [threadId]);
 
   useEffect(
     () => () => {
-      // 组件卸载后取消底层 fetch，并让异步循环通过 operation 身份检查停止派发。
-      activeOperationRef.current?.controller.abort();
-      activeOperationRef.current = null;
+      // 页面卸载才终止全部本地订阅；普通 Thread 切换不会触碰后台 Run。
+      for (const operation of activeOperationsRef.current.values()) {
+        operation.controller.abort();
+      }
+      activeOperationsRef.current.clear();
+    },
+    [],
+  );
+
+  const dispatchForThread = useCallback(
+    (targetThreadId: string, action: ChatRunAction): void => {
+      const current =
+        statesRef.current.get(targetThreadId) ??
+        createInitialChatRunState(targetThreadId);
+      const next = chatRunReducer(current, action);
+      statesRef.current.set(targetThreadId, next);
+      if (currentThreadIdRef.current === targetThreadId) {
+        setRenderedState(next);
+      }
     },
     [],
   );
@@ -165,7 +199,7 @@ export function useChatRun(options: UseChatRunOptions): UseChatRunResult {
       attachments: readonly PreparedTextAttachment[] = [],
       submitOptions: ChatSubmitOptions = {},
     ): Promise<boolean> => {
-      if (activeOperationRef.current !== null) {
+      if (activeOperationsRef.current.has(threadId)) {
         return false;
       }
 
@@ -187,9 +221,13 @@ export function useChatRun(options: UseChatRunOptions): UseChatRunResult {
         cancelRequested: false,
       };
       nextOperationIdRef.current += 1;
-      activeOperationRef.current = operation;
+      activeOperationsRef.current.set(threadId, operation);
+      setActiveThreadIds((current) =>
+        current.includes(threadId) ? current : [...current, threadId],
+      );
+      onRunRequested?.(threadId);
 
-      dispatch({
+      dispatchForThread(threadId, {
         type: "run/requested",
         threadId,
         userMessage: {
@@ -213,8 +251,8 @@ export function useChatRun(options: UseChatRunOptions): UseChatRunResult {
       });
 
       const isCurrentOperation = () =>
-        activeOperationRef.current?.id === operation.id &&
-        currentThreadIdRef.current === operation.threadId;
+        activeOperationsRef.current.get(operation.threadId)?.id ===
+        operation.id;
 
       try {
         for await (const event of streamRunner({
@@ -233,14 +271,27 @@ export function useChatRun(options: UseChatRunOptions): UseChatRunResult {
             // 响应头先建立取消寻址；旧 operation 的回调不能覆盖当前 Run。
             if (isCurrentOperation()) {
               operation.runId = runId;
+              onRunStarted?.(operation.threadId, runId);
             }
           },
         })) {
           if (!isCurrentOperation()) {
             return false;
           }
-          operation.runId ??= event.runId;
-          dispatch({ type: "run/event-received", event });
+          if (operation.runId === null) {
+            operation.runId = event.runId;
+            if (event.event === "run_started") {
+              onRunStarted?.(operation.threadId, event.runId);
+            }
+          }
+          dispatchForThread(operation.threadId, {
+            type: "run/event-received",
+            event,
+          });
+          onEventReceived?.(event);
+          if (TERMINAL_EVENT_NAMES.has(event.event)) {
+            onRunSettled?.(operation.threadId, event.runId);
+          }
         }
         return isCurrentOperation();
       } catch (error) {
@@ -250,7 +301,7 @@ export function useChatRun(options: UseChatRunOptions): UseChatRunResult {
 
         const failure = toClientFailure(error);
         if (operation.controller.signal.aborted || failure === null) {
-          dispatch({ type: "run/cancelled" });
+          dispatchForThread(operation.threadId, { type: "run/cancelled" });
         } else {
           if (operation.runId !== null && isUncertainConnectionFailure(error)) {
             try {
@@ -263,7 +314,11 @@ export function useChatRun(options: UseChatRunOptions): UseChatRunResult {
                 return false;
               }
               if (isTerminalRun(run)) {
-                dispatch({ type: "run/status-reconciled", run });
+                dispatchForThread(operation.threadId, {
+                  type: "run/status-reconciled",
+                  run,
+                });
+                onRunSettled?.(operation.threadId, run.runId);
                 return true;
               }
             } catch {
@@ -273,20 +328,39 @@ export function useChatRun(options: UseChatRunOptions): UseChatRunResult {
               }
             }
           }
-          dispatch({ type: "run/client-failed", error: failure });
+          dispatchForThread(operation.threadId, {
+            type: "run/client-failed",
+            error: failure,
+          });
         }
         return false;
       } finally {
-        if (activeOperationRef.current?.id === operation.id) {
-          activeOperationRef.current = null;
+        if (
+          activeOperationsRef.current.get(operation.threadId)?.id ===
+          operation.id
+        ) {
+          activeOperationsRef.current.delete(operation.threadId);
+          setActiveThreadIds((current) =>
+            current.filter((item) => item !== operation.threadId),
+          );
         }
       }
     },
-    [createMessageId, runReconciler, streamRunner, threadId],
+    [
+      createMessageId,
+      dispatchForThread,
+      onRunRequested,
+      onRunSettled,
+      onRunStarted,
+      onEventReceived,
+      runReconciler,
+      streamRunner,
+      threadId,
+    ],
   );
 
   const cancel = useCallback(async (): Promise<boolean> => {
-    const operation = activeOperationRef.current;
+    const operation = activeOperationsRef.current.get(threadId) ?? null;
     if (operation === null) {
       return false;
     }
@@ -297,12 +371,12 @@ export function useChatRun(options: UseChatRunOptions): UseChatRunResult {
 
     if (operation.runId === null) {
       // 响应头尚未到达时没有可寻址 Run；断开连接会触发服务端同一取消状态机。
-      dispatch({ type: "run/cancelled" });
+      dispatchForThread(operation.threadId, { type: "run/cancelled" });
       operation.controller.abort();
       return true;
     }
 
-    dispatch({ type: "run/cancel-requested" });
+    dispatchForThread(operation.threadId, { type: "run/cancel-requested" });
     try {
       await cancelRunner({
         threadId: operation.threadId,
@@ -311,14 +385,14 @@ export function useChatRun(options: UseChatRunOptions): UseChatRunResult {
       // 不主动关闭 SSE；等待服务端 run_interrupted 作为唯一可信终态。
       return true;
     } catch (error) {
-      const isCurrentOperation =
-        activeOperationRef.current?.id === operation.id &&
-        currentThreadIdRef.current === operation.threadId;
-      if (!isCurrentOperation) {
+      const isLiveOperation =
+        activeOperationsRef.current.get(operation.threadId)?.id ===
+        operation.id;
+      if (!isLiveOperation) {
         return false;
       }
       const failure = toClientFailure(error);
-      dispatch({
+      dispatchForThread(operation.threadId, {
         type: "run/cancel-failed",
         error:
           failure === null
@@ -332,23 +406,24 @@ export function useChatRun(options: UseChatRunOptions): UseChatRunResult {
       operation.cancelRequested = false;
       return false;
     }
-  }, [cancelRunner]);
+  }, [cancelRunner, dispatchForThread, threadId]);
 
   const hydrateHistory = useCallback(
     (historyThreadId: string, timeline: readonly ChatTimelineItem[]): void => {
       // reducer 再次校验 Thread，旧查询即使迟到也不能覆盖已经切换的新页面。
-      dispatch({
+      dispatchForThread(historyThreadId, {
         type: "thread/history-loaded",
         threadId: historyThreadId,
         timeline,
       });
     },
-    [],
+    [dispatchForThread],
   );
 
   return {
-    state,
-    isActive: isActiveState(state),
+    state: renderedState,
+    isActive: isActiveState(renderedState),
+    activeThreadIds,
     hydrateHistory,
     submit,
     cancel,

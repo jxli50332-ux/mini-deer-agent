@@ -12437,3 +12437,363 @@ git diff --check：通过
 - reasoning 持久化让刷新后仍可查看，不牺牲历史恢复能力。
 
 当前已按用户要求完成 12.18 记录。下一连续编号是 12.19，主题等待用户指定。
+
+## 功能点 13.1：项目登记与只读状态
+
+### 后端登记与持久查询（已验证）
+
+用户已将主线转入项目工作区与 Agent Coding，并要求沿用
+`docs/plans/project-workspace-coding-stage.md`。本次先交付 13.1 的后端子步骤；
+页面入口和解除登记需要分别实现、验证，不能把 13.1 整体提前标记完成。
+
+DeerFlow 对照提交为 `a5acc25de6742b2166b3f41c97bd895822277b94`。
+`ThreadDataMiddleware.before_agent()` 从运行配置取得 `thread_id`，通过
+`_get_thread_paths()` → `Paths.sandbox_work_dir()` → `Paths.thread_dir()`
+计算 workspace/uploads/outputs。默认惰性初始化，目录身份跟随 Thread。
+Mini Deer 需要让一个项目跨多个 Thread 存续，因此新增独立 Project 业务实体，
+不把登记目录写入 LangGraph checkpoint。
+
+实现链路：
+
+```text
+POST /api/v1/projects
+  → require_workspace_access：回环连接、Host、Origin、独立凭据
+  → ProjectService.register：名称与根目录校验、生成 Project ID
+  → ProjectRootPolicy.inspect：允许范围、逐层 lstat、链接/敏感目录检查
+  → SqliteProjectRepository.insert：唯一根路径、业务 SQLite v9
+GET /api/v1/projects 或 /api/v1/projects/{project_id}
+  → 读取登记 → 复核目录身份 → 返回并保存当前可用状态
+```
+
+`ProjectRecord` 保存名称、规范根路径、原目录身份和固定 `read_only` 权限。
+项目子仓储复用业务数据库的同一连接、锁和迁移链；`projects` 没有 Thread 外键，
+删除会话不会删除项目登记或原文件。API 尚不提供文件读取、写入、Shell 或 Agent 工具。
+
+根目录必须由用户明确配置在允许范围内。逐层 `lstat` 拒绝符号链接、Windows junction
+和其他 reparse point；入口拒绝 UNC、设备路径、ADS、上级跳转、磁盘根及敏感目录。
+登记只打开目录确认访问性，不扫描或读取文件正文。目录身份校验用于发现替换，不能宣称
+消除了外部文件系统竞争；后续文件服务每次实际访问仍需重新校验。
+
+查询区分 `available / missing / unavailable / changed`。允许根本身暂不可用时，
+服务仍可重启，已登记项目返回失效状态。重复根路径由数据库唯一约束原子拒绝，
+Windows 大小写变体也不会创建第二个项目。列表有界分页，并提供 `next_offset`。
+
+默认没有配置允许根或凭据时，项目 API 返回 503。所有项目请求，包括 GET，均检查
+本地连接、Host/Origin 和独立访问凭据；成功结果使用 `Cache-Control: no-store`。
+这是本地单用户管理入口，尚未提供完整用户认证、浏览器会话引导或操作审批。
+
+自动化全量后端 260 项通过；补充缺失根重启、权限拒绝与 Windows 路径别名后，
+相关模块 48 项通过。另通过 Python 编译、新增文件 Black 检查和 `git diff --check`。
+测试使用临时目录，覆盖真实符号链接/junction、并发重复登记、迁移保留旧数据与原文件不变。
+
+用户在 Swagger 验收后明确回复“已验证”。随回复附带的是字段示例，未提供真实项目 ID；
+本记录依据用户的验收确认，不将示例中的 `string` 当作实际数据库结果。
+随后已推进并完成 13.1 的页面登记、状态查询和解除登记闭环；对应结论见下一节。
+
+### 页面登记、状态查询与解除登记（已验证）
+
+页面调用链保持职责分离：
+
+```text
+ConversationRail → WorkspaceLauncher → ProjectManager
+  → useProjects：内存凭据、单请求门闩、取消和迟到响应拒绝
+  → projects.ts：同源 GET/POST/DELETE、15 秒超时、禁止重定向
+  → 项目 Router → ProjectService → SqliteProjectRepository
+```
+
+页面不会在挂载时读取路径，也不会自动创建测试登记；用户输入后端配置的独立工作区凭据后，
+才加载实际业务数据库中的项目。凭据只保留在当前页面内存，不进入浏览器存储、URL 或构建配置。
+登记只有在服务端返回并通过校验的 201 后才进入列表；网络中断不自动重发 POST，避免结果未知时
+重复登记。状态刷新展示 `available / missing / unavailable / changed`，不把失效目录伪装为可用。
+
+DeerFlow 的 `DELETE /threads/{thread_id}` 会调用 `_delete_thread_data()` 和
+`Paths.delete_thread_dir()` 删除 DeerFlow 自己管理的 Thread 目录，并清理 checkpoint、元数据和
+运行资源。Mini Deer 登记的是用户已有项目目录，不能复用这种删除语义。因此解除链被收窄为：
+
+```text
+ProjectManager 显式确认
+  → DELETE /api/v1/projects/{project_id}
+  → ProjectService.unregister
+  → SqliteProjectRepository.remove：只删除 projects 行
+  → 204 后页面移除卡片
+```
+
+取消不会发送请求；解除失败保留项目与确认区域，只有 204 才显示成功。后端不接收 `root_path`
+或文件删除选项，解除时也不调用目录检查，因此目录缺失或不可访问仍能清理登记。操作幂等，
+不会删除 Thread、Memory 或其他 Project；原目录和文件保持不变。
+
+自动化结果为后端 265 项、前端 33 个测试文件 218 项通过，typecheck、ESLint、Prettier、
+生产构建、Python 编译和空白差异检查通过。隔离浏览器验证了凭据连接、登记、状态、确认、取消、
+成功解除和卡片移除；解除后测试数据库项目行数为 0，原文件内容仍为 `keep original`。
+
+用户在实际页面确认允许根为
+`D:\project\agentstudy\mini-deer-agent\examples\workspace-registration-sample`：允许根外的
+`src` 路径被拒绝，改用允许根完成登记、刷新和解除后回复“已验证”。13.1 至此完整验收。
+
+## 功能点 13.2：Project 与 Thread 归属
+
+### 后端持久归属（已验证）
+
+DeerFlow 的 `ThreadDataMiddleware.before_agent()` 通过 `_get_thread_paths()` 和
+`Paths.sandbox_work_dir(thread_id)`，让 Thread ID 直接决定其受管工作目录。Mini Deer 需要一个
+Project 容纳多个 Thread，因此在业务 SQLite v10 中为 Thread 增加 nullable `project_id`，明确保存
+归属关系，而不是从目录名或 checkpoint 反推。
+
+```text
+POST /api/v1/projects/{project_id}/threads
+  → 工作区访问门禁
+  → ProjectThreadService：确认项目已登记且 available
+  → SqliteConversationRepository：创建或幂等返回项目 Thread
+GET /api/v1/projects/{project_id}/threads
+  → 只返回该项目的持久归属
+GET /api/v1/threads/{thread_id}
+  → 返回 project_id 或 null
+```
+
+同一 Thread ID 只能属于最初创建它的项目；普通聊天与其他项目的 Thread 都不能被重绑。项目
+Thread 的第一个 Run 可以补上默认标题，但不能改写 `project_id`。解除项目登记不级联清空历史
+Thread 身份；目录失效时拒绝创建新项目 Thread，已有归属仍可查询。该步骤只建立会话身份，尚未
+创建项目文件工具、Run 工作区快照、checkpoint 或目录副本。
+
+后端全量 268 项通过，覆盖两个项目隔离、创建幂等、禁止重绑、普通聊天 `project_id = null`、
+重启恢复、解除登记后保留历史归属及 v8 到 v10 迁移。用户随后在 Swagger 验证项目 Thread 的
+创建、重复创建、项目内列表、全局 Thread 查询和普通聊天兼容，并明确回复“已验证”。
+
+### 纯思考历史消息恢复（已验证）
+
+运行历史可能包含正文为空、但 `reasoning` 非空的 Assistant 中间消息。这类记录用于保存工具调用
+前后的思考过程，是合法历史，不能因为 `content` 为空而拒绝整页。前端历史解析现允许这一组合，
+同时继续拒绝空用户消息，以及 `content` 和 `reasoning` 都为空的 Assistant 消息。
+
+前端全量 34 个测试文件、229 项测试以及 typecheck、ESLint、Prettier 和生产构建通过。用户对
+原先显示“历史消息加载失败 / content 必须是非空字符串”的真实旅游会话刷新后确认“修复成功”。
+
+### 多 Thread 并发运行与切换（已验证）
+
+前端运行状态按 `thread_id` 隔离保存；每个 Thread 拥有自己的状态快照和活动 SSE operation。
+切换会话只更换当前展示的状态，不再中止原 Thread 的网络流。不同 Thread 可以分别提交 Run，
+切回后继续显示该 Thread 的实时进度或最终时间线；停止操作只作用于当前 Thread。侧栏把切走后
+仍在执行的普通会话标为“正在后台运行”，项目会话标为“运行中”，两者都保持可点击。
+
+真实浏览器依次启动 Thread `f460187c-cb54-478f-b46b-b4d3be89777b` 的 Run
+`ff358376-4040-4a7b-8044-58a20021a06d`，在其执行中切换并启动 Thread
+`3d038245-d478-4f04-aba3-a1138dc7771d` 的 Run
+`3733437e-0249-4d92-9fc9-688205203c24`。页面当时同时显示当前 Thread“正在生成”和前一 Thread
+“正在后台运行”。持久记录表明前者执行区间为 19:31:55—19:32:52，后者为
+19:32:08—19:33:08，两者重叠约 44 秒且均独立完成。随后在页面来回切换，两个 Thread 各自的
+完整问题、思考过程、最终回答、Run ID 和完成状态都正确恢复。
+
+前端全量 34 个测试文件、230 项测试通过，并通过 typecheck、ESLint、Prettier 和生产构建；
+后端全量 270 项通过。自动化另覆盖两个活动 Thread 的反序事件、独立完成和只取消指定 Thread。
+
+### 13.2 页面与并发收尾（用户已验证）
+
+用户在完成项目空草稿清理、已运行会话切换/刷新保留、双 Thread 并发独立停止和南京旧会话继续的验收要求后，明确回复“已验证，继续”。13.2 至此完成。页面通过 Project ID 持久关联 Thread，useProjectThreadDraft 在提交 Run 时清除草稿标记，useChatRun 按 Thread 保存状态和 SSE operation，切换只改变展示身份。针对性前端 43 项、后端 33 项通过；新增前端独立取消测试后运行 Hook 15 项和类型检查通过。下一步为 13.3 目录列表接口，再接文件树页面。
+
+### 13.3 单层目录 API（用户已验证）
+
+用户在源码讲解和 Swagger 验收后明确回复“已验证，继续”。实现链为项目 Router → ProjectService.directory → workspace/directory.py，项目身份复核后按根内相对路径只列直接子项；无正文读取，无 Agent 文件工具。固定忽略规则、链接拒绝、截断原因和目录变化检查已交付，相关后端 48 项通过。当前继续页面文件树，页面验收独立进行。
+
+### 13.3 文件树页面（用户已验证）
+
+用户确认页面验收。WorkspaceLauncher 按 Project ID 挂载 ProjectFileTree；节点展开后通过 useProjects 的内存凭据请求目录接口，parseDirectory 验证项目及相对路径。每个目录独立加载，刷新重建子树；收起/卸载取消请求并拒绝迟到响应。文件名只展示，忽略/不可访问项不展开，截断明确提示。相关前端 27 项、类型/ESLint/格式/构建通过。13.3 完成，进入 13.4 只读源码预览。
+
+### 13.4 只读文件接口（用户已验证）
+
+用户在源码讲解和 Swagger 验收后回复“已验证，继续”。读取链为项目 Router → ProjectService.read_file → workspace/files.py。路径复核后只读普通文件，最大 2 MiB 快照，按行和字符预算返回片段、next_line 和 SHA-256 revision；UTF-8/BOM/CRLF、空文件与不支持状态分别处理。Windows 路径 stat 和句柄 fstat 的 ctime 语义不同，跨接口签名比较使用设备号、文件身份、大小和修改时间。相关后端 61 项通过。下一子步骤接入只读预览 UI。
+
+### 13.4 源码预览页面（用户已验证）
+
+用户确认源码预览验收并要求继续。ProjectFileTree 的普通文件节点传递相对路径，ProjectFiles 管理预览生命周期，FilePreview 按段显示纯文本和真实行号。parseFilePage 校验身份、行范围与连续游标；续读核对 revision，外部修改后要求重新加载，关闭/卸载拒绝迟到响应。相关前端 35 项、类型/ESLint/格式/构建通过。13.4 完成，进入 13.5 工具适配及主 Agent 接入。
+
+### 个人学习模式免密码入口与简洁项目侧栏（用户已验证）
+
+用户要求移除工作区密码并把入口简化为 Codex 式项目→会话结构。后端项目接口保留回环来源与允许目录检查，不再读取或校验工作区 token；前端 useProjects 挂载后自动加载项目，WorkspaceLauncher 将会话缩进到所属项目下，默认显示最近五条并可展开其余。项目管理现由标题旁“···”进入，项目行“＋”继续创建项目会话。旧连接、密码和锁定入口已删除。
+
+自动化结果为前端全量 243 项、后端项目/配置/应用接口相关 40 项通过，类型、构建、ESLint、格式和空白差异检查通过。助手已在真实页面检查自动加载、展开、切换和管理表单；用户随后刷新 `http://127.0.0.1:5173` 完成实际页面验证并回复“已验证继续”。该插入项至此验收，继续 13.5 主图只读文件工具的真实模型闭环。
+
+### 13.5 项目主图只读工具闭环（用户已验证）
+
+项目图由可信调用方把 `ProjectService + project_id` 成对传入 `build_agent_graph`，构图时冻结项目绑定并创建 `list_files/read_file`。模型绑定与 ToolNode 使用同一工具集合；Skills allowed-tools 同时约束工具可见性和执行，项目图排除传入的 MCP，task 子图不继承项目文件工具。普通图会覆盖伪造的项目 Prompt 字段，不能仅靠消息取得文件权限。
+
+终端真实模型第一次按 `list_files → read_file → 最终回答` 执行并引用真实行号，但把 `next_line: null` 的末行错误描述为截断。Prompt 升级到 v18，明确 `list_files.truncated = false` 表示目录结果未截断、`read_file.next_line = null` 表示读到文件末尾，并禁止根据标点或换行猜测完整性；针对性 20 项通过。相同问题复测后，模型正确列出 `README.md` 与 `test.md`，完整读取 6 行，引用 `README.md:3`、`:5`、`:6`，不再误报截断。用户随后回复“继续”，13.5 至此验收。
+
+### 13.5 通用只读文件访问上下文（用户已验证）
+
+DeerFlow 的文件工具由 `Runtime` 取得 Thread state/context，再经 `SandboxProvider` 找到当前 Sandbox；工具参数本身不携带运行环境身份。Mini Deer 据此把原 `ProjectService + project_id` 工具闭包拆成 `FileAccessScope → ReadOnlyFileAccess → create_file_tools`：Scope 可来自已登记 Project，也可来自普通对话中用户明确指定的允许根内文件或目录，模型仍只传相对路径与行数。
+
+明确单文件 Scope 的根列表只暴露该文件，读取兄弟文件被拒绝；明确目录继续复用既有目录枚举、忽略规则和有界读取。每次操作前后复核规范路径、目标类型和文件系统身份，允许根外、敏感文件、链接及目标替换失败关闭。`create_project_tools` 现为通用工具工厂的兼容包装，已有项目主图不回退。针对性 43 项、后端全量 309 项、Python 编译和 diff 空白检查通过。用户运行 `examples/inspect_file_access.py` 验证 `source=explicit`、`project_id=null`、单文件列表及 6 行正文后回复“已验证，继续”。
+
+### 13.5 无 Project 普通主图只读闭环（用户已验证）
+
+主图新增可信 `file_access` 参数，与 `project_service + project_id` 成对绑定互斥。无 Project 的普通图可获得明确文件 Scope 的 list/read 工具，同时覆盖外部 Prompt 伪造身份、排除未声明路径边界的 MCP，并保持 Skills 和 task 子图权限边界。Prompt v20 只说明 explicit file/directory 范围，不展示绝对路径或文件系统身份。
+
+真实模型第一次正确调用 `list_files → read_file`，但因正文空行把实际第 3、5 行引用成第 2、4 行。通用读取结果随后加入与 `lines` 一一对应的 `line_numbers`，Prompt 要求引用该字段而非自行计数。相同问题复测后，模型只看到授权的 README.md，正确引用 `README.md:1`、`:3`、`:5`、`:6`，结果没有 Project ID 或宿主绝对路径。针对性 39 项、后端全量 311 项、编译和 diff 空白检查通过；用户连续回复“继续”，该原子点验收完成。
+
+### 13.5 网页项目 Run 只读闭环（用户已验证）
+
+网页 Run 不接收 `project_id`。`ProjectFileAccessResolver` 查询业务库的 `ThreadRecord.project_id`，再由当前 `ProjectService` 冻结项目只读 Scope；`RunStreamService` 在每轮构图前把 Scope 交给 graph factory。该次验收时普通或不存在的 Thread 尚未接入 Scope；项目解除、目录失效或根身份变化会在模型调用前失败关闭。新版 Run 与旧 `/chat/stream` 共用这条持久身份解析链。
+
+真实 Project Thread 的应用层测试确认模型获得 list/read，Prompt 含项目 UUID 且不含绝对根，工具读取 `main.py` 并返回真实 `line_numbers`。针对性 41 项、后端全量 312 项通过；确认没有活动 Run 后重启 8001。用户随后在 `tesst` 项目会话发送目录与 README 读取问题，完成网页真实模型验收。
+
+### 13.5 普通 Thread 常驻允许根（用户已验证）
+
+用户进一步澄清：普通 Thread 在任何时候都应拥有读文件权限，不采用每个 Run 临时传入单一路径的入口。`ProjectRootPolicy.inspect_allowed_roots` 会复核全部配置根；`ReadOnlyFileAccess.for_allowed_roots` 把它们冻结为 `workspace-1`、`workspace-2` 等虚拟入口。普通或尚不存在的 Thread 每轮自动取得该 Scope，Project Thread 仍只取得自己的项目根。模型只能使用虚拟相对路径，工具结果不含宿主绝对路径；敏感项、越界路径、链接和根身份替换继续失败关闭。
+
+Prompt v21 新增 `readonly_workspace` 约束，要求先列虚拟根再展开读取。针对性 44 项、后端全量 314 项通过。真实模型按 `list_files("") → list_files("workspace-1") → read_file("workspace-1/README.md")` 完成闭环，正确引用 1、3、5、6 行并识别 `next_line: null`。格式化工具未安装，已用测试、Python 导入执行和 `git diff --check` 覆盖当前检查；8001 后端重启后，用户已完成普通页面 Thread 验收。
+
+### 13.6 共用有界文件名 glob（用户已验证）
+
+DeerFlow 的 `find_glob_matches` 使用相对 `PurePosixPath.match`，特判 `**/` 让根文件也能命中，并过滤依赖、缓存和版本控制目录；工具层再把宿主路径映射回虚拟路径。Mini Deer 沿用这些语义，同时在 `workspace/search.py` 增加逐目录身份复核、Windows reparse 拒绝、10,000 项扫描上限和 1 秒预算。`glob_files` 只返回路径与完整性字段，正文仍必须由 `read_file` 获取。
+
+Project、明确文件/目录及普通 Thread 的虚拟允许根共用一个工具适配器；单文件 Scope 的 glob 不会扩大到父目录。Prompt v22 明确路径发现不是正文证据，前端 COT 将 glob 显示为文件查找步骤。针对性后端 47 项、后端全量 319 项、前端全量 244 项、类型、Lint、格式和构建均通过。真实模型第一次成功 glob 后因全量读取 598 行文件导致最终请求超过 180 秒；改用 6 行 README 后正确完成 glob→read→引用。后端重启后，用户在普通页面 Thread 使用 `workspace-1/project-test` 完成页面验收。
+
+### 13.6 共用有界正文搜索（用户已验证）
+
+Mini Deer 的 `search_files` 沿用 DeerFlow grep 的“文件或目录、文件 glob、行级结果”结构，但首版只接受单行字面量，避免 Python 任意正则在长输入上造成不可中止的回溯。搜索继承 `ReadOnlyFileAccess` Scope：Project、明确文件/目录和普通 Thread 共用实现，普通范围只返回 `workspace-N` 虚拟路径，单文件范围不搜索兄弟文件。
+
+搜索同时限制目录项、文件数、单文件与累计字节、时间、匹配条数和输出字符；二进制、非 UTF-8、超大文件与超长行会增加跳过计数并标记结果不完整。长行摘要围绕实际命中位置截取，避免“命中了但摘要看不到查询词”。跨多个允许根时，共享预算且不会因前一个根含不支持文件而遗漏后续根。Prompt v23 和页面 COT 已接入；真实 `project-test` 模型闭环找到 `src/main.py:1` 的定义与 `:6` 的调用。后端 327 项、前端 247 项及静态检查通过，用户已完成普通页面 Thread 验收。
+
+### 13.7 从项目文件树引用文件到当前提问（用户已验证）
+
+显式文件引用首先做成可见、可撤销的草稿操作：文件预览按钮只写入项目相对路径，用户仍可补充问题、修改或删除，再自行发送。这比把文件正文复制成附件更符合已建立的文件工具边界，Agent 会在 Run 内通过 `read_file` 获取当时的真实内容与行号。
+
+引用只在当前 Thread 属于同一 Project 时启用；普通 Thread 虽然始终有通用读权限，但项目文件树中的 `src/main.py` 不等同于其 `workspace-N/...` 虚拟路径，不能把两种路径身份混用。ChatPage 生成绑定当前 Thread 的递增插入 ID，Composer 每个 ID 只应用一次、保留原草稿并重新聚焦。组件相关 18 项、前端全量 250 项和静态检查通过；助手与用户已在真实页面完成 `project-test/src/main.py` 引用验收。它只是可选快捷入口，不是 Agent Coding 的必需输入。
+
+### 13.7 自动项目根概要（用户已验证）
+
+用户指出模型应自行判断需要读取哪些文件，而不是要求人工逐个引用。Mini Deer 因此暂缓选区引用，把 Project 根目录的一层有界快照加入每个 Run 的静态系统提示：最多 40 个可用文件/目录，只含相对路径、类型和截断状态。正文仍必须通过工具读取，宿主绝对路径不进入模型；普通 Thread 保持 `workspace-N` 发现流程，不混用项目路径。
+
+概要路径来自文件系统，仍按不可信数据处理：控制字符被拒绝，XML 结构字符转义，提示明确禁止把路径名当作指令或正文。主图覆盖外部 PromptContext 的概要字段，避免伪造上下文。Prompt v24 告诉模型自主选择 list/glob/search/read 并尽量只读必要文件；真实模型在未给文件名时自动定位 `src/main.py` 并给出准确行号，但也额外读取了 README/notes，说明最小读取仍是软策略而非权限门禁。后端全量 330 项通过；用户随后完成页面验证并回复“已验证，继续”。
+
+### 项目标题“＋”选择真实文件夹（用户已验证）
+
+浏览器的目录上传选择器不能稳定提供后端可读取的 Windows 绝对路径，因此个人本地应用由 FastAPI 触发独立 `tkinter` 子进程打开原生目录选择器。子进程避免阻塞服务事件循环，返回路径后仍交给现有 `ProjectService.register` 校验；原生对话框只是交互入口，不构成新的文件授权边界。
+
+WorkspaceLauncher 将标题“＋”绑定到该接口，把项目管理移到相邻“···”。只有刚选择的项目自动展开根目录，避免普通项目展开时额外请求改变既有交互与测试顺序。页面同时显示选中项目的完整 `root_path`，文件树根节点使用实际目录名。用户用 `D:/project/agentstudy/project-test` 验证了 `README.md`、`notes.txt` 与 `src/main.py` 的真实结构。全量后端 321 项、前端 246 项及类型、Lint、构建通过。
+
+### Project Thread 明确根外路径（用户已验证）
+
+用户明确 Project 根目录是默认范围；当前消息写出根外 Windows 绝对文件或目录时，该目标可成为本轮附加范围。`RunStreamService` 把当前消息交给 `ProjectFileAccessResolver`，后者组合项目相对 Scope 与明确绝对路径 Scope；list/read/glob/search 结果对外恢复为用户给出的绝对路径。未明确给出的根外路径不从模型猜测扩张，附加范围不写入 Project 或下一 Run。
+
+实现不再受全局项目登记允许根约束，因此明确路径可以位于 Project 根和配置允许根之外。测试覆盖根外文件与目录、四种读取工具、项目内相对路径共存以及 Web Run 消息传递；相关 109 项与后端全量 332 项通过。确认没有活动 Run 后重启 8001，用户在 `project-test` Project Thread 完成真实页面验证并回复“已验证，继续”。
+
+### 13.8 创建新文本文件（用户已验证）
+
+`create_file` 复用 Project、普通 Thread 虚拟根和本轮明确根外目录的同一 FileAccess Scope。Project 使用相对路径，普通 Thread 使用 `workspace-N/...`；工具只创建父目录已存在的新 UTF-8 文本，正文最多 80 KiB，同名目标返回 `file_already_exists` 并保留原内容。Project 数据通过 SQLite v11 迁移为 `read_write`，保留既有 Project ID、根路径和 Thread 归属。
+
+Prompt v25 要求模型在创建成功后调用 `read_file` 核对落盘内容，前端 COT 显示“创建文件”和目标路径。后端全量 335 项、前端 251 项及类型、Lint、格式和构建通过；用户在真实 `project-test` Project Thread 创建 `agent-created.txt` 后回复“已验证，继续”。
+
+### 13.12 唯一精确替换（用户已验证）
+
+`str_replace(path, old_str, new_str)` 复用全部 FileAccess Scope，只在 `old_str` 恰好出现一次时修改已有 UTF-8 文本；零匹配与多匹配分别返回稳定错误并保持原文件。读取和替换在原始解码文本上进行，因此 CRLF 不会因行处理被改写，UTF-8 BOM 也会保留；成功结果返回替换前后 revision。
+
+Prompt v26 要求局部编辑后调用 `read_file` 核对，前端 COT 显示“更新文件”和目标路径。后端全量 337 项、前端 252 项及类型、Lint、格式和构建通过；用户在真实 `project-test` Project Thread 把 `agent-created.txt` 从创建能力文案改为精确编辑能力文案后回复“已验证，继续”。
+
+
+### 13.11 完整文本更新（用户已验证）
+
+`write_file(path, content)` 复用文件访问 Scope，使用最多 80 KiB 的完整 UTF-8 正文更新已有文本，保留 BOM；缺失目标提示使用 create_file。局部修改仍优先使用 str_replace。Prompt v27 要求先获取所需内容，写后读回确认。后端 339 项、前端 253 项和静态检查通过，用户于 2026-09-05 确认真实页面验收。
+
+
+### 创建目录（用户已验证）
+
+`create_directory` 复用项目、普通 Thread 与明确目录 Scope。父目录必须存在，嵌套目录由模型逐层创建；已有目录返回 created=false。Prompt v28 与 COT 创建目录步骤已接入，异步主图验证了创建目录→创建文件→读取文件的闭环。用户确认真实 project-test 页面验收。
+
+### 同目录文件重命名（用户已验证）
+
+`rename_file(path, new_name)` 只修改普通文件在同一目录中的名称，目标存在时不覆盖，文件字节保持不变。Project、普通 Thread 虚拟根和明确目录共用实现；单文件 Scope 不提供改名工具。Prompt v29 要求改名后使用返回的新路径读回，并列目录确认。用户在真实 `project-test` 页面完成验收后要求继续推进。
+
+### 文件跨目录移动（用户已验证）
+
+`move_file(path, new_path)` 在同一 FileAccess 目录 Scope 内移动普通文件，目标父目录必须存在且不会覆盖已有目标。普通 Thread 只能在同一个 `workspace-N` 根中移动；Project Thread 的项目范围与本轮明确根外范围不能互相穿越。工具返回原路径和新路径，前端 COT 显示“原路径 → 新路径”。后端全量 349 项、前端 256 项和静态检查通过，用户完成真实页面验收后要求继续。
+
+### 普通文件删除（用户已验证）
+
+`delete_file(path)` 只删除单个普通文件，不接受目录和递归删除。它覆盖 Project、普通 Thread、明确目录和用户本轮明确指定的单文件；单文件 Scope 仍不能触及兄弟文件。Prompt v31 要求只有用户明确要求时才删除，并在成功后列目录确认。后端全量 353 项、前端 257 项和静态检查通过，用户在真实 `project-test` 页面完成验收。
+
+### 本轮改动操作清单（用户已验证）
+
+前端直接从 Conversation Turn 已持久化的工具时间线投影实际文件变化：成功的新建、修改、目录创建、重命名、移动和删除进入清单，失败、未完成、不可解析结果与 no-op 不进入。移动与重命名同时显示原路径和新路径，因此刷新前后使用同一历史事实，无需另建只存在于浏览器内的变化状态。前端全量 260 项和静态检查通过，用户在真实页面完成验收。
+
+### 精确替换逐行差异（用户已验证）
+
+成功的 `str_replace` 改动项从持久化工具输入取得 `old_str` 与 `new_str`，统一换行后在“查看差异”中以红色删除行和绿色新增行展示。每侧最多显示 4000 字符，超限明确标记截断；刷新后仍由历史工具事实恢复。前端全量 261 项和静态检查通过，用户在真实页面完成验收。
+
+### 完整文本更新差异（用户已验证）
+
+成功且实际变化的 `write_file` 工具结果额外保存更新前最多 4000 字符的 UTF-8 正文预览及截断标记；前端将它与持久化工具输入中的新正文组合为红色删除行和绿色新增行。该事实来自写入发生时的真实旧内容，刷新后无需回读已经变化的文件。后端全量 353 项、前端全量 262 项和静态检查通过，用户在真实页面完成验收。
+
+### 新建文件正文差异（用户已验证）
+
+成功的 `create_file` 改动项从持久化工具输入取得正文，在“查看差异”中只显示绿色新增行，不渲染空白删除区域。正文统一换行并限制为最多 4000 字符，刷新后仍可恢复。前端全量 263 项和静态检查通过，用户在真实页面完成验收。
+
+### 删除文件正文差异（用户已验证）
+
+`delete_file` 在删除前尝试保存最多 4000 字符的 UTF-8 正文预览，成功项在“查看差异”中只显示红色删除行。二进制、非 UTF-8 和超过文本读取上限的文件仍可按原契约删除，但不生成文本差异。后端全量 353 项、前端全量 264 项和静态检查通过，用户在真实页面完成验收。
+
+### Agent 文件结构变化后自动刷新项目树（用户已验证）
+
+前端在 SSE 工具结果到达时识别成功的 `create_file`、`create_directory`、`rename_file`、`move_file` 和 `delete_file`，以 Run ID 记录结构变化；Run 完成、失败或取消后只发出一次刷新版本。已展开目录收到版本后重新读取，旧请求在 effect 清理时取消；`str_replace` 和 `write_file` 不改变目录结构，因此不触发目录刷新。
+
+刷新信号沿 ChatPage → ConversationRail → WorkspaceLauncher → ProjectFiles → ProjectFileTree 传递，页面加载时保留旧树，避免短暂退回空状态。前端全量 266 项及类型、Lint、格式和构建通过，用户在真实 `project-test` 页面完成验收。
+
+### Docker 执行环境状态诊断（用户已验证）
+
+`inspect_execution_environment` 只运行固定的 `docker version --format {{.Server.Version}}`，不接收用户命令。它把 CLI 缺失、检查超时、引擎不可用和成功结果映射为稳定字段，不把 Docker stderr 直接送入模型；Prompt v32 要求检查或测试前先诊断，同时明确 `available=true` 不等于项目测试已执行。
+
+前端执行过程显示“检查执行环境”，成功时展示 Docker 服务端版本。真实工具调用返回 Docker 29.6.2，后端全量 357 项、前端全量 267 项及静态检查通过；用户在页面确认工具步骤和能力边界后要求继续。
+
+### 最小 Docker SandboxProvider 生命周期（用户已验证）
+
+`DockerSandboxProvider` 采用 DeerFlow 的 acquire/get/release 责任划分，但当前只实现单进程临时容器：acquire 使用已有 `python:3.12-slim-bookworm` 创建唯一容器，get 只读取 Provider 内存句柄，release 强制删除容器。生命周期诊断只运行固定 `mini-deer-sandbox-ready` 探针，不接受用户命令；探针失败也在 finally 中执行 release。
+
+`inspect_execution_environment(verify_lifecycle=true)` 把创建、取回、探针和销毁事实结构化返回，前端显示“验证沙箱生命周期”。真实调用返回 `lifecycle_ready=true` 和 `released=true`，随后容器列表确认无遗留；后端全量 360 项、前端全量 268 项及静态检查通过，用户完成页面验收后要求继续。
+
+### Project 根只读挂载诊断（用户已验证）
+
+只有 `source=project` 且目标为目录的冻结 FileAccess Scope 才注册无参数 `inspect_project_sandbox`；普通 Thread 和明确路径 Scope 不获得该工具。宿主路径由闭包绑定，不进入模型 schema。Provider 把项目根只读挂载到 `/workspace`，固定 Python 探针读取最多 50 个根条目，并在 finally 中删除容器。
+
+前端显示“检查项目沙箱挂载”、容器路径、根条目数和销毁状态。真实 `project-test` 探针读到 `README.md`、`src` 等 7 个根条目，返回 `mount_ready=true` 与 `released=true`，容器列表确认无遗留；后端全量 364 项、前端全量 269 项及静态检查通过，用户完成页面验收后要求继续。
+
+### 首个 Docker 项目命令成功路径（用户已验证）
+
+Project 目录 Scope 新增 `run_project_command(description, command)`，宿主根由闭包绑定，模型只提供说明和容器内命令。Provider 把真实项目挂载为 `/workspace` 工作目录，使用 `python:3.12-slim-bookworm` 的 `sh -lc` 执行单条非交互命令；Docker inspect 提供真实退出码，stdout/stderr 各限制 12000 字符，finally 删除容器。
+
+真实 `project-test` 执行 `python src/main.py` 返回 exit 0、`Hello, Mini Deer!`、空 stderr 和 `released=true`，没有遗留容器或 Python 缓存。前端执行过程展示说明、命令、退出码和输出摘要；后端全量 367 项、前端全量 270 项及静态检查通过，用户完成页面验收后要求继续。
+
+### 失败项目命令的真实证据（用户已验证）
+
+Docker CLI 的 `start --attach` 自身返回非零时，Provider 仍通过 `docker inspect` 读取容器 `.State.ExitCode`，因此项目命令失败不会被误报为沙箱基础设施故障。结果保留独立 stdout/stderr，前端分别加标签展示；工具调用状态可以完成，但 Agent 必须依据非零退出码判断命令失败。
+
+真实 `project-test` 执行 `python missing-file.py` 返回 exit 2、文件不存在 stderr 和 `released=true`，容器列表无遗留。后端全量 368 项、前端全量 271 项及静态检查通过，用户在页面确认 Agent 没有声称测试通过后要求继续。
+
+### 项目命令超时与容器回收（用户已验证）
+
+`run_project_command` 新增默认 30 秒、范围 1—60 秒的 `timeout_seconds`。Docker attach 超时映射为稳定 `project_command_timeout`，结果包含 `timed_out=true`、超时秒数和真实回收状态，不提供伪造的 exit code。Provider 在 finally 中使用 `docker rm --force` 终止并删除仍在运行的容器。
+
+真实 `project-test` 执行 `sleep 5` 并设置 1 秒超时，返回 `command_completed=false`、`released=true`，容器列表无遗留。前端显示 timeout 和回收说明，Prompt v36 禁止 Agent 把超时描述为命令完成。后端全量 369 项、前端全量 272 项及静态检查通过，用户完成页面验收后要求继续。
+
+### 用户主动停止项目命令（用户已验证）
+
+Web Run 的项目命令改用真正的异步 Docker CLI 子进程，不再把完整生命周期放进无法随协程取消而结束的工作线程。用户点击“停止”后，取消先终止 `docker start --attach`，finally 再按本次唯一容器名执行 `docker rm --force`；清理完成后 `CancelledError` 继续向上传播，由既有 Run 状态机持久化 interrupted，并把页面工具步骤收敛为“已取消”。
+
+真实 `project-test` 执行 `sleep 30`、超时 60 秒时，用户在命令运行中停止，页面在数秒内结束且后续可以继续发送消息。Docker 冒烟同时观察到取消前容器为 Up、取消后容器列表为空。后端全量 371 项通过，用户完成页面验收后要求继续。
+
+### 失败后自主修复并重跑（用户已验证）
+
+Prompt v37 在读写与项目命令工具同时存在时增加有限 Coding 修复规则：已有检查应尽早运行获取修改前证据；非零退出码后不能立刻结束，而要依据 stdout/stderr 读取相关文件、进行有依据修正并用同一命令重跑。最多两轮修正；重复失败、缺少环境能力或证据不足时保留最后退出码和错误，不继续盲目修改。最终只有最后一次相关检查 exit 0 才能声称验证通过。
+
+真实 `project-test` 首次运行 `python -m unittest discover -s tests -v` 得到 exit 1，明确显示 `Hello, !` 与 `Hello, World!` 的差异。Agent 保留测试文件，读取并修改 `src/main.py`，加入空名称回退，再用同一命令重跑到 exit 0；页面同时展示文件 Diff 与前后命令证据。后端全量 374 项通过，用户完成页面验收后要求继续。
+
+### 自然语言小功能与配套测试（用户已验证）
+
+Prompt v38 要求实现新行为前读取相关实现和附近测试，遵循已有结构并保持未要求改变的行为；项目已有测试约定时新增或更新最小聚焦测试，不能通过删除、跳过、放宽或改写已有正确断言来让检查通过，也不另造第二套测试框架。完成编辑后继续沿用 v37 的真实命令与有限失败修复规则。
+
+真实 `project-test` 中，Agent 为 `greet` 新增仅限关键字的 `punctuation` 参数，同时保留默认感叹号与空名称回退。`tests/test_greeting.py` 保留原断言并增加默认标点、自定义问号和仅限关键字约束，共四项 unittest；同一 Run 执行完整测试到 exit 0，并交付两个文件的 Diff。后端全量 376 项通过，用户完成页面验收后要求继续。
+
+### 持久化检查结果审阅（用户已验证）
+
+前端从 Conversation Turn 已持久化的 `run_project_command` 工具时间线投影检查记录，不依赖模型在最终回答里自行复述。每次真实命令按执行顺序显示命令文本、通过、失败、超时、取消、运行中或未完成状态，以及存在时的真实退出码；因此失败后修复重跑会同时保留失败与成功两次证据。
+
+检查结果与“本轮改动”并列显示，并在刷新后由同一历史事实恢复。前端全量 37 个测试文件、274 项测试及类型、Lint、格式和生产构建通过；用户在真实 `project-test` 历史会话确认 unittest 命令、通过状态、exit 0 和刷新恢复均正确。

@@ -2,6 +2,7 @@ import { Fragment, useEffect, useState, type FormEvent } from "react";
 
 import type { ThreadSummary } from "@/entities/thread/model/types";
 import type { ChatRunPhase } from "@/features/chat/model/reducer";
+import { WorkspaceLauncher } from "@/features/workspace/ui/WorkspaceLauncher";
 
 interface ConversationRailProps {
   readonly phase: ChatRunPhase;
@@ -18,9 +19,16 @@ interface ConversationRailProps {
   readonly onCloseMobile: () => void;
   readonly onCreateNewThread: () => void;
   readonly onSelectThread: (threadId: string) => void;
+  readonly onBeforeCreateProjectThread: () => Promise<boolean>;
+  readonly onSelectCreatedProjectThread: (threadId: string) => void;
+  readonly discardedProjectThreadId: string | null;
+  readonly projectDraftError: string | null;
+  readonly activeThreadIds: readonly string[];
+  readonly projectFileTreeRevision?: number;
   readonly onRetryThreadList: () => void;
   readonly onRenameThread: (threadId: string, title: string) => Promise<void>;
   readonly onDeleteThread: (threadId: string) => Promise<void>;
+  readonly onReferenceProjectFile?: (path: string) => void;
 }
 
 const PHASE_SUMMARIES: Record<ChatRunPhase, string> = {
@@ -72,9 +80,16 @@ export function ConversationRail({
   onCloseMobile,
   onCreateNewThread,
   onSelectThread,
+  onBeforeCreateProjectThread,
+  onSelectCreatedProjectThread,
+  discardedProjectThreadId,
+  projectDraftError,
+  activeThreadIds,
+  projectFileTreeRevision = 0,
   onRetryThreadList,
   onRenameThread,
   onDeleteThread,
+  onReferenceProjectFile = () => undefined,
 }: ConversationRailProps) {
   const [editingThreadId, setEditingThreadId] = useState<string | null>(null);
   const [titleDraft, setTitleDraft] = useState("");
@@ -88,6 +103,10 @@ export function ConversationRail({
   const hasPersistedCurrentThread = threads.some(
     (thread) => thread.threadId === currentThreadId,
   );
+  const currentProjectId =
+    threads.find((thread) => thread.threadId === currentThreadId)?.projectId ??
+    null;
+  const ordinaryThreads = threads.filter((thread) => thread.projectId == null);
   const isCompact = collapsed && !mobileOpen;
 
   useEffect(() => {
@@ -220,6 +239,22 @@ export function ConversationRail({
           </button>
         </div>
 
+        <WorkspaceLauncher
+          compact={isCompact}
+          currentThreadId={currentThreadId}
+          activeProjectId={currentProjectId}
+          threadSwitchingDisabled={isThreadSwitchDisabled}
+          onSelectThread={onSelectThread}
+          onBeforeCreateProjectThread={onBeforeCreateProjectThread}
+          onProjectThreadCreated={onSelectCreatedProjectThread}
+          discardedProjectThreadId={discardedProjectThreadId}
+          projectDraftError={projectDraftError}
+          activeThreadIds={activeThreadIds}
+          projectFileTreeRevision={projectFileTreeRevision}
+          onCloseNavigation={onCloseMobile}
+          onReferenceProjectFile={onReferenceProjectFile}
+        />
+
         {isCompact ? (
           <button
             className="new-thread-button new-thread-button--compact"
@@ -266,8 +301,9 @@ export function ConversationRail({
                   </span>
                 </div>
               )}
-              {threads.map((thread) => {
+              {ordinaryThreads.map((thread) => {
                 const isCurrent = thread.threadId === currentThreadId;
+                const isRunning = activeThreadIds.includes(thread.threadId);
                 const displayTitle = titleOfThread(thread);
                 if (confirmingDeleteThreadId === thread.threadId) {
                   return (
@@ -350,9 +386,7 @@ export function ConversationRail({
                       type="button"
                       aria-label={`切换到会话 ${displayTitle}`}
                       aria-current={isCurrent ? "page" : undefined}
-                      disabled={
-                        isThreadSwitchDisabled || thread.status === "busy"
-                      }
+                      disabled={isThreadSwitchDisabled}
                       onClick={() => {
                         onSelectThread(thread.threadId);
                         onCloseMobile();
@@ -364,7 +398,9 @@ export function ConversationRail({
                       <span className="conversation-preview__meta">
                         {isCurrent
                           ? PHASE_SUMMARIES[phase]
-                          : `${THREAD_STATUS_SUMMARIES[thread.status]} · ${formatUpdatedAt(thread.updatedAt)}`}
+                          : isRunning
+                            ? "正在后台运行"
+                            : `${THREAD_STATUS_SUMMARIES[thread.status]} · ${formatUpdatedAt(thread.updatedAt)}`}
                       </span>
                     </button>
                     <button
@@ -392,7 +428,7 @@ export function ConversationRail({
                   </div>
                 );
               })}
-              {isThreadListLoading && threads.length === 0 && (
+              {isThreadListLoading && ordinaryThreads.length === 0 && (
                 <p className="conversation-list__state" role="status">
                   正在加载最近会话……
                 </p>

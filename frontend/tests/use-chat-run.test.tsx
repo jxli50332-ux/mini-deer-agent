@@ -1,5 +1,5 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   ChatStreamClientError,
@@ -99,11 +99,14 @@ describe("useChatRun", () => {
   it("组合 runner 与 reducer，并把每条事件合并为最终时间线", async () => {
     let capturedMessage = "";
     let capturedSignal: AbortSignal | undefined;
+    const onRunStarted = vi.fn();
+    const onEventReceived = vi.fn();
     const runner: ChatStreamRunner = async function* (request) {
       // 保留真实异步边界，模拟 fetch 建立连接后的事件调度。
       await Promise.resolve();
       capturedMessage = request.message;
       capturedSignal = request.signal;
+      request.onRunId?.(RUN_ID);
       yield started();
       yield aiDelta(2, "北");
       yield aiDelta(3, "京天气");
@@ -114,6 +117,8 @@ describe("useChatRun", () => {
         threadId: THREAD_ID,
         streamRunner: runner,
         createMessageId: () => "user-local-1",
+        onRunStarted,
+        onEventReceived,
       }),
     );
 
@@ -125,6 +130,11 @@ describe("useChatRun", () => {
     expect(submitted).toBe(true);
     expect(capturedMessage).toBe("查询北京天气");
     expect(capturedSignal).toBeInstanceOf(AbortSignal);
+    expect(onRunStarted).toHaveBeenCalledWith(THREAD_ID, RUN_ID);
+    expect(onEventReceived).toHaveBeenNthCalledWith(1, started());
+    expect(onEventReceived).toHaveBeenNthCalledWith(2, aiDelta(2, "北"));
+    expect(onEventReceived).toHaveBeenNthCalledWith(3, aiDelta(3, "京天气"));
+    expect(onEventReceived).toHaveBeenNthCalledWith(4, completed(4));
     expect(result.current.state.phase).toBe("completed");
     expect(result.current.state.timeline).toEqual([
       {
@@ -516,15 +526,34 @@ describe("useChatRun", () => {
     });
   });
 
-  it("线程切换会中止旧操作、重置状态并忽略迟到事件", async () => {
-    const gate = deferred();
-    let capturedSignal: AbortSignal | undefined;
+  it("线程切换保留旧操作，并允许两个 Thread 并发运行和恢复各自状态", async () => {
+    const firstGate = deferred();
+    const secondGate = deferred();
+    const signals = new Map<string, AbortSignal | undefined>();
     const runner: ChatStreamRunner = async function* (request) {
-      capturedSignal = request.signal;
-      yield started();
-      await gate.promise;
-      yield aiDelta(2, "不应进入新线程");
-      yield completed(3);
+      const isFirst = request.threadId === THREAD_ID;
+      const runId = isFirst ? RUN_ID : "55555555-5555-4555-8555-555555555555";
+      signals.set(request.threadId, request.signal);
+      yield {
+        ...started(),
+        eventId: `${runId}:1`,
+        runId,
+        threadId: request.threadId,
+      };
+      await (isFirst ? firstGate.promise : secondGate.promise);
+      yield {
+        ...aiDelta(2, isFirst ? "线程 A 完成" : "线程 B 完成"),
+        eventId: `${runId}:2`,
+        runId,
+        threadId: request.threadId,
+        messageId: `assistant-${request.threadId}`,
+      };
+      yield {
+        ...completed(3),
+        eventId: `${runId}:3`,
+        runId,
+        threadId: request.threadId,
+      };
     };
     const { result, rerender } = renderHook(
       ({ threadId }: { readonly threadId: string }) =>
@@ -532,9 +561,9 @@ describe("useChatRun", () => {
       { initialProps: { threadId: THREAD_ID } },
     );
 
-    let request: Promise<boolean> | undefined;
+    let firstRequest: Promise<boolean> | undefined;
     act(() => {
-      request = result.current.submit("旧线程消息");
+      firstRequest = result.current.submit("线程 A 消息");
     });
     await waitFor(() => expect(result.current.state.phase).toBe("streaming"));
 
@@ -546,13 +575,113 @@ describe("useChatRun", () => {
         timeline: [],
       }),
     );
-    expect(capturedSignal?.aborted).toBe(true);
+    expect(signals.get(THREAD_ID)?.aborted).toBe(false);
+
+    let secondRequest: Promise<boolean> | undefined;
+    act(() => {
+      secondRequest = result.current.submit("线程 B 消息");
+    });
+    await waitFor(() => expect(result.current.state.phase).toBe("streaming"));
+    expect(result.current.activeThreadIds).toEqual([
+      THREAD_ID,
+      OTHER_THREAD_ID,
+    ]);
+
+    rerender({ threadId: THREAD_ID });
+    await waitFor(() =>
+      expect(result.current.state).toMatchObject({
+        phase: "streaming",
+        threadId: THREAD_ID,
+      }),
+    );
+    expect(result.current.state.timeline[0]).toMatchObject({
+      role: "user",
+      content: "线程 A 消息",
+    });
 
     await act(async () => {
-      gate.resolve();
-      expect(await request).toBe(false);
+      firstGate.resolve();
+      expect(await firstRequest).toBe(true);
     });
-    expect(result.current.state.timeline).toEqual([]);
+    expect(result.current.state.phase).toBe("completed");
+    expect(result.current.state.timeline.at(-1)).toMatchObject({
+      content: "线程 A 完成",
+    });
+    expect(result.current.activeThreadIds).toEqual([OTHER_THREAD_ID]);
+
+    rerender({ threadId: OTHER_THREAD_ID });
+    await waitFor(() => expect(result.current.state.phase).toBe("streaming"));
+    await act(async () => {
+      secondGate.resolve();
+      expect(await secondRequest).toBe(true);
+    });
+    expect(result.current.state.phase).toBe("completed");
+    expect(result.current.state.timeline.at(-1)).toMatchObject({
+      content: "线程 B 完成",
+    });
+    expect(result.current.activeThreadIds).toEqual([]);
+  });
+
+  it("两个线程运行时切回并停止 A，只取消 A，B 仍可独立完成", async () => {
+    // 保护切换后的取消寻址，不能误用最近启动的 B 或中止全部连接。
+    const stopFirst = deferred();
+    const finishSecond = deferred();
+    const secondRunId = "55555555-5555-4555-8555-555555555555";
+    const signals = new Map<string, AbortSignal | undefined>();
+    const runner: ChatStreamRunner = async function* (request) {
+      const first = request.threadId === THREAD_ID;
+      const runId = first ? RUN_ID : secondRunId;
+      const identity = { threadId: request.threadId, runId };
+      signals.set(request.threadId, request.signal);
+      yield { ...started(), ...identity, eventId: `${runId}:1` };
+      await (first ? stopFirst.promise : finishSecond.promise);
+      yield {
+        ...(first ? interrupted(2) : completed(2)),
+        ...identity,
+        eventId: `${runId}:2`,
+      };
+    };
+    const cancelRunner = vi.fn(() => {
+      stopFirst.resolve();
+      return Promise.resolve();
+    });
+    const { result, rerender } = renderHook(
+      ({ threadId }: { threadId: string }) =>
+        useChatRun({ threadId, streamRunner: runner, cancelRunner }),
+      { initialProps: { threadId: THREAD_ID } },
+    );
+    let firstRequest: Promise<boolean> | undefined;
+    let secondRequest: Promise<boolean> | undefined;
+    act(() => {
+      firstRequest = result.current.submit("A");
+    });
+    await waitFor(() => expect(result.current.state.phase).toBe("streaming"));
+    rerender({ threadId: OTHER_THREAD_ID });
+    act(() => {
+      secondRequest = result.current.submit("B");
+    });
+    await waitFor(() => expect(result.current.state.runId).toBe(secondRunId));
+    rerender({ threadId: THREAD_ID });
+    await act(async () => {
+      expect(await result.current.cancel()).toBe(true);
+      await firstRequest;
+    });
+    expect(cancelRunner).toHaveBeenCalledExactlyOnceWith({
+      threadId: THREAD_ID,
+      runId: RUN_ID,
+    });
+    expect(result.current.state.phase).toBe("cancelled");
+    expect(result.current.activeThreadIds).toEqual([OTHER_THREAD_ID]);
+    expect(signals.get(OTHER_THREAD_ID)?.aborted).toBe(false);
+    rerender({ threadId: OTHER_THREAD_ID });
+    expect(result.current.state.phase).toBe("streaming");
+    await act(async () => {
+      finishSecond.resolve();
+      await secondRequest;
+    });
+    expect(result.current.state.phase).toBe("completed");
+    rerender({ threadId: THREAD_ID });
+    expect(result.current.state.phase).toBe("cancelled");
   });
 
   it("组件卸载会中止活动请求，旧 promise 不再派发状态", async () => {

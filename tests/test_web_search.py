@@ -47,6 +47,7 @@ def test_agent_registry_exposes_search_before_fetch() -> None:
         "web_fetch",
         "write_todos",
         "ask_clarification",
+        "inspect_execution_environment",
     )
 
 

@@ -1,7 +1,10 @@
 """编排一次 Agent 流式运行，不依赖 FastAPI 或具体传输协议。"""
 
+from __future__ import annotations
+
 from collections.abc import AsyncIterator, Callable, Iterator
 from functools import partial
+from typing import TYPE_CHECKING
 
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import BaseTool
@@ -19,8 +22,14 @@ from mini_deer_agent.streaming import (
 from mini_deer_agent.streaming.events import RunEvent
 from mini_deer_agent.streaming.projector import aproject_run_events
 
+if TYPE_CHECKING:
+    from mini_deer_agent.application.workspaces import FileAccess
 
-type AgentGraphFactory = Callable[[BaseCheckpointSaver], CompiledStateGraph]
+
+type AgentGraphFactory = Callable[
+    [BaseCheckpointSaver, "FileAccess | None"], CompiledStateGraph
+]
+type FileAccessResolver = Callable[[str, str], "FileAccess | None"]
 
 
 def _human_message(
@@ -53,6 +62,7 @@ def _human_message(
 
 def build_default_agent_graph(
     checkpointer: BaseCheckpointSaver,
+    file_access: FileAccess | None = None,
     *,
     memory_store: MemoryStore | None = None,
     mcp_tools: tuple[BaseTool, ...] = (),
@@ -63,6 +73,7 @@ def build_default_agent_graph(
         checkpointer=checkpointer,
         memory_store=memory_store,
         mcp_tools=mcp_tools,
+        file_access=file_access,
     )
 
 
@@ -76,6 +87,7 @@ class RunStreamService:
         memory_store: MemoryStore | None = None,
         mcp_tools: tuple[BaseTool, ...] = (),
         graph_factory: AgentGraphFactory = build_default_agent_graph,
+        file_access_resolver: FileAccessResolver | None = None,
     ) -> None:
         """保存 checkpoint 和可替换构图工厂，不负责 HTTP 或 Run 注册。"""
         self._checkpointer = checkpointer
@@ -88,6 +100,16 @@ class RunStreamService:
             if graph_factory is build_default_agent_graph
             else graph_factory
         )
+        self._file_access_resolver = file_access_resolver
+
+    def _graph_for_thread(self, thread_id: str, message: str) -> CompiledStateGraph:
+        """从可信持久归属解析本轮 Scope，再为该 Thread 独立构图。"""
+        file_access = (
+            self._file_access_resolver(thread_id, message)
+            if self._file_access_resolver is not None
+            else None
+        )
+        return self._graph_factory(self._checkpointer, file_access)
 
     def stream_messages(
         self,
@@ -97,7 +119,7 @@ class RunStreamService:
     ) -> Iterator[AgentMessageEvent]:
         """恢复指定线程，只提交本轮用户消息，并惰性产生 LangGraph 消息。"""
         # 每轮构建独立 CompiledStateGraph；共享 checkpointer 负责跨轮状态和线程隔离。
-        graph = self._graph_factory(self._checkpointer)
+        graph = self._graph_for_thread(thread_id, message)
         config = {"configurable": {"thread_id": thread_id}}
         yield from stream_agent_messages(
             graph,
@@ -113,7 +135,7 @@ class RunStreamService:
         human_input_response: dict[str, object] | None = None,
     ) -> AsyncIterator[AgentMessageEvent]:
         """异步运行指定 Thread，供后台 asyncio Task 驱动。"""
-        graph = self._graph_factory(self._checkpointer)
+        graph = self._graph_for_thread(thread_id, message)
         config = {"configurable": {"thread_id": thread_id}}
         async for event in astream_agent_messages(
             graph,

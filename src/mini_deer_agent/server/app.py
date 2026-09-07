@@ -19,14 +19,23 @@ from mini_deer_agent.application import (
     ThreadCheckpointStore,
     ThreadLifecycleService,
 )
+from mini_deer_agent.application.workspaces import (
+    ProjectFileAccessResolver,
+    ProjectRepositoryProvider,
+    ProjectService,
+    ProjectThreadRepository,
+    ProjectThreadService,
+)
 from mini_deer_agent.core import Settings
 from mini_deer_agent.mcp import McpRuntime, initialize_mcp_runtime
 from mini_deer_agent.persistence import (
     open_async_sqlite_checkpointer,
     open_async_sqlite_conversation_repository,
 )
-from mini_deer_agent.server.routers import health, mcp, runs, threads
+from mini_deer_agent.server.routers import health, mcp, projects, runs, threads
 from mini_deer_agent.tools import get_reserved_agent_tool_names
+from mini_deer_agent.workspace.paths import ProjectRootPolicy
+from mini_deer_agent.workspace.picker import NativeDirectoryPicker
 
 
 def _configure_logging() -> None:
@@ -100,6 +109,30 @@ def create_lifespan(
                 # 路由只能经 dependencies 模块取得服务，不能自行构建模型或数据库连接。
                 app.state.settings = settings
                 app.state.mcp_runtime = mcp_runtime
+                # 登记权限是独立管理配置；未配置时保持关闭，不影响普通聊天。
+                app.state.project_service = None
+                app.state.project_thread_service = None
+                app.state.directory_picker = None
+                workspace_policy = None
+                if settings.workspace_allowed_roots:
+                    workspace_policy = ProjectRootPolicy(
+                        allowed_roots=settings.workspace_allowed_roots,
+                        blocked_roots=(
+                            settings.application_database_path.resolve().parent,
+                            settings.checkpoint_database_path.resolve().parent,
+                        ),
+                    )
+                    app.state.project_service = ProjectService(
+                        cast(ProjectRepositoryProvider, conversation_repository).projects,
+                        workspace_policy,
+                    )
+                    app.state.project_thread_service = ProjectThreadService(
+                        app.state.project_service,
+                        cast(ProjectThreadRepository, conversation_repository),
+                    )
+                    app.state.directory_picker = NativeDirectoryPicker(
+                        settings.workspace_allowed_roots[0]
+                    )
                 run_stream_service = (
                     run_stream_service_factory(
                         checkpointer,
@@ -110,6 +143,11 @@ def create_lifespan(
                         checkpointer,
                         memory_store=conversation_repository,
                         mcp_tools=mcp_runtime.tools,
+                        file_access_resolver=ProjectFileAccessResolver(
+                            conversation_repository,
+                            app.state.project_service,
+                            workspace_policy,
+                        ),
                     )
                 )
                 run_execution_manager = run_execution_manager_factory(
@@ -137,6 +175,9 @@ def create_lifespan(
                 finally:
                     # 先等待后台 Run 收束，再关闭它们仍会访问的两个 SQLite 资源。
                     await run_execution_manager.shutdown()
+                    del app.state.project_thread_service
+                    del app.state.project_service
+                    del app.state.directory_picker
                     del app.state.run_event_history_service
                     del app.state.thread_lifecycle_service
                     del app.state.conversation_history_service
@@ -190,6 +231,7 @@ def create_app(
     # 正式路由和兼容路由集中在工厂注册，避免模块导入时分散修改全局 app。
     application.include_router(health.router)
     application.include_router(mcp.router)
+    application.include_router(projects.router)
     application.include_router(threads.router)
     application.include_router(runs.router)
     application.include_router(health.legacy_router)

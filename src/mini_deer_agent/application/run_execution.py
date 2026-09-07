@@ -16,6 +16,7 @@ from mini_deer_agent.streaming.events import RunEvent
 
 logger = logging.getLogger(__name__)
 _QUEUE_CAPACITY = 256
+_DEFAULT_CANCEL_GRACE_SECONDS = 5.0
 _TERMINAL_EVENTS = {"run_completed", "run_error", "run_interrupted"}
 
 
@@ -68,10 +69,15 @@ class RunExecutionManager:
         self,
         stream_service: RunStreamService,
         conversation_repository: ConversationRepository,
+        *,
+        cancel_grace_seconds: float = _DEFAULT_CANCEL_GRACE_SECONDS,
     ) -> None:
         """保存执行源和产品仓储；Task 句柄永远不会写入数据库。"""
+        if cancel_grace_seconds <= 0:
+            raise ValueError("cancel_grace_seconds must be positive")
         self._stream_service = stream_service
         self._conversation_repository = conversation_repository
+        self._cancel_grace_seconds = cancel_grace_seconds
         self._active_runs: dict[str, _ActiveRun] = {}
         self._shutting_down = False
 
@@ -356,9 +362,24 @@ class RunExecutionManager:
                 return CancelOutcome.not_active
             if not task.done():
                 task.cancel()
-            # gather(return_exceptions=True) 把“底层 Task 自身已取消”和“当前 HTTP
-            # 请求被取消”分开；后者仍会由 shield 向上传播。
-            await asyncio.shield(asyncio.gather(task, return_exceptions=True))
+            # 某些模型或工具可能吞掉 CancelledError。这里只给底层 Task 有界宽限期，
+            # 超时后以持久终态释放 Thread，迟到事件会被仓储的终态条件拒绝。
+            done, _ = await asyncio.wait(
+                {task},
+                timeout=self._cancel_grace_seconds,
+            )
+            if task not in done:
+                logger.warning(
+                    "Run 取消等待超时，强制收敛持久状态：run_id=%s reason=%s",
+                    active.run_id,
+                    reason,
+                )
+                self._discard_buffered_events(active)
+                await self._finish_interrupted(active)
+                active.terminal = True
+                await active.events.put(_END_OF_RUN)
+                if self._active_runs.get(active.run_id) is active:
+                    self._active_runs.pop(active.run_id, None)
 
             final_record = await asyncio.to_thread(
                 self._conversation_repository.get_run,

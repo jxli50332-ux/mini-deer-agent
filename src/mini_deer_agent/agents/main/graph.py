@@ -80,8 +80,44 @@ from mini_deer_agent.tools.task import (
     create_task_failure_message,
 )
 
+from mini_deer_agent.tools.project_files import create_file_tools, create_project_tools
+from mini_deer_agent.tools.project_sandbox import create_project_sandbox_tools
+
 if TYPE_CHECKING:
     from mini_deer_agent.application.memory import MemoryStore
+    from mini_deer_agent.application.workspaces import FileAccess, ProjectService
+
+
+_PROJECT_ROOT_OVERVIEW_LIMIT = 40
+
+
+def _load_project_root_overview(
+    *,
+    project_service: ProjectService | None,
+    project_id: str | None,
+    file_access: FileAccess | None,
+) -> tuple[tuple[tuple[str, Literal["directory", "file"]], ...], bool] | None:
+    """读取一次项目根元数据，作为模型自主探索的有界导航快照。"""
+    if file_access is not None:
+        if file_access.scope.source != "project":
+            return None
+        result = file_access.list_files(path="", limit=_PROJECT_ROOT_OVERVIEW_LIMIT)
+    elif project_service is not None and project_id is not None:
+        result = project_service.directory(
+            project_id,
+            path="",
+            limit=_PROJECT_ROOT_OVERVIEW_LIMIT,
+        )
+    else:
+        return None
+    entries = tuple(
+        (item["path"], item["kind"])
+        for item in result["items"]
+        if item.get("status") == "available"
+        and item.get("kind") in {"directory", "file"}
+        and isinstance(item.get("path"), str)
+    )
+    return entries, bool(result["truncated"])
 
 
 def route_after_model(
@@ -882,8 +918,38 @@ def build_agent_graph(
     summary_model: BaseChatModel | None = None,
     memory_store: MemoryStore | None = None,
     mcp_tools: tuple[BaseTool, ...] = (),
+    project_service: ProjectService | None = None,
+    project_id: str | None = None,
+    file_access: FileAccess | None = None,
 ) -> CompiledStateGraph:
     """绑定模型、Prompt、工具和可选状态存储，并编译条件循环。"""
+    # 项目身份只能由可信调用方提供；HTTP 接入前须先按持久 Thread 归属授权。
+    # 成对参数防止漏配时静默退化为普通聊天；在创建模型前验证登记与根身份。
+    if (project_service is None) != (project_id is None):
+        raise ValueError(
+            "project_service and project_id must be provided together"
+        )
+    if file_access is not None and project_service is not None:
+        raise ValueError("file_access cannot be combined with project binding")
+    project_root_overview = _load_project_root_overview(
+        project_service=project_service,
+        project_id=project_id,
+        file_access=file_access,
+    )
+    file_tools = (
+        create_file_tools(file_access)
+        if file_access is not None
+        else (
+            create_project_tools(project_service, project_id)
+            if project_service is not None and project_id is not None
+            else ()
+        )
+    )
+    sandbox_tools = (
+        create_project_sandbox_tools(file_access)
+        if file_access is not None
+        else ()
+    )
     # 显式参数供测试注入假模型；正常运行时才从项目配置创建真实模型。
     settings = Settings() if model is None else None
     chat_model = model if model is not None else create_chat_model(settings)
@@ -943,7 +1009,13 @@ def build_agent_graph(
     passive_tools = get_agent_tools(
         task_tool,
         model_activation_tool,
-        extra_tools=(*memory_tools, *mcp_tools),
+        # 任意文件 Scope 都排除未声明路径边界的 MCP；task 保留独立工具集合。
+        extra_tools=(
+            *memory_tools,
+            *(() if file_tools else mcp_tools),
+            *file_tools,
+            *sandbox_tools,
+        ),
     )
     execution_tools = (*passive_tools, *get_skill_tools())
     passive_tool_names = tuple(tool.name for tool in passive_tools)
@@ -959,6 +1031,31 @@ def build_agent_graph(
         prompt_context or AgentPromptContext(),
         available_tool_names=passive_tool_names,
         available_skills=resolved_skill_catalog.summaries,
+        readonly_project_id=(
+            file_access.scope.project_id
+            if file_access is not None
+            else project_id
+        ),
+        readonly_file_access_source=(
+            file_access.scope.source
+            if file_access is not None
+            else "project" if project_id is not None else None
+        ),
+        readonly_file_target_kind=(
+            file_access.scope.target_kind
+            if file_access is not None
+            else "directory" if project_id is not None else None
+        ),
+        readonly_project_root_entries=(
+            project_root_overview[0]
+            if project_root_overview is not None
+            else None
+        ),
+        readonly_project_root_truncated=(
+            project_root_overview[1]
+            if project_root_overview is not None
+            else False
+        ),
     )
     built_prompt = (prompt_builder or DefaultAgentPromptBuilder()).build(
         resolved_prompt_context

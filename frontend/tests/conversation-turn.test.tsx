@@ -163,4 +163,140 @@ describe("ConversationTurn 附件查看", () => {
       screen.getByRole("button", { name: "收起思考" }),
     ).toBeInTheDocument();
   });
+
+  it("显示一轮中真实发生的文件改动清单", () => {
+    const turn: ConversationTurnView = {
+      id: "turn-changes",
+      user: null,
+      steps: [
+        {
+          kind: "tool",
+          id: "create-file",
+          toolCallId: "create-call",
+          name: "create_file",
+          input: '{"path":"notes.txt","content":"first line\\nsecond line\\n"}',
+          result: '{"ok":true,"path":"notes.txt","created":true}',
+          status: "completed",
+        },
+        {
+          kind: "tool",
+          id: "replace-file",
+          toolCallId: "replace-call",
+          name: "str_replace",
+          input:
+            '{"path":"src/main.py","old_str":"answer = 1","new_str":"answer = 2"}',
+          result: '{"ok":true,"path":"src/main.py","replaced":true}',
+          status: "completed",
+        },
+        {
+          kind: "tool",
+          id: "move-file",
+          toolCallId: "move-call",
+          name: "move_file",
+          input: "{}",
+          result:
+            '{"ok":true,"previous_path":"old.txt","path":"archive/new.txt","moved":true}',
+          status: "completed",
+        },
+        {
+          kind: "tool",
+          id: "delete-file",
+          toolCallId: "delete-call",
+          name: "delete_file",
+          input: '{"path":"temporary.txt"}',
+          result:
+            '{"ok":true,"path":"temporary.txt","deleted":true,"deleted_content_preview":"remove me\\n","deleted_content_truncated":false}',
+          status: "completed",
+        },
+        {
+          kind: "message",
+          id: "assistant-final",
+          role: "assistant",
+          content: "处理完成。",
+        },
+      ],
+      status: "final",
+    };
+
+    render(<ConversationTurn turn={turn} />);
+
+    const changes = screen.getByRole("region", { name: "本轮改动" });
+    expect(changes).toBeInTheDocument();
+    expect(screen.getByText("4 项")).toBeInTheDocument();
+    const createdDiff = screen.getByRole("region", {
+      name: "notes.txt 的改动差异",
+    });
+    expect(createdDiff).toHaveTextContent("+ first line");
+    expect(createdDiff).toHaveTextContent("+ second line");
+    expect(createdDiff.querySelector('[data-diff="removed"]')).toBeNull();
+    const deletedDiff = screen.getByRole("region", {
+      name: "temporary.txt 的改动差异",
+    });
+    expect(deletedDiff).toHaveTextContent("- remove me");
+    expect(deletedDiff.querySelector('[data-diff="added"]')).toBeNull();
+    expect(screen.getByText("修改文件")).toBeInTheDocument();
+    expect(screen.getByText("src/main.py")).toBeInTheDocument();
+    expect(
+      screen.getByRole("region", { name: "src/main.py 的改动差异" }),
+    ).toHaveTextContent("- answer = 1");
+    expect(
+      screen.getByRole("region", { name: "src/main.py 的改动差异" }),
+    ).toHaveTextContent("+ answer = 2");
+    expect(changes).toHaveTextContent("移动文件");
+    expect(screen.getByText("old.txt")).toBeInTheDocument();
+    expect(screen.getByText("archive/new.txt")).toBeInTheDocument();
+  });
+
+  it("在审阅区显示持久化命令的失败和最终通过结果", () => {
+    const command = "python -m unittest discover -s tests -v";
+    const turn: ConversationTurnView = {
+      id: "turn-checks",
+      user: null,
+      steps: [
+        {
+          kind: "tool",
+          id: "check-failed",
+          toolCallId: "check-failed-call",
+          name: "run_project_command",
+          input: JSON.stringify({ command }),
+          result: JSON.stringify({
+            ok: true,
+            command_completed: true,
+            exit_code: 1,
+          }),
+          status: "completed",
+        },
+        {
+          kind: "tool",
+          id: "check-passed",
+          toolCallId: "check-passed-call",
+          name: "run_project_command",
+          input: JSON.stringify({ command }),
+          result: JSON.stringify({
+            ok: true,
+            command_completed: true,
+            exit_code: 0,
+          }),
+          status: "completed",
+        },
+        {
+          kind: "message",
+          id: "assistant-check-final",
+          role: "assistant",
+          content: "修复并验证完成。",
+        },
+      ],
+      status: "final",
+    };
+
+    render(<ConversationTurn turn={turn} />);
+
+    const review = screen.getByRole("region", { name: "检查结果" });
+    expect(review).toHaveTextContent("2 次");
+    expect(review).toHaveTextContent("失败");
+    expect(review).toHaveTextContent("exit 1");
+    expect(review).toHaveTextContent("通过");
+    expect(review).toHaveTextContent("exit 0");
+    expect(review).toHaveTextContent(command);
+  });
 });

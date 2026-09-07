@@ -12,6 +12,46 @@ from mini_deer_agent.application import (
     ThreadLifecycleService,
 )
 from mini_deer_agent.mcp import McpRuntime
+from mini_deer_agent.application.workspaces import ProjectService, ProjectThreadService
+from mini_deer_agent.workspace.picker import DirectoryPicker
+
+
+def get_project_service(request: Request) -> ProjectService:
+    """取得项目应用服务，禁止请求内临时打开数据库或放宽目录配置。"""
+    service = getattr(request.app.state, "project_service", None)
+    if service is None:
+        raise HTTPException(status_code=503, detail={
+            "code": "workspace_not_configured", "message": "项目服务尚未启用。",
+        })
+    return cast(ProjectService, service)
+
+
+def get_project_thread_service(request: Request) -> ProjectThreadService:
+    """取得项目会话应用服务；配置关闭时不能退回普通 Thread 接口猜测归属。"""
+    service = getattr(request.app.state, "project_thread_service", None)
+    if service is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "workspace_not_configured",
+                "message": "项目服务尚未启用。",
+            },
+        )
+    return cast(ProjectThreadService, service)
+
+
+def get_directory_picker(request: Request) -> DirectoryPicker:
+    """取得生命周期创建的本机选择器；请求不能指定启动程序或初始目录。"""
+    picker = getattr(request.app.state, "directory_picker", None)
+    if picker is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "directory_picker_unavailable",
+                "message": "本机文件夹选择器当前不可用。",
+            },
+        )
+    return cast(DirectoryPicker, picker)
 
 
 def get_run_stream_service(request: Request) -> RunStreamService:

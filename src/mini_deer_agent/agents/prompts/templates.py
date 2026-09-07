@@ -1,7 +1,7 @@
 """保存可审查、可测试的 Mini Deer Agent 系统提示模板。"""
 
 
-DEFAULT_PROMPT_VERSION = "mini-deer-agent/system/v16"
+DEFAULT_PROMPT_VERSION = "mini-deer-agent/system/v38"
 
 DEFAULT_SYSTEM_PROMPT_TEMPLATE = """<identity>
 你是 {agent_name}，一个由当前应用提供的 Agent 产品。
@@ -47,6 +47,10 @@ DEFAULT_SYSTEM_PROMPT_TEMPLATE = """<identity>
 </durable_context>
 
 {memory_policy}
+
+{project_policy}
+
+{execution_environment_policy}
 
 <tool_policy>
 {tool_catalog}

@@ -5,6 +5,7 @@ export interface ThreadSummary {
   readonly threadId: string;
   readonly title: string | null;
   readonly status: ThreadStatus;
+  readonly projectId: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
 }

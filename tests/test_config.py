@@ -25,6 +25,7 @@ def test_settings_has_non_sensitive_defaults(monkeypatch: pytest.MonkeyPatch) ->
     assert settings.api_base_url is None
     assert settings.checkpoint_database_path == Path("data/checkpoints.sqlite")
     assert settings.application_database_path == Path("data/application.sqlite")
+    assert settings.workspace_allowed_roots == ()
     assert settings.context_summary_enabled is True
     assert settings.context_summary_trigger_tokens == 50_000
     assert settings.context_summary_trigger_messages == 40

@@ -21,6 +21,7 @@ class ThreadResponse(BaseModel):
     status: Literal["idle", "busy", "error"]
     created_at: str
     updated_at: str
+    project_id: str | None = None
 
 
 class ThreadTitleUpdateRequest(BaseModel):

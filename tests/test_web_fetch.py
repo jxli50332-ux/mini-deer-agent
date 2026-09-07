@@ -33,6 +33,7 @@ def test_web_fetch_exposes_model_visible_contract() -> None:
         "web_fetch",
         "write_todos",
         "ask_clarification",
+        "inspect_execution_environment",
     )
 
 

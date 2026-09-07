@@ -5,7 +5,13 @@ import { describe, expect, it, vi } from "vitest";
 import { ConversationRail } from "@/features/chat/ui/ConversationRail";
 import { ThreadHeader } from "@/features/chat/ui/ThreadHeader";
 
-function NavigationHarness({ onSelect = vi.fn() }: { onSelect?: () => void }) {
+function NavigationHarness({
+  onSelect = vi.fn(),
+  activeThreadIds = [],
+}: {
+  onSelect?: () => void;
+  activeThreadIds?: readonly string[];
+}) {
   const [collapsed, setCollapsed] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
 
@@ -20,6 +26,15 @@ function NavigationHarness({ onSelect = vi.fn() }: { onSelect?: () => void }) {
             threadId: "thread-other",
             title: "另一段会话",
             status: "idle",
+            projectId: null,
+            createdAt: "2026-09-01T07:00:00Z",
+            updatedAt: "2026-09-01T08:00:00Z",
+          },
+          {
+            threadId: "thread-project",
+            title: "项目内会话",
+            status: "idle",
+            projectId: "11223344-1234-4234-9234-123456789012",
             createdAt: "2026-09-01T07:00:00Z",
             updatedAt: "2026-09-01T08:00:00Z",
           },
@@ -34,6 +49,11 @@ function NavigationHarness({ onSelect = vi.fn() }: { onSelect?: () => void }) {
         onCloseMobile={() => setMobileOpen(false)}
         onCreateNewThread={vi.fn()}
         onSelectThread={() => onSelect()}
+        onBeforeCreateProjectThread={() => Promise.resolve(true)}
+        onSelectCreatedProjectThread={vi.fn()}
+        discardedProjectThreadId={null}
+        projectDraftError={null}
+        activeThreadIds={activeThreadIds}
         onRetryThreadList={vi.fn()}
         onRenameThread={vi.fn(() => Promise.resolve())}
         onDeleteThread={vi.fn(() => Promise.resolve())}
@@ -66,6 +86,7 @@ describe("响应式会话导航", () => {
       "false",
     );
     expect(screen.getByText("Mini Deer")).toBeInTheDocument();
+    expect(screen.queryByText("项目内会话")).not.toBeInTheDocument();
   });
 
   it("移动端入口打开抽屉，选择会话后自动关闭", () => {
@@ -89,5 +110,14 @@ describe("响应式会话导航", () => {
       "data-mobile-open",
       "false",
     );
+  });
+
+  it("切走后仍在侧栏标记后台运行的 Thread", () => {
+    render(<NavigationHarness activeThreadIds={["thread-other"]} />);
+
+    expect(screen.getByText("正在后台运行")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "切换到会话 另一段会话" }),
+    ).toBeEnabled();
   });
 });

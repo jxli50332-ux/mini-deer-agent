@@ -14,6 +14,8 @@ from mini_deer_agent.streaming import RunEvent
 
 THREAD_ID = "11111111-1111-4111-8111-111111111111"
 MESSAGE_ID = "22222222-2222-4222-8222-222222222222"
+OTHER_THREAD_ID = "33333333-3333-4333-8333-333333333333"
+OTHER_MESSAGE_ID = "44444444-4444-4444-8444-444444444444"
 
 
 class BlockingRunStreamService:
@@ -73,6 +75,37 @@ class CompletedRunStreamService:
             message_id=None,
             payload={"finish_reason": "stop"},
         )
+
+
+class CancellationResistantRunStreamService:
+    """模拟底层调用吞掉第一次取消，验证管理器不会无限等待。"""
+
+    def __init__(self) -> None:
+        self.cancel_observed = asyncio.Event()
+        self.release = asyncio.Event()
+        self.finished = asyncio.Event()
+
+    async def astream_run_events(
+        self,
+        _message: str,
+        thread_id: str,
+        run_id: str,
+        _attachments: tuple[TextAttachment, ...] = (),
+    ) -> AsyncIterator[RunEvent]:
+        yield RunEvent(
+            event="run_started",
+            run_id=run_id,
+            thread_id=thread_id,
+            sequence=1,
+            message_id=None,
+            payload={"created_at": "2026-08-26T00:00:00+00:00"},
+        )
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancel_observed.set()
+            await self.release.wait()
+        self.finished.set()
 
 
 def test_cancel_stops_background_task_and_is_idempotent(tmp_path: Path) -> None:
@@ -162,5 +195,93 @@ def test_completed_run_rejects_late_cancel(tmp_path: Path) -> None:
             assert record is not None
             assert record.status == "completed"
             assert record.finish_reason == "stop"
+
+    asyncio.run(scenario())
+
+
+def test_cancel_timeout_forces_terminal_state_and_releases_thread(
+    tmp_path: Path,
+) -> None:
+    """底层 Task 不响应取消时，取消 API 仍须有界返回并释放 Thread。"""
+
+    async def scenario() -> None:
+        with open_sqlite_conversation_repository(
+            tmp_path / "application.sqlite"
+        ) as repository:
+            stream_service = CancellationResistantRunStreamService()
+            manager = RunExecutionManager(
+                cast(RunStreamService, stream_service),
+                repository,
+                cancel_grace_seconds=0.01,
+            )
+            started = await manager.start_run(
+                "等待超时取消",
+                THREAD_ID,
+                MESSAGE_ID,
+            )
+
+            outcome = await asyncio.wait_for(
+                manager.cancel_run(THREAD_ID, started.run_id),
+                timeout=0.5,
+            )
+
+            assert outcome is CancelOutcome.cancelled
+            assert stream_service.cancel_observed.is_set()
+            record = repository.get_run(started.run_id)
+            thread = repository.get_thread(THREAD_ID)
+            assert record is not None
+            assert record.status == "interrupted"
+            assert record.finish_reason == "user_cancelled"
+            assert thread is not None
+            assert thread.status == "idle"
+            assert [event.event async for event in started.events] == [
+                "run_interrupted"
+            ]
+
+            stream_service.release.set()
+            await asyncio.wait_for(stream_service.finished.wait(), 0.5)
+
+    asyncio.run(scenario())
+
+
+def test_different_threads_can_run_and_cancel_independently(tmp_path: Path) -> None:
+    """不同 Thread 可同时运行，终止其中一个不会改变另一个的状态。"""
+
+    async def scenario() -> None:
+        with open_sqlite_conversation_repository(
+            tmp_path / "application.sqlite"
+        ) as repository:
+            manager = RunExecutionManager(
+                cast(RunStreamService, BlockingRunStreamService()),
+                repository,
+            )
+            first = await manager.start_run("线程 A", THREAD_ID, MESSAGE_ID)
+            second = await manager.start_run(
+                "线程 B",
+                OTHER_THREAD_ID,
+                OTHER_MESSAGE_ID,
+            )
+            await asyncio.sleep(0)
+
+            first_record = repository.get_run(first.run_id)
+            second_record = repository.get_run(second.run_id)
+            assert first_record is not None and first_record.status == "running"
+            assert second_record is not None and second_record.status == "running"
+
+            assert (
+                await manager.cancel_run(THREAD_ID, first.run_id)
+                is CancelOutcome.cancelled
+            )
+            first_record = repository.get_run(first.run_id)
+            second_record = repository.get_run(second.run_id)
+            assert first_record is not None and first_record.status == "interrupted"
+            assert second_record is not None and second_record.status == "running"
+
+            assert (
+                await manager.cancel_run(OTHER_THREAD_ID, second.run_id)
+                is CancelOutcome.cancelled
+            )
+            second_record = repository.get_run(second.run_id)
+            assert second_record is not None and second_record.status == "interrupted"
 
     asyncio.run(scenario())

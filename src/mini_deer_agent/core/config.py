@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     checkpoint_database_path: Path = Path("data/checkpoints.sqlite")
     # 产品历史与 LangGraph checkpoint 分库保存，避免 API 依赖框架内部表结构。
     application_database_path: Path = Path("data/application.sqlite")
+    # 项目登记默认关闭：允许根由用户配置，不能由模型或请求参数自行扩充。
+    workspace_allowed_roots: tuple[Path, ...] = ()
     # 摘要只压缩 Agent checkpoint；产品历史仍由 application SQLite 完整保存。
     context_summary_enabled: bool = True
     context_summary_trigger_tokens: int = Field(default=50000, ge=1)

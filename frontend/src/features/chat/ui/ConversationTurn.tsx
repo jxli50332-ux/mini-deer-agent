@@ -4,7 +4,12 @@ import type {
 } from "@/entities/message/model/types";
 import type { ConversationTurnView } from "@/features/chat/model/project-conversation";
 import { projectCotSteps } from "@/features/chat/model/project-cot";
+import {
+  projectChanges,
+  projectChecks,
+} from "@/features/chat/model/project-changes";
 import { CotTimeline } from "@/features/chat/ui/CotTimeline";
+import { RunChanges } from "@/features/chat/ui/RunChanges";
 import { MessageContent } from "@/features/chat/ui/MessageContent";
 import { RunTiming } from "@/features/chat/ui/RunTiming";
 import { HumanInputCard } from "@/features/chat/ui/HumanInputCard";
@@ -143,6 +148,8 @@ export function ConversationTurn({
   }
 
   const cotSteps = projectCotSteps(cotSourceSteps, lastAssistantMessageId);
+  const changes = projectChanges(turn.steps);
+  const checks = projectChecks(turn.steps);
 
   const renderStep = (item: ChatTimelineItem) => {
     if (item.kind === "tool") {
@@ -197,6 +204,7 @@ export function ConversationTurn({
       {clarificationSteps.map(renderStep)}
       <CotTimeline steps={cotSteps} />
       {finalSteps.map(renderStep)}
+      <RunChanges changes={changes} checks={checks} />
       {turn.timing !== undefined && (
         <RunTiming
           timing={turn.timing}

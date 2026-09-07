@@ -50,6 +50,7 @@ class ThreadRecord:
     status: ThreadStatus
     created_at: str
     updated_at: str
+    project_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

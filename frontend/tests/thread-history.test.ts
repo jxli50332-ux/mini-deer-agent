@@ -154,4 +154,55 @@ describe("Thread history API client", () => {
     expect(missing.threadExists).toBe(false);
     expect(missing.items).toEqual([]);
   });
+
+  it("接受只有思考过程的 Assistant 中间消息", () => {
+    const valid = wirePage();
+    const page = parseThreadHistoryPage(
+      {
+        ...valid,
+        items: [
+          {
+            ...valid.items[0],
+            role: "assistant",
+            content: "",
+            reasoning: "先分析目的地和预算。",
+            attachments: [],
+            hidden_from_ui: false,
+            human_input_response: null,
+          },
+        ],
+        has_more: false,
+        next_before_sequence: null,
+      },
+      THREAD_ID,
+    );
+
+    expect(page.items[0]).toMatchObject({
+      kind: "message",
+      role: "assistant",
+      content: "",
+      reasoning: "先分析目的地和预算。",
+    });
+  });
+
+  it("仍拒绝正文和思考过程都为空的消息", () => {
+    const valid = wirePage();
+    const invalid = {
+      ...valid,
+      items: [
+        {
+          ...valid.items[0],
+          role: "assistant",
+          content: "",
+          reasoning: null,
+        },
+      ],
+      has_more: false,
+      next_before_sequence: null,
+    };
+
+    expect(() => parseThreadHistoryPage(invalid, THREAD_ID)).toThrow(
+      "content 必须是非空字符串",
+    );
+  });
 });

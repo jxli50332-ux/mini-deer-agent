@@ -25,11 +25,14 @@ import { useConversationScroll } from "@/features/chat/model/use-conversation-sc
 import { useThreadHistory } from "@/features/threads/model/use-thread-history";
 import { useThreadList } from "@/features/threads/model/use-thread-list";
 import { useThreadRuns } from "@/features/threads/model/use-thread-runs";
+import { useProjectThreadDraft } from "@/features/workspace/model/use-project-thread-draft";
 import {
   buildHumanInputResponseText,
   type HumanInputRequest,
   type HumanInputResponse,
 } from "@/features/chat/model/human-input";
+import { projectToolResultChangesTree } from "@/features/chat/model/project-changes";
+import type { ChatRunEvent } from "@/features/chat/model/events";
 
 interface ChatPageProps {
   readonly streamRunner?: ChatStreamRunner;
@@ -41,6 +44,12 @@ interface ChatPageProps {
   readonly threadListLoader?: ThreadListLoader;
   readonly threadTitleUpdater?: ThreadTitleUpdater;
   readonly threadDeleter?: ThreadDeleter;
+}
+
+interface ComposerDraftInsertion {
+  readonly id: number;
+  readonly threadId: string;
+  readonly text: string;
 }
 
 export function ChatPage({
@@ -63,20 +72,11 @@ export function ChatPage({
   );
   const [isRailCollapsed, setIsRailCollapsed] = useState(false);
   const [isMobileNavigationOpen, setIsMobileNavigationOpen] = useState(false);
-  const { state, isActive, hydrateHistory, submit, cancel } = useChatRun({
-    threadId,
-    ...(streamRunner === undefined ? {} : { streamRunner }),
-    ...(cancelRunner === undefined ? {} : { cancelRunner }),
-    ...(createMessageId === undefined ? {} : { createMessageId }),
-  });
-  const history = useThreadHistory(threadId, {
-    ...(historyPageLoader === undefined
-      ? {}
-      : { pageLoader: historyPageLoader }),
-  });
-  const { runs: threadRuns, retry: retryThreadRuns } = useThreadRuns(threadId, {
-    ...(threadRunsLoader === undefined ? {} : { loader: threadRunsLoader }),
-  });
+  const [projectFileTreeRevision, setProjectFileTreeRevision] = useState(0);
+  const structureChangedRunIds = useRef(new Set<string>());
+  const [composerDraftInsertion, setComposerDraftInsertion] =
+    useState<ComposerDraftInsertion | null>(null);
+  const nextDraftInsertionId = useRef(0);
   const {
     items: recentThreads,
     isLoading: isThreadListLoading,
@@ -90,6 +90,57 @@ export function ChatPage({
       ? {}
       : { updater: threadTitleUpdater }),
     ...(threadDeleter === undefined ? {} : { deleter: threadDeleter }),
+  });
+  const {
+    discardedThreadId: discardedProjectThreadId,
+    error: projectDraftError,
+    requiresDiscardBeforeLeaving,
+    discardBeforeLeaving: discardEmptyProjectThread,
+    markCreated: markProjectThreadCreated,
+    markRunStarted: markProjectThreadRunStarted,
+  } = useProjectThreadDraft({ currentThreadId: threadId, deleteThread });
+  const handleRunRequested = useCallback(
+    (requestedThreadId: string) => {
+      markProjectThreadRunStarted(requestedThreadId);
+      retryThreadList();
+    },
+    [markProjectThreadRunStarted, retryThreadList],
+  );
+  const handleRunEvent = useCallback((event: ChatRunEvent) => {
+    if (
+      event.event === "tool_result" &&
+      projectToolResultChangesTree(event.payload.name, event.payload.content)
+    ) {
+      structureChangedRunIds.current.add(event.runId);
+    }
+  }, []);
+  const handleRunSettled = useCallback(
+    (_settledThreadId: string, runId: string) => {
+      retryThreadList();
+      if (structureChangedRunIds.current.delete(runId)) {
+        setProjectFileTreeRevision((current) => current + 1);
+      }
+    },
+    [retryThreadList],
+  );
+  const { state, isActive, activeThreadIds, hydrateHistory, submit, cancel } =
+    useChatRun({
+      threadId,
+      ...(streamRunner === undefined ? {} : { streamRunner }),
+      ...(cancelRunner === undefined ? {} : { cancelRunner }),
+      ...(createMessageId === undefined ? {} : { createMessageId }),
+      onRunRequested: handleRunRequested,
+      onRunStarted: markProjectThreadRunStarted,
+      onRunSettled: handleRunSettled,
+      onEventReceived: handleRunEvent,
+    });
+  const history = useThreadHistory(threadId, {
+    ...(historyPageLoader === undefined
+      ? {}
+      : { pageLoader: historyPageLoader }),
+  });
+  const { runs: threadRuns, retry: retryThreadRuns } = useThreadRuns(threadId, {
+    ...(threadRunsLoader === undefined ? {} : { loader: threadRunsLoader }),
   });
   const {
     setViewport: setConversationViewport,
@@ -136,25 +187,58 @@ export function ChatPage({
     lastRefreshedRunId.current = state.runId;
     retryThreadList();
     retryThreadRuns();
-  }, [retryThreadList, retryThreadRuns, state.phase, state.runId]);
+  }, [
+    retryThreadList,
+    retryThreadRuns,
+    state.phase,
+    state.runId,
+    state.timeline,
+  ]);
 
   const createNewThread = useCallback(() => {
-    if (isActive) {
+    if (!requiresDiscardBeforeLeaving) {
+      setThreadId(threadRepository.createNewCurrentThreadId());
       return;
     }
-
-    // Repository 负责生成与持久化身份；改变 prop 后由 useChatRun 统一重置线程级运行状态。
-    setThreadId(threadRepository.createNewCurrentThreadId());
-  }, [isActive, threadRepository]);
+    void (async () => {
+      if (!(await discardEmptyProjectThread())) return;
+      // Repository 负责生成与持久化身份；改变 prop 后由 useChatRun 统一重置线程级运行状态。
+      setThreadId(threadRepository.createNewCurrentThreadId());
+    })();
+  }, [
+    discardEmptyProjectThread,
+    requiresDiscardBeforeLeaving,
+    threadRepository,
+  ]);
   const selectThread = useCallback(
     (selectedThreadId: string) => {
-      if (isActive || selectedThreadId === threadId) {
+      if (selectedThreadId === threadId) {
         return;
       }
-      // 先持久化设备选择，再改变 React 身份；刷新页面时会恢复同一个 Thread。
-      setThreadId(threadRepository.selectCurrentThreadId(selectedThreadId));
+      if (!requiresDiscardBeforeLeaving) {
+        setThreadId(threadRepository.selectCurrentThreadId(selectedThreadId));
+        return;
+      }
+      void (async () => {
+        if (!(await discardEmptyProjectThread())) return;
+        // 先持久化设备选择，再改变 React 身份；刷新页面时会恢复同一个 Thread。
+        setThreadId(threadRepository.selectCurrentThreadId(selectedThreadId));
+      })();
     },
-    [isActive, threadId, threadRepository],
+    [
+      discardEmptyProjectThread,
+      requiresDiscardBeforeLeaving,
+      threadId,
+      threadRepository,
+    ],
+  );
+  const selectCreatedProjectThread = useCallback(
+    (createdThreadId: string) => {
+      markProjectThreadCreated(createdThreadId);
+      setThreadId(threadRepository.selectCurrentThreadId(createdThreadId));
+      retryThreadList();
+    },
+    [markProjectThreadCreated, retryThreadList, threadRepository],
   );
   const deletePersistedThread = useCallback(
     async (deletedThreadId: string) => {
@@ -173,6 +257,22 @@ export function ChatPage({
       }),
     [submit],
   );
+  const referenceProjectFile = useCallback(
+    (path: string) => {
+      nextDraftInsertionId.current += 1;
+      setComposerDraftInsertion({
+        id: nextDraftInsertionId.current,
+        threadId,
+        text: `请读取并参考项目文件 ${JSON.stringify(path)}：`,
+      });
+    },
+    [threadId],
+  );
+  const clearAppliedDraftInsertion = useCallback((id: number) => {
+    setComposerDraftInsertion((current) =>
+      current?.id === id ? null : current,
+    );
+  }, []);
 
   return (
     <div className="app-shell" data-rail-collapsed={isRailCollapsed}>
@@ -183,17 +283,24 @@ export function ChatPage({
         threads={recentThreads}
         isThreadListLoading={isThreadListLoading}
         threadListError={threadListError}
-        isNewThreadDisabled={isActive}
-        isThreadSwitchDisabled={isActive}
+        isNewThreadDisabled={false}
+        isThreadSwitchDisabled={false}
         collapsed={isRailCollapsed}
         mobileOpen={isMobileNavigationOpen}
         onToggleCollapsed={() => setIsRailCollapsed((current) => !current)}
         onCloseMobile={() => setIsMobileNavigationOpen(false)}
         onCreateNewThread={createNewThread}
         onSelectThread={selectThread}
+        onBeforeCreateProjectThread={discardEmptyProjectThread}
+        onSelectCreatedProjectThread={selectCreatedProjectThread}
+        discardedProjectThreadId={discardedProjectThreadId}
+        projectDraftError={projectDraftError}
+        activeThreadIds={activeThreadIds}
+        projectFileTreeRevision={projectFileTreeRevision}
         onRetryThreadList={retryThreadList}
         onRenameThread={renameTitle}
         onDeleteThread={deletePersistedThread}
+        onReferenceProjectFile={referenceProjectFile}
       />
       <main className="workspace">
         <ThreadHeader
@@ -287,6 +394,12 @@ export function ChatPage({
           key={threadId}
           isActive={isActive}
           isStopping={state.phase === "stopping"}
+          draftInsertion={
+            composerDraftInsertion?.threadId === threadId
+              ? composerDraftInsertion
+              : null
+          }
+          onDraftInsertionApplied={clearAppliedDraftInsertion}
           {...(latestTodoSnapshot === null
             ? {}
             : {

@@ -24,6 +24,11 @@ from mini_deer_agent.application.memory import (
     MemoryFactNotFoundError,
     MemoryStore,
 )
+from mini_deer_agent.application.workspaces import (
+    ProjectThreadRepository,
+    ProjectThreadService,
+    ThreadProjectConflictError,
+)
 
 
 __all__ = [
@@ -35,6 +40,8 @@ __all__ = [
     "DuplicateMemoryFactError",
     "MemoryFactNotFoundError",
     "MemoryStore",
+    "ProjectThreadRepository",
+    "ProjectThreadService",
     "RunExecutionManager",
     "RunEventHistoryService",
     "RunEventSequenceError",
@@ -43,4 +50,5 @@ __all__ = [
     "StartedRun",
     "ThreadCheckpointStore",
     "ThreadLifecycleService",
+    "ThreadProjectConflictError",
 ]

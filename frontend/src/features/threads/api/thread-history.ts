@@ -168,11 +168,18 @@ function parseHistoryItem(value: unknown): ThreadHistoryItem {
       value.reasoning === null || value.reasoning === undefined
         ? undefined
         : requiredString(value, "reasoning");
+    const content = stringField(value, "content");
+    if (
+      content.length === 0 &&
+      (value.role === "user" || reasoning === undefined)
+    ) {
+      invalidResponse("content 必须是非空字符串");
+    }
     return {
       kind: "message",
       id,
       role: value.role,
-      content: requiredString(value, "content"),
+      content,
       runId,
       threadSequence,
       createdAt,

@@ -92,9 +92,24 @@ describe("Mini Deer Agent 实时聊天页", () => {
             : input instanceof URL
               ? input.href
               : input.url;
+        if (requestUrl.startsWith("/api/v1/projects")) {
+          return Promise.resolve(
+            Response.json({ items: [], next_offset: null }),
+          );
+        }
+        if (requestUrl.startsWith("/api/v1/projects")) {
+          return Promise.resolve(
+            Response.json({ items: [], next_offset: null }),
+          );
+        }
         const match = requestUrl.match(/\/threads\/([^/]+)\/messages/);
         if (requestUrl.startsWith("/api/v1/threads?")) {
           return Promise.resolve(Response.json([]));
+        }
+        if (requestUrl.startsWith("/api/v1/projects")) {
+          return Promise.resolve(
+            Response.json({ items: [], next_offset: null }),
+          );
         }
         if (match?.[1] === undefined) {
           return Promise.reject(new Error("测试只允许 Thread 查询"));
@@ -315,6 +330,11 @@ describe("Mini Deer Agent 实时聊天页", () => {
             : input instanceof URL
               ? input.href
               : input.url;
+        if (requestUrl.startsWith("/api/v1/projects")) {
+          return Promise.resolve(
+            Response.json({ items: [], next_offset: null }),
+          );
+        }
         if (requestUrl.startsWith("/api/v1/threads?")) {
           return Promise.resolve(Response.json([]));
         }
@@ -399,18 +419,20 @@ describe("Mini Deer Agent 实时聊天页", () => {
     ).toBe(true);
   });
 
-  it("运行结束后创建独立新会话并把下一轮发送到新线程", async () => {
+  it("当前 Run 继续后台执行时创建新 Thread 并并发发送", async () => {
     let releaseFirstRun: () => void = () => undefined;
     const firstRunGate = new Promise<void>((resolve) => {
       releaseFirstRun = resolve;
     });
     const requestedThreadIds: string[] = [];
+    const requestedSignals: AbortSignal[] = [];
     let runNumber = 0;
     const runner = vi.fn<ChatStreamRunner>(async function* (request) {
       runNumber += 1;
       const currentRunNumber = runNumber;
       const runId = currentRunNumber === 1 ? RUN_ID : NEXT_RUN_ID;
       requestedThreadIds.push(request.threadId);
+      if (request.signal !== undefined) requestedSignals.push(request.signal);
 
       yield {
         ...baseEvent(1, runId, request.threadId),
@@ -419,7 +441,7 @@ describe("Mini Deer Agent 实时聊天页", () => {
         payload: { createdAt: "2026-08-25T15:00:00+00:00" },
       } satisfies ChatRunEvent;
       if (currentRunNumber === 1) {
-        // 保持第一轮运行中，验证 UI 不允许在活动 SSE 流中途切换线程。
+        // 保持第一轮运行中，验证切换后旧 SSE 仍在后台消费。
         await firstRunGate;
       }
       yield {
@@ -447,6 +469,7 @@ describe("Mini Deer Agent 实时聊天页", () => {
           threadId: OTHER_THREAD_ID,
           title: "其他会话",
           status: "idle",
+          projectId: null,
           createdAt: "2026-08-26T08:00:00+00:00",
           updatedAt: "2026-08-26T09:00:00+00:00",
         },
@@ -466,18 +489,11 @@ describe("Mini Deer Agent 实时聊天页", () => {
     fireEvent.change(textbox, { target: { value: "第一轮问题" } });
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
 
-    await waitFor(() => expect(newThreadButton).toBeDisabled());
+    await screen.findByRole("status", { name: "正在生成" });
+    expect(newThreadButton).toBeEnabled();
     expect(
       screen.getByRole("button", { name: "切换到会话 其他会话" }),
-    ).toBeDisabled();
-    expect(
-      screen.getByText("当前运行结束或停止后才能创建新会话"),
-    ).toBeInTheDocument();
-
-    releaseFirstRun();
-    await screen.findByRole("status", { name: "已完成" });
-    expect(newThreadButton).toBeEnabled();
-    expect(screen.getByText("第一轮问题")).toBeInTheDocument();
+    ).toBeEnabled();
 
     fireEvent.click(newThreadButton);
 
@@ -487,7 +503,7 @@ describe("Mini Deer Agent 实时聊天页", () => {
       ).toBeInTheDocument(),
     );
     expect(createNewCurrentThreadId).toHaveBeenCalledOnce();
-    expect(screen.getByLabelText("开始新对话")).toBeInTheDocument();
+    expect(await screen.findByLabelText("开始新对话")).toBeInTheDocument();
     expect(screen.queryByText("第一轮问题")).not.toBeInTheDocument();
 
     const nextThreadTextbox = screen.getByRole("textbox", {
@@ -499,6 +515,9 @@ describe("Mini Deer Agent 实时聊天页", () => {
     await screen.findByText("第 2 轮回答");
 
     expect(requestedThreadIds).toEqual([THREAD_ID, NEXT_THREAD_ID]);
+    expect(requestedSignals[0]?.aborted).toBe(false);
+    releaseFirstRun();
+    await waitFor(() => expect(requestedSignals[0]?.aborted).toBe(false));
   });
 
   it("从真实最近列表切换 Thread，并只展示目标历史", async () => {
@@ -514,6 +533,7 @@ describe("Mini Deer Agent 实时聊天页", () => {
           threadId: NEXT_THREAD_ID,
           title: "目标会话",
           status: "idle",
+          projectId: null,
           createdAt: "2026-08-26T09:00:00+00:00",
           updatedAt: "2026-08-26T10:00:00+00:00",
         },
@@ -521,6 +541,7 @@ describe("Mini Deer Agent 实时聊天页", () => {
           threadId: THREAD_ID,
           title: "旧会话",
           status: "idle",
+          projectId: null,
           createdAt: "2026-08-26T08:00:00+00:00",
           updatedAt: "2026-08-26T09:00:00+00:00",
         },
@@ -576,6 +597,7 @@ describe("Mini Deer Agent 实时聊天页", () => {
       threadId: THREAD_ID,
       title: "原始标题",
       status: "idle" as const,
+      projectId: null,
       createdAt: "2026-08-26T08:00:00+00:00",
       updatedAt: "2026-08-26T09:00:00+00:00",
     };
@@ -621,6 +643,7 @@ describe("Mini Deer Agent 实时聊天页", () => {
       threadId: THREAD_ID,
       title: "准备删除的会话",
       status: "idle" as const,
+      projectId: null,
       createdAt: "2026-08-30T08:00:00+00:00",
       updatedAt: "2026-08-30T09:00:00+00:00",
     };
@@ -680,7 +703,7 @@ describe("Mini Deer Agent 实时聊天页", () => {
     expect(
       screen.getByTitle(`thread_id: ${NEXT_THREAD_ID}`),
     ).toBeInTheDocument();
-    expect(screen.getByLabelText("开始新对话")).toBeInTheDocument();
+    expect(await screen.findByLabelText("开始新对话")).toBeInTheDocument();
     expect(screen.queryByText("删除前的历史")).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "删除会话 准备删除的会话" }),
@@ -692,6 +715,7 @@ describe("Mini Deer Agent 实时聊天页", () => {
       threadId: THREAD_ID,
       title: "不能删除的会话",
       status: "idle" as const,
+      projectId: null,
       createdAt: "2026-08-30T08:00:00+00:00",
       updatedAt: "2026-08-30T09:00:00+00:00",
     };

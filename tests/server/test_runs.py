@@ -515,9 +515,10 @@ def test_lifespan_checkpointer_persists_and_isolates_http_threads(
         """让真实 application service 使用假模型和 lifespan 的真实 SQLite saver。"""
         return RunStreamService(
             checkpointer,
-            graph_factory=lambda saver: build_agent_graph(
+            graph_factory=lambda saver, file_access: build_agent_graph(
                 model,
                 checkpointer=saver,
+                file_access=file_access,
             ),
         )
 
@@ -583,9 +584,10 @@ def test_v1_text_attachment_reaches_model_and_returns_in_history(
         """使用真实图与持久化，只替换外部模型。"""
         return RunStreamService(
             checkpointer,
-            graph_factory=lambda saver: build_agent_graph(
+            graph_factory=lambda saver, file_access: build_agent_graph(
                 model,
                 checkpointer=saver,
+                file_access=file_access,
             ),
         )
 

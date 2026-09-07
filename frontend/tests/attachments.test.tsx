@@ -4,6 +4,42 @@ import { describe, expect, it, vi } from "vitest";
 import { Composer } from "@/features/chat/ui/Composer";
 
 describe("文本附件输入", () => {
+  it("外部文件引用追加到现有草稿并把焦点移回输入框", () => {
+    const onDraftInsertionApplied = vi.fn();
+    const { rerender } = render(
+      <Composer
+        isActive={false}
+        draftInsertion={null}
+        onDraftInsertionApplied={onDraftInsertionApplied}
+        onSubmit={() => Promise.resolve(true)}
+        onCancel={() => Promise.resolve(true)}
+      />,
+    );
+    const input = screen.getByRole<HTMLTextAreaElement>("textbox", {
+      name: "向 Agent 提问",
+    });
+    fireEvent.change(input, { target: { value: "解释这个入口" } });
+
+    rerender(
+      <Composer
+        isActive={false}
+        draftInsertion={{
+          id: 1,
+          text: '请读取并参考项目文件 "src/main.py"：',
+        }}
+        onDraftInsertionApplied={onDraftInsertionApplied}
+        onSubmit={() => Promise.resolve(true)}
+        onCancel={() => Promise.resolve(true)}
+      />,
+    );
+
+    expect(input).toHaveValue(
+      '解释这个入口\n\n请读取并参考项目文件 "src/main.py"：',
+    );
+    expect(input).toHaveFocus();
+    expect(onDraftInsertionApplied).toHaveBeenCalledWith(1);
+  });
+
   it("清空原生文件输入框前先快照实时 FileList", async () => {
     const onSubmit = vi.fn(() => Promise.resolve(true));
     render(
