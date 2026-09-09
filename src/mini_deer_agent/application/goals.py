@@ -21,6 +21,7 @@ from mini_deer_agent.agents.durable_state import GoalEvaluationState, GoalState
 from mini_deer_agent.agents.state import MiniDeerAgentState
 from mini_deer_agent.application.conversations import ConversationRepository
 from mini_deer_agent.domain import MessageHistoryItem, ToolExecutionHistoryItem
+from mini_deer_agent.llms import ModelSnapshot
 
 
 MAX_GOAL_OBJECTIVE_CHARS = 4_000
@@ -527,7 +528,7 @@ class GoalCompletionEvaluator:
 
     def __init__(
         self,
-        model: BaseChatModel | Callable[[], BaseChatModel],
+        model: BaseChatModel | Callable[[], BaseChatModel | ModelSnapshot],
         *,
         timeout_seconds: float = DEFAULT_GOAL_EVALUATION_TIMEOUT_SECONDS,
     ) -> None:
@@ -536,12 +537,15 @@ class GoalCompletionEvaluator:
         self._model = model
         self._timeout_seconds = timeout_seconds
 
-    def _resolved_model(self) -> BaseChatModel:
+    def _resolved_model(self) -> tuple[BaseChatModel, ModelSnapshot | None]:
         if isinstance(self._model, BaseChatModel):
-            return self._model
-        model = self._model()
-        self._model = model
-        return model
+            return self._model, None
+        # 工厂在每次独立评估开始时解析当前默认值；否则设置页切换 Goal
+        # 模型后，首次评估缓存会让后续评估永久停留在旧模型。
+        resolved = self._model()
+        if isinstance(resolved, ModelSnapshot):
+            return resolved.model, resolved
+        return resolved, None
 
     async def evaluate(
         self,
@@ -578,17 +582,22 @@ class GoalCompletionEvaluator:
             ),
             HumanMessage(content=payload),
         ]
+        model_snapshot: ModelSnapshot | None = None
         try:
+            model, model_snapshot = self._resolved_model()
             response = await asyncio.wait_for(
-                self._resolved_model().ainvoke(messages),
+                model.ainvoke(messages),
                 timeout=self._timeout_seconds,
             )
             parsed = json.loads(response.text)
         except Exception:
-            return _fallback_evaluation(
+            fallback = _fallback_evaluation(
                 "missing_evidence",
                 "独立完成评估未返回有效结构，按证据不足处理。",
             )
+            if model_snapshot is not None:
+                fallback.update(model_snapshot.metadata)
+            return fallback
         if not isinstance(parsed, dict):
             return _fallback_evaluation(
                 "missing_evidence",
@@ -612,7 +621,7 @@ class GoalCompletionEvaluator:
                 "missing_evidence",
                 "独立完成评估字段无效，按证据不足处理。",
             )
-        return {
+        result: GoalEvaluationState = {
             "satisfied": satisfied,
             "blocker": blocker,  # type: ignore[typeddict-item]
             "reason": reason.strip()[:MAX_GOAL_EVALUATION_REASON_CHARS],
@@ -621,6 +630,9 @@ class GoalCompletionEvaluator:
             ],
             "evaluated_at": _utc_timestamp(),
         }
+        if model_snapshot is not None:
+            result.update(model_snapshot.metadata)
+        return result
 
 
 class GoalEvaluationService:

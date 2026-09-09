@@ -34,7 +34,7 @@ from mini_deer_agent.application.workspaces import (
 from mini_deer_agent.agents.middleware import RunBudgetPolicy
 from mini_deer_agent.core import Settings
 from mini_deer_agent.mcp import McpRuntime, initialize_mcp_runtime
-from mini_deer_agent.llms import create_chat_model
+from mini_deer_agent.llms import ModelConfigurationService
 from mini_deer_agent.persistence import (
     open_async_sqlite_checkpointer,
     open_async_sqlite_conversation_repository,
@@ -43,12 +43,16 @@ from mini_deer_agent.server.routers import (
     benchmarks,
     health,
     mcp,
+    models,
     projects,
     runs,
     skills,
+    skill_market,
     threads,
 )
-from mini_deer_agent.skills import UserSkillManager
+from mini_deer_agent.skills import SkillManagementService, UserSkillManager
+from mini_deer_agent.skills.marketplace import SkillMarketplaceService
+from mini_deer_agent.skills.registries import ClawHubRegistryProvider
 from mini_deer_agent.tools import get_reserved_agent_tool_names
 from mini_deer_agent.workspace.paths import ProjectRootPolicy
 from mini_deer_agent.workspace.picker import NativeDirectoryPicker
@@ -128,23 +132,32 @@ def create_lifespan(
                 app.state.user_skill_manager = UserSkillManager(
                     settings.user_skills_directory
                 )
+                app.state.skill_management_service = SkillManagementService(
+                    app.state.user_skill_manager
+                )
+                app.state.model_configuration_service = ModelConfigurationService(settings)
+                app.state.skill_marketplace_service = SkillMarketplaceService(
+                    settings.user_skills_directory / ".market-cache.json",
+                    (ClawHubRegistryProvider(),),
+                    app.state.skill_management_service,
+                    available_tool_names=tuple(
+                        dict.fromkeys(
+                            (
+                                *get_reserved_agent_tool_names(),
+                                *(tool.name for tool in mcp_runtime.tools),
+                            )
+                        )
+                    ),
+                )
                 app.state.goal_state_service = GoalStateService(
                     conversation_repository,
                     checkpointer,
-                )
-                evaluator_settings = settings.model_copy(
-                    update={
-                        "model_name": (
-                            settings.goal_evaluator_model_name
-                            or settings.model_name
-                        )
-                    }
                 )
                 app.state.goal_evaluation_service = GoalEvaluationService(
                     conversation_repository,
                     app.state.goal_state_service,
                     GoalCompletionEvaluator(
-                        lambda: create_chat_model(evaluator_settings),
+                        app.state.model_configuration_service.create_goal_snapshot,
                         timeout_seconds=settings.goal_evaluation_timeout_seconds,
                     ),
                 )
@@ -190,6 +203,14 @@ def create_lifespan(
                             workspace_policy,
                         ),
                         skill_catalog_factory=app.state.user_skill_manager.catalog,
+                        model_snapshot_factory=(
+                            app.state.model_configuration_service.create_primary_snapshot
+                        ),
+                        model_snapshot_restorer=(
+                            app.state.model_configuration_service.restore_primary_snapshot
+                        ),
+                        skill_management_service=app.state.skill_management_service,
+                        skill_marketplace_service=app.state.skill_marketplace_service,
                         run_budget_policy=RunBudgetPolicy(
                             soft_token_limit=settings.run_token_soft_limit,
                             hard_token_limit=settings.run_token_hard_limit,
@@ -249,6 +270,9 @@ def create_lifespan(
                     del app.state.goal_state_service
                     del app.state.goal_evaluation_service
                     del app.state.user_skill_manager
+                    del app.state.skill_management_service
+                    del app.state.model_configuration_service
+                    del app.state.skill_marketplace_service
                     del app.state.mcp_runtime
                     del app.state.settings
 
@@ -299,6 +323,9 @@ def create_app(
     application.include_router(benchmarks.router)
     application.include_router(mcp.router)
     application.include_router(skills.router)
+    application.include_router(models.models_router)
+    application.include_router(models.settings_router)
+    application.include_router(skill_market.router)
     application.include_router(projects.router)
     application.include_router(threads.router)
     application.include_router(runs.router)

@@ -29,6 +29,10 @@ _FRONTMATTER_PATTERN = re.compile(
 )
 
 
+def _contains_disallowed_control(value: str) -> bool:
+    return any(ord(character) < 32 and character not in "\t\n\r" for character in value)
+
+
 class SkillCatalogError(RuntimeError):
     """表示受信任的内置技能发布资产不完整或不合法。"""
 
@@ -152,6 +156,10 @@ def _load_skill_resources(skill_dir: Path) -> tuple[SkillResource, ...]:
             content = resolved.read_text(encoding="utf-8-sig")
         except (OSError, UnicodeError) as exc:
             raise SkillCatalogError(f"Cannot read UTF-8 skill resource: {path}") from exc
+        if _contains_disallowed_control(content):
+            raise SkillCatalogError(
+                f"Skill resource contains disallowed control characters: {path}"
+            )
         resources.append(
             SkillResource(
                 path=f"references/{relative.as_posix()}",
@@ -164,7 +172,7 @@ def _load_skill_resources(skill_dir: Path) -> tuple[SkillResource, ...]:
 def load_skill_package(
     skill_dir: Path,
     *,
-    source: Literal["builtin", "user"] = "user",
+    source: Literal["builtin", "user", "market"] = "user",
 ) -> BuiltInSkill:
     """校验并读取单个真实目录中的技能包。"""
     if not skill_dir.exists() or not skill_dir.is_dir() or skill_dir.is_symlink():
@@ -188,7 +196,7 @@ def _parse_skill_file(
     skill_file: Path,
     *,
     directory_name: str,
-    source: Literal["builtin", "user"] = "builtin",
+    source: Literal["builtin", "user", "market"] = "builtin",
     resources: tuple[SkillResource, ...] = (),
 ) -> BuiltInSkill:
     """解析一个经过路径收敛的内置技能文件，非法发布资产直接失败。"""
@@ -198,6 +206,11 @@ def _parse_skill_file(
         content = skill_file.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeError) as exc:
         raise SkillCatalogError(f"Cannot read built-in skill file: {skill_file}") from exc
+
+    if _contains_disallowed_control(content):
+        raise SkillCatalogError(
+            f"Skill file contains disallowed control characters: {skill_file}"
+        )
 
     if len(content.encode("utf-8")) > MAX_SKILL_FILE_BYTES:
         raise SkillCatalogError(

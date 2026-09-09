@@ -19,6 +19,9 @@ export interface GoalEvaluation {
   readonly reason: string;
   readonly evidenceSummary: string;
   readonly evaluatedAt: string;
+  readonly modelProfile: string | null;
+  readonly modelProfileRevision: string | null;
+  readonly modelSelectionRevision: number | null;
 }
 
 export interface ThreadGoal {
@@ -118,6 +121,9 @@ const EVALUATION_FIELDS = new Set([
   "reason",
   "evidence_summary",
   "evaluated_at",
+  "model_profile",
+  "model_profile_revision",
+  "model_selection_revision",
 ]);
 
 function requiredString(record: UnknownRecord, field: string): string {
@@ -164,6 +170,18 @@ function parseEvaluation(value: unknown): GoalEvaluation | null {
     reason: requiredString(value, "reason"),
     evidenceSummary: requiredString(value, "evidence_summary"),
     evaluatedAt: timestamp(value, "evaluated_at"),
+    modelProfile:
+      value.model_profile == null
+        ? null
+        : requiredString(value, "model_profile"),
+    modelProfileRevision:
+      value.model_profile_revision == null
+        ? null
+        : requiredString(value, "model_profile_revision"),
+    modelSelectionRevision:
+      value.model_selection_revision == null
+        ? null
+        : integer(value, "model_selection_revision"),
   };
 }
 

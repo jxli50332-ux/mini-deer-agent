@@ -50,6 +50,9 @@ class GoalEvaluationResponse(BaseModel):
     reason: str = Field(min_length=1)
     evidence_summary: str = Field(min_length=1)
     evaluated_at: datetime
+    model_profile: str | None = None
+    model_profile_revision: str | None = None
+    model_selection_revision: int | None = Field(default=None, ge=0)
 
 
 class GoalResponse(BaseModel):

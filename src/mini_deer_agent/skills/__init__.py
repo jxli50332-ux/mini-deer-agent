@@ -30,7 +30,26 @@ from mini_deer_agent.skills.tool_policy import (
     resolve_skill_tool_policy,
     validate_skill_tool_policies,
 )
-from mini_deer_agent.skills.user import UserSkillManager, UserSkillRecord
+from mini_deer_agent.skills.user import (
+    ManagedSkillRecord,
+    SkillState,
+    UserSkillManager,
+    UserSkillRecord,
+)
+from mini_deer_agent.skills.management import (
+    SkillArchiveInspection,
+    SkillCheckResult,
+    SkillDetailRecord,
+    SkillDraftPayload,
+    SkillDraftRecord,
+    SkillHistoryRecord,
+    SkillInstallAuthorization,
+    SkillAgentSettings,
+    RecoverableSkillRecord,
+    SkillManagementService,
+)
+from mini_deer_agent.skills.manage_tool import create_skill_manage_tool
+from mini_deer_agent.skills.market_tool import create_skill_market_search_tool
 
 
 __all__ = [
@@ -55,4 +74,18 @@ __all__ = [
     "validate_skill_tool_policies",
     "UserSkillManager",
     "UserSkillRecord",
+    "ManagedSkillRecord",
+    "SkillCheckResult",
+    "SkillArchiveInspection",
+    "SkillDetailRecord",
+    "SkillDraftPayload",
+    "SkillDraftRecord",
+    "SkillHistoryRecord",
+    "SkillInstallAuthorization",
+    "SkillAgentSettings",
+    "RecoverableSkillRecord",
+    "SkillManagementService",
+    "SkillState",
+    "create_skill_manage_tool",
+    "create_skill_market_search_tool",
 ]

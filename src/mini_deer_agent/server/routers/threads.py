@@ -95,7 +95,12 @@ async def _cancel_run_before_goal_mutation(
 ) -> None:
     """Goal 控制面必须先收敛同 Thread 的 Run，避免 revision 与 busy 状态分叉。"""
     thread = service.get_thread(thread_id)
-    if thread is None or thread.status != "busy":
+    if thread is None:
+        return
+    if thread.status != "busy":
+        releaser = getattr(manager, "release_goal_context", None)
+        if callable(releaser):
+            await releaser(thread_id)
         return
     outcome = await manager.cancel_active_run(thread_id, reason=reason)
     refreshed = service.get_thread(thread_id)

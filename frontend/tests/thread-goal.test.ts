@@ -24,6 +24,9 @@ function payload(overrides: Record<string, unknown> = {}) {
       reason: "还差最终测试",
       evidence_summary: "代码已修改",
       evaluated_at: "2026-09-08T01:00:00Z",
+      model_profile: "goal-evaluator",
+      model_profile_revision: "profile-hash",
+      model_selection_revision: 2,
     },
     status: "active",
     stop_reason: null,
@@ -44,6 +47,7 @@ describe("线程 Goal API", () => {
       lastEvaluation: {
         blocker: "goal_not_met_yet",
         evidenceSummary: "代码已修改",
+        modelProfile: "goal-evaluator",
       },
     });
     expect(() => parseThreadGoal(payload({ status: "invented" }))).toThrow(

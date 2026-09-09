@@ -34,7 +34,7 @@ class BuiltInSkill:
     # None 保留旧技能的主 Agent 工具集合；显式元组会启用最小权限策略。
     allowed_tools: tuple[str, ...] | None = None
     resources: tuple[SkillResource, ...] = ()
-    source: Literal["builtin", "user"] = "builtin"
+    source: Literal["builtin", "user", "market"] = "builtin"
 
     @property
     def summary(self) -> SkillSummary:

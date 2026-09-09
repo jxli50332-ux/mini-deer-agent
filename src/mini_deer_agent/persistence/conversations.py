@@ -47,7 +47,7 @@ from mini_deer_agent.persistence.workspaces import (
 )
 
 
-_LATEST_MIGRATION_VERSION = 14
+_LATEST_MIGRATION_VERSION = 16
 
 _SCHEMA_STATEMENTS = (
     """
@@ -343,6 +343,23 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
         CREATE INDEX IF NOT EXISTS idx_run_events_thread_run_sequence
         ON run_events(thread_id, run_id, sequence)
         """,
+    ),
+    15: (
+        """
+        CREATE TABLE IF NOT EXISTS goal_context_snapshots (
+            thread_id TEXT PRIMARY KEY REFERENCES threads(thread_id) ON DELETE CASCADE,
+            goal_revision TEXT NOT NULL,
+            snapshot_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """,
+    ),
+    16: (
+        "ALTER TABLE runs ADD COLUMN model_profile TEXT",
+        "ALTER TABLE runs ADD COLUMN model_profile_revision TEXT",
+        "ALTER TABLE runs ADD COLUMN model_selection_revision INTEGER CHECK (model_selection_revision >= 0)",
+        "ALTER TABLE runs ADD COLUMN skill_catalog_hash TEXT",
     ),
 }
 
@@ -1069,13 +1086,37 @@ class SqliteConversationRepository:
 
             if event.event == "run_started":
                 started_at = str(event.payload.get("created_at") or now)
+                model_profile = event.payload.get("model_profile")
+                model_profile_revision = event.payload.get("model_profile_revision")
+                model_selection_revision = event.payload.get("model_selection_revision")
+                skill_catalog_hash = event.payload.get("skill_catalog_hash")
                 cursor.execute(
                     """
                     UPDATE runs
-                    SET status = 'running', started_at = COALESCE(started_at, ?), updated_at = ?
+                    SET status = 'running', started_at = COALESCE(started_at, ?),
+                        updated_at = ?, model_profile = ?, model_profile_revision = ?,
+                        model_selection_revision = ?, skill_catalog_hash = ?
                     WHERE run_id = ?
                     """,
-                    (started_at, now, event.run_id),
+                    (
+                        started_at,
+                        now,
+                        model_profile if isinstance(model_profile, str) else None,
+                        (
+                            model_profile_revision
+                            if isinstance(model_profile_revision, str)
+                            else None
+                        ),
+                        (
+                            model_selection_revision
+                            if isinstance(model_selection_revision, int)
+                            and not isinstance(model_selection_revision, bool)
+                            and model_selection_revision >= 0
+                            else None
+                        ),
+                        skill_catalog_hash if isinstance(skill_catalog_hash, str) else None,
+                        event.run_id,
+                    ),
                 )
                 return True
 
@@ -1417,7 +1458,9 @@ class SqliteConversationRepository:
                 """
                 SELECT run_id, thread_id, status, user_message_id, created_at,
                        started_at, finished_at, finish_reason, error_code,
-                       input_tokens, output_tokens, total_tokens, model_calls
+                       input_tokens, output_tokens, total_tokens, model_calls,
+                       model_profile, model_profile_revision,
+                       model_selection_revision, skill_catalog_hash
                 FROM runs
                 WHERE run_id = ?
                 """,
@@ -1439,6 +1482,10 @@ class SqliteConversationRepository:
             output_tokens=cast(int | None, row["output_tokens"]),
             total_tokens=cast(int | None, row["total_tokens"]),
             model_calls=cast(int | None, row["model_calls"]),
+            model_profile=cast(str | None, row["model_profile"]),
+            model_profile_revision=cast(str | None, row["model_profile_revision"]),
+            model_selection_revision=cast(int | None, row["model_selection_revision"]),
+            skill_catalog_hash=cast(str | None, row["skill_catalog_hash"]),
         )
 
     def create_project_thread(
@@ -1552,6 +1599,52 @@ class SqliteConversationRepository:
             return None
         return self._thread_from_row(row)
 
+    def save_goal_context_snapshot(
+        self,
+        *,
+        thread_id: str,
+        goal_revision: str,
+        snapshot_json: str,
+    ) -> None:
+        """按 Thread 幂等保存 Goal 快照；新 revision 会完整替换旧上下文。"""
+        now = _utc_now()
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO goal_context_snapshots(
+                    thread_id, goal_revision, snapshot_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(thread_id) DO UPDATE SET
+                    goal_revision = excluded.goal_revision,
+                    snapshot_json = excluded.snapshot_json,
+                    updated_at = excluded.updated_at
+                """,
+                (thread_id, goal_revision, snapshot_json, now, now),
+            )
+
+    def get_goal_context_snapshot(self, thread_id: str) -> tuple[str, str] | None:
+        """读取跨进程恢复所需的 Goal revision 与序列化快照。"""
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT goal_revision, snapshot_json
+                FROM goal_context_snapshots
+                WHERE thread_id = ?
+                """,
+                (thread_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row["goal_revision"]), str(row["snapshot_json"])
+
+    def delete_goal_context_snapshot(self, thread_id: str) -> None:
+        """释放 Goal 生命周期结束后的冻结上下文。"""
+        with self._lock, self._connection:
+            self._connection.execute(
+                "DELETE FROM goal_context_snapshots WHERE thread_id = ?",
+                (thread_id,),
+            )
+
     def list_threads(
         self, *, limit: int, offset: int = 0, standalone_only: bool = False
     ) -> tuple[ThreadRecord, ...]:
@@ -1614,7 +1707,9 @@ class SqliteConversationRepository:
                 """
                 SELECT run_id, thread_id, status, user_message_id, created_at,
                        started_at, finished_at, finish_reason, error_code,
-                       input_tokens, output_tokens, total_tokens, model_calls
+                       input_tokens, output_tokens, total_tokens, model_calls,
+                       model_profile, model_profile_revision,
+                       model_selection_revision, skill_catalog_hash
                 FROM runs
                 WHERE thread_id = ?
                 ORDER BY created_at DESC, run_id DESC
@@ -1637,6 +1732,10 @@ class SqliteConversationRepository:
                 output_tokens=cast(int | None, row["output_tokens"]),
                 total_tokens=cast(int | None, row["total_tokens"]),
                 model_calls=cast(int | None, row["model_calls"]),
+                model_profile=cast(str | None, row["model_profile"]),
+                model_profile_revision=cast(str | None, row["model_profile_revision"]),
+                model_selection_revision=cast(int | None, row["model_selection_revision"]),
+                skill_catalog_hash=cast(str | None, row["skill_catalog_hash"]),
             )
             for row in rows
         )

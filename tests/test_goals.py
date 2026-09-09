@@ -27,6 +27,7 @@ from mini_deer_agent.application import (
 )
 from mini_deer_agent.agents.middleware import RunBudgetTracker
 from mini_deer_agent.domain import ThreadRecord
+from mini_deer_agent.llms import ModelSnapshot
 from mini_deer_agent.persistence import (
     open_async_sqlite_checkpointer,
     open_sqlite_conversation_repository,
@@ -65,6 +66,37 @@ class _BindableModel(FakeMessagesListChatModel):
             run_manager=run_manager,
             **kwargs,
         )
+
+
+def test_goal_evaluation_records_actual_model_snapshot() -> None:
+    async def scenario() -> None:
+        model = _BindableModel(
+            responses=[
+                AIMessage(
+                    content=(
+                        '{"satisfied":true,"blocker":"none",'
+                        '"reason":"已完成","evidence_summary":"已有完成证据"}'
+                    )
+                )
+            ]
+        )
+        evaluator = GoalCompletionEvaluator(
+            lambda: ModelSnapshot(
+                "goal-profile",
+                "profile-revision",
+                7,
+                model,
+            )
+        )
+        result = await evaluator.evaluate(
+            objective="完成任务",
+            evidence=({"kind": "assistant", "content": "任务完成。"},),
+        )
+        assert result["model_profile"] == "goal-profile"
+        assert result["model_profile_revision"] == "profile-revision"
+        assert result["model_selection_revision"] == 7
+
+    asyncio.run(scenario())
 
 
 class _ThreadRepository:

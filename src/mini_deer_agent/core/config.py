@@ -59,6 +59,8 @@ class Settings(BaseSettings):
     mcp_server_init_timeout_seconds: float = Field(default=10.0, gt=0)
     # 用户 Skill 只从受管本地目录加载；启停影响之后创建的 Run 快照。
     user_skills_directory: Path = Field(default_factory=_default_user_skills_directory)
+    # 可信多模型清单只保存非敏感配置；API Key 由各 Profile 声明的环境变量提供。
+    models_config_path: Path = Path("models.yaml")
     # 可指定更小的非工具模型做 Goal 完成判断；省略时复用主模型配置。
     goal_evaluator_model_name: str | None = None
     goal_evaluation_timeout_seconds: float = Field(default=60.0, gt=0)

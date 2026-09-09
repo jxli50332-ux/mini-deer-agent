@@ -5,6 +5,7 @@ interface ThreadHeaderProps {
   readonly phase: ChatRunPhase;
   readonly threadId: string;
   readonly runId: string | null;
+  readonly modelProfile?: string | null;
   readonly navigationOpen: boolean;
   readonly onOpenNavigation: () => void;
   readonly onOpenBenchmarks: () => void;
@@ -24,6 +25,7 @@ export function ThreadHeader({
   phase,
   threadId,
   runId,
+  modelProfile = null,
   navigationOpen,
   onOpenNavigation,
   onOpenBenchmarks,
@@ -53,6 +55,14 @@ export function ThreadHeader({
           能力基准
         </button>
         <StatusIndicator label={PHASE_LABELS[phase]} />
+        {modelProfile !== null && (
+          <span
+            className="thread-id"
+            title={`实际模型 Profile: ${modelProfile}`}
+          >
+            model {modelProfile}
+          </span>
+        )}
         <span className="thread-id" title={`thread_id: ${threadId}`}>
           thread {threadId.slice(0, 8)}
         </span>

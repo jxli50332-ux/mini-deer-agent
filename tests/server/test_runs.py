@@ -47,6 +47,7 @@ class StubRunStreamService:
             tuple[str, str, str, tuple[TextAttachment, ...]]
         ] = []
         self.received_human_input_responses: list[dict[str, object] | None] = []
+        self.received_skill_authorizations: list[str | None] = []
         self.cancel_outcome = CancelOutcome.cancelled
         self.cancel_calls: list[tuple[str, str]] = []
 
@@ -83,12 +84,17 @@ class StubRunExecutionManager:
         user_message_id: str,
         attachments: tuple[TextAttachment, ...] = (),
         human_input_response: dict[str, object] | None = None,
+        skill_install_authorization_token: str | None = None,
+        **_kwargs: object,
     ) -> StartedRun:
         """记录 v1 参数并返回路由可在响应前读取 run ID 的对象。"""
         self.service.received_v1.append(
             (message, thread_id, user_message_id, attachments)
         )
         self.service.received_human_input_responses.append(human_input_response)
+        self.service.received_skill_authorizations.append(
+            skill_install_authorization_token
+        )
         if self.service.started_run is None:
             raise AssertionError("测试没有配置 started_run")
         return self.service.started_run
@@ -276,6 +282,44 @@ def test_v1_run_stream_returns_versioned_sequenced_events() -> None:
         "message_id": "message-v1-1",
         "payload": {"text": "你好"},
     }
+
+
+def test_v1_run_stream_forwards_hidden_skill_install_authorization() -> None:
+    """一次性授权应作为结构化控制字段传递，不进入用户消息。"""
+    run_id = "run-http-skill-authorization"
+    token = "a" * 32
+    service = StubRunStreamService(
+        started_run=StartedRun(
+            run_id=run_id,
+            events=async_run_events(
+                [
+                    RunEvent(
+                        event="run_completed",
+                        run_id=run_id,
+                        thread_id=THREAD_ID,
+                        sequence=1,
+                        message_id=None,
+                        payload={"finish_reason": "stop"},
+                    )
+                ]
+            ),
+        )
+    )
+
+    with TestClient(create_stubbed_app(service)) as client:
+        response = client.post(
+            f"/api/v1/threads/{THREAD_ID}/runs/stream",
+            json={
+                "message_id": MESSAGE_ID,
+                "message": "创建天气 Skill",
+                "skill_install_authorization_token": token,
+            },
+        )
+
+    assert response.status_code == 200
+    assert service.received_v1[0][0] == "创建天气 Skill"
+    assert token not in service.received_v1[0][0]
+    assert service.received_skill_authorizations == [token]
 
 
 def test_run_routes_reject_invalid_input_before_calling_service() -> None:

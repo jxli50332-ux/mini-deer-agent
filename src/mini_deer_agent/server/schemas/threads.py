@@ -65,6 +65,10 @@ class RunResponse(BaseModel):
     output_tokens: int | None = Field(default=None, ge=0)
     total_tokens: int | None = Field(default=None, ge=0)
     model_calls: int | None = Field(default=None, ge=0)
+    model_profile: str | None = None
+    model_profile_revision: str | None = None
+    model_selection_revision: int | None = Field(default=None, ge=0)
+    skill_catalog_hash: str | None = None
 
 
 class RunEventResponse(BaseModel):

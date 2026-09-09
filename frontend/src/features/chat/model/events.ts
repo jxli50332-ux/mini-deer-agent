@@ -2,6 +2,10 @@ import type { SseFrame } from "@/shared/api/sse-parser";
 
 export interface RunStartedPayload {
   readonly createdAt: string;
+  readonly modelProfile?: string | null;
+  readonly modelProfileRevision?: string | null;
+  readonly modelSelectionRevision?: number | null;
+  readonly skillCatalogHash?: string | null;
 }
 
 export interface AiDeltaPayload {
@@ -340,11 +344,26 @@ export function decodeChatRunEvent(frame: SseFrame): ChatRunEvent {
   switch (frame.event) {
     case "run_started":
       requireNoMessageId(frame.event, messageId);
+      const modelSelectionRevision = payload.model_selection_revision;
       return {
         ...base,
         event: frame.event,
         payload: {
           createdAt: requireIsoDateTime(payload, "created_at"),
+          ...(typeof payload.model_profile === "string"
+            ? { modelProfile: payload.model_profile }
+            : {}),
+          ...(typeof payload.model_profile_revision === "string"
+            ? { modelProfileRevision: payload.model_profile_revision }
+            : {}),
+          ...(typeof modelSelectionRevision === "number" &&
+          Number.isInteger(modelSelectionRevision) &&
+          modelSelectionRevision >= 0
+            ? { modelSelectionRevision }
+            : {}),
+          ...(typeof payload.skill_catalog_hash === "string"
+            ? { skillCatalogHash: payload.skill_catalog_hash }
+            : {}),
         },
       };
     case "ai_delta":

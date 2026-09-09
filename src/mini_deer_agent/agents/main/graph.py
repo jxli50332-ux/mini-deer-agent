@@ -77,6 +77,8 @@ from mini_deer_agent.core import Settings
 from mini_deer_agent.skills import (
     SKILL_ACTIVATION_TOOL_NAME,
     BuiltInSkillCatalog,
+    create_skill_market_search_tool,
+    create_skill_manage_tool,
     SkillToolPolicyDecision,
     create_skill_activation_tool,
     find_automatic_skill_name,
@@ -107,6 +109,8 @@ from mini_deer_agent.tools.project_sandbox import create_project_sandbox_tools
 if TYPE_CHECKING:
     from mini_deer_agent.application.memory import MemoryStore
     from mini_deer_agent.application.workspaces import FileAccess, ProjectService
+    from mini_deer_agent.skills.management import SkillManagementService
+    from mini_deer_agent.skills.marketplace import SkillMarketplaceService
 
 
 _PROJECT_ROOT_OVERVIEW_LIMIT = 40
@@ -1548,6 +1552,9 @@ def build_agent_graph(
     tool_output_policy: ToolOutputBudgetPolicy | None = None,
     run_budget_policy: RunBudgetPolicy | None = None,
     run_budget_tracker: RunBudgetTracker | None = None,
+    skill_management_service: "SkillManagementService | None" = None,
+    skill_marketplace_service: "SkillMarketplaceService | None" = None,
+    skill_creation_enabled: bool | None = None,
 ) -> CompiledStateGraph:
     """绑定模型、Prompt、工具和可选状态存储，并编译条件循环。"""
     # 项目身份只能由可信调用方提供；HTTP 接入前须先按持久 Thread 归属授权。
@@ -1724,12 +1731,26 @@ def build_agent_graph(
     )
     tool_search = create_tool_search_tool(deferred_tool_catalog)
     discovery_tools = (tool_search,) if deferred_tool_catalog.names else ()
+    active_skill_creation = (
+        skill_creation_enabled
+        if skill_creation_enabled is not None
+        else (
+            skill_management_service is not None
+            and skill_management_service.agent_settings().creation_enabled
+        )
+    )
     parent_extra_tools = (
         *memory_tools,
         *file_tools,
         *run_output_tools,
         *sandbox_tools,
         *discovery_tools,
+        *(
+            (create_skill_manage_tool(skill_management_service),)
+            if active_skill_creation and skill_management_service is not None
+            else ()
+        ),
+        *((create_skill_market_search_tool(skill_marketplace_service),) if skill_marketplace_service is not None else ()),
     )
     # task 在创建时获得父 Run 已绑定工具的冻结快照；子图不会重新发现项目或 MCP。
     subagent_parent_tools = (

@@ -14,7 +14,9 @@ from mini_deer_agent.application import (
     GoalStateService,
 )
 from mini_deer_agent.mcp import McpRuntime
-from mini_deer_agent.skills import UserSkillManager
+from mini_deer_agent.skills import SkillManagementService, UserSkillManager
+from mini_deer_agent.llms import ModelConfigurationService
+from mini_deer_agent.skills.marketplace import SkillMarketplaceService
 from mini_deer_agent.application.workspaces import ProjectService, ProjectThreadService
 from mini_deer_agent.workspace.picker import DirectoryPicker
 
@@ -167,6 +169,38 @@ def get_user_skill_manager(request: Request) -> UserSkillManager:
             },
         )
     return cast(UserSkillManager, manager)
+
+
+def get_skill_management_service(request: Request) -> SkillManagementService:
+    """取得 Skill 写入应用服务，确保所有变更留在同一受管根目录。"""
+    service = getattr(request.app.state, "skill_management_service", None)
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "service_not_ready", "message": "Skill service is not ready"},
+        )
+    return cast(SkillManagementService, service)
+
+
+def get_model_configuration_service(request: Request) -> ModelConfigurationService:
+    """取得生命周期内固定 Profile 目录和可热更新默认选择。"""
+    service = getattr(request.app.state, "model_configuration_service", None)
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "service_not_ready", "message": "Model service is not ready"},
+        )
+    return cast(ModelConfigurationService, service)
+
+
+def get_skill_marketplace_service(request: Request) -> SkillMarketplaceService:
+    service = getattr(request.app.state, "skill_marketplace_service", None)
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "service_not_ready", "message": "Skill market is not ready"},
+        )
+    return cast(SkillMarketplaceService, service)
 
 
 def get_goal_state_service(request: Request) -> GoalStateService:

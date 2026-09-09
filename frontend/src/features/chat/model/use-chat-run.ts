@@ -70,6 +70,7 @@ export interface ChatSubmitOptions {
   readonly humanInputResponse?: HumanInputResponse;
   readonly benchmarkCaseId?: string;
   readonly goalResumeRevision?: string;
+  readonly skillInstallAuthorizationToken?: string;
 }
 
 interface ActiveOperation {
@@ -277,6 +278,12 @@ export function useChatRun(options: UseChatRunOptions): UseChatRunResult {
           ...(submitOptions.goalResumeRevision === undefined
             ? {}
             : { goalResumeRevision: submitOptions.goalResumeRevision }),
+          ...(submitOptions.skillInstallAuthorizationToken === undefined
+            ? {}
+            : {
+                skillInstallAuthorizationToken:
+                  submitOptions.skillInstallAuthorizationToken,
+              }),
           signal: operation.controller.signal,
           onRunId: (runId) => {
             // 响应头先建立取消寻址；旧 operation 的回调不能覆盖当前 Run。

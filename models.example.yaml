@@ -1,0 +1,17 @@
+version: 1
+models:
+  - name: primary-openai
+    display_name: Primary OpenAI
+    provider: openai
+    model: gpt-5
+    api_key_env: MINI_DEER_API_KEY
+    supports_tools: true
+    supports_reasoning: true
+  - name: local-compatible
+    display_name: Local Compatible
+    provider: openai-compatible
+    model: local-model
+    base_url: http://127.0.0.1:11434/v1
+    api_key_env: LOCAL_MODEL_API_KEY
+    supports_tools: true
+    supports_reasoning: false

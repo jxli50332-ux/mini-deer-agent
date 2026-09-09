@@ -33,6 +33,8 @@ export interface ChatRunState {
   readonly runId: string | null;
   readonly lastSequence: number;
   readonly startedAt: string | null;
+  readonly modelProfile: string | null;
+  readonly skillCatalogHash: string | null;
   readonly finishReason: string | null;
   readonly timeline: readonly ChatTimelineItem[];
   readonly error: ChatRunFailure | null;
@@ -94,6 +96,8 @@ export function createInitialChatRunState(
     runId: null,
     lastSequence: 0,
     startedAt: null,
+    modelProfile: null,
+    skillCatalogHash: null,
     finishReason: null,
     timeline: [],
     error: null,
@@ -472,6 +476,8 @@ function reduceRunEvent(
         runId: event.runId,
         lastSequence: event.sequence,
         startedAt: event.payload.createdAt,
+        modelProfile: event.payload.modelProfile ?? null,
+        skillCatalogHash: event.payload.skillCatalogHash ?? null,
       };
     case "ai_delta":
       return reduceAiDelta(state, event);
@@ -565,6 +571,8 @@ export function chatRunReducer(
         runId: null,
         lastSequence: 0,
         startedAt: null,
+        modelProfile: null,
+        skillCatalogHash: null,
         finishReason: null,
         timeline: [
           ...previousTimeline,

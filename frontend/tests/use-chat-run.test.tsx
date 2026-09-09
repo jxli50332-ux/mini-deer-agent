@@ -189,6 +189,37 @@ describe("useChatRun", () => {
     });
   });
 
+  it("Skill 安装授权只进入结构化 Run 请求，不进入 optimistic 消息", async () => {
+    const token = "a".repeat(32);
+    let capturedToken: string | undefined;
+    const runner: ChatStreamRunner = async function* (request) {
+      await Promise.resolve();
+      capturedToken = request.skillInstallAuthorizationToken;
+      yield started();
+      yield completed(2);
+    };
+    const { result } = renderHook(() =>
+      useChatRun({
+        threadId: THREAD_ID,
+        streamRunner: runner,
+        createMessageId: () => "user-skill-auth-1",
+      }),
+    );
+
+    await act(async () => {
+      await result.current.submit("创建天气 Skill", [], {
+        skillInstallAuthorizationToken: token,
+      });
+    });
+
+    expect(capturedToken).toBe(token);
+    expect(result.current.state.timeline[0]).toMatchObject({
+      id: "user-skill-auth-1",
+      content: "创建天气 Skill",
+    });
+    expect(JSON.stringify(result.current.state.timeline)).not.toContain(token);
+  });
+
   it("用 active operation guard 阻止同一时刻重复提交", async () => {
     const gate = deferred();
     const runner: ChatStreamRunner = async function* () {

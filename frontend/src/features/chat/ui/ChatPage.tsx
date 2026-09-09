@@ -28,6 +28,7 @@ import { useThreadHistory } from "@/features/threads/model/use-thread-history";
 import { useThreadList } from "@/features/threads/model/use-thread-list";
 import { useThreadRuns } from "@/features/threads/model/use-thread-runs";
 import { useProjectThreadDraft } from "@/features/workspace/model/use-project-thread-draft";
+import { createSkillInstallAuthorization } from "@/features/skills/api/skills";
 import {
   buildHumanInputResponseText,
   type HumanInputRequest,
@@ -398,6 +399,39 @@ export function ChatPage({
     },
     [threadId],
   );
+  const startSkillCreation = useCallback(
+    async (
+      mode: "balanced" | "guided" | "automatic",
+      requirement: string,
+      expectedName?: string,
+    ) => {
+      nextDraftInsertionId.current += 1;
+      const authorization =
+        mode === "automatic"
+          ? await createSkillInstallAuthorization({
+              threadId,
+              expectedName: expectedName ?? "",
+              requirement,
+            })
+          : null;
+      const modeInstruction =
+        mode === "guided"
+          ? "先询问我触发条件、输入输出和边界；得到回答后再生成。"
+          : mode === "automatic"
+            ? `自行做出合理假设，不要中途提问；只创建名为 ${JSON.stringify(authorization?.expectedName)} 的全新 Skill。依次调用 skill_manage 的 create_draft、validate_draft 和 request_install；一次性授权已在服务端绑定本次 Run、草稿和已校验内容摘要，不要索要或传递授权令牌。`
+            : "先搜索 Skill 市场候选；若继续自建，请列出关键假设并生成第一版草稿。";
+      await submit(
+        `请使用 Skill 创作流程处理以下需求：${requirement}\n\n模式要求：${modeInstruction} 使用 skill_market_search 只读搜索，使用 skill_manage 创建并校验草稿。除自动模式使用服务端的一次性授权安装全新 Skill 外，不要安装、覆盖、启用或删除 Skill。`,
+        [],
+        authorization === null
+          ? {}
+          : {
+              skillInstallAuthorizationToken: authorization.authorizationToken,
+            },
+      );
+    },
+    [submit, threadId],
+  );
   const clearAppliedDraftInsertion = useCallback((id: number) => {
     setComposerDraftInsertion((current) =>
       current?.id === id ? null : current,
@@ -489,6 +523,7 @@ export function ChatPage({
         onRenameThread={renameTitle}
         onDeleteThread={deletePersistedThread}
         onReferenceProjectFile={referenceProjectFile}
+        onStartSkillCreation={startSkillCreation}
       />
       <main className="workspace">
         <div className="thread-header-region">
@@ -496,6 +531,12 @@ export function ChatPage({
             phase={state.phase}
             threadId={threadId}
             runId={state.runId}
+            modelProfile={
+              state.modelProfile ??
+              (state.phase === "idle"
+                ? (threadRuns[0]?.modelProfile ?? null)
+                : null)
+            }
             navigationOpen={isMobileNavigationOpen}
             onOpenNavigation={() => setIsMobileNavigationOpen(true)}
             onOpenBenchmarks={() => setIsBenchmarkPanelOpen(true)}

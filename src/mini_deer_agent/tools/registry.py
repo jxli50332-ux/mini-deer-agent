@@ -23,6 +23,8 @@ _DYNAMIC_AGENT_TOOL_NAMES = (
     "inspect_project_sandbox",
     "run_project_command",
     "tool_search",
+    "skill_manage",
+    "skill_market_search",
 )
 
 

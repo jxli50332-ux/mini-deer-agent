@@ -25,6 +25,17 @@ type LegacyThreadId = Annotated[
     StringConstraints(strip_whitespace=True, min_length=1, max_length=128),
 ]
 
+type SkillInstallAuthorizationToken = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        to_lower=True,
+        min_length=32,
+        max_length=32,
+        pattern=r"^[a-f0-9]{32}$",
+    ),
+]
+
 
 type AttachmentFilename = Annotated[
     str,
@@ -103,6 +114,7 @@ class RunStreamRequest(BaseModel):
         str,
         StringConstraints(strip_whitespace=True, min_length=1, max_length=64),
     ] | None = None
+    skill_install_authorization_token: SkillInstallAuthorizationToken | None = None
 
     def to_domain_attachments(self) -> tuple[TextAttachment, ...]:
         """由服务端重新推导附件类型和 UTF-8 字节数。"""

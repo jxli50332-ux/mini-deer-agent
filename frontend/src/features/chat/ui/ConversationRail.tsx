@@ -21,6 +21,7 @@ import {
 } from "@/features/threads/model/navigation-index";
 import { useNavigationThreadIndex } from "@/features/threads/model/use-navigation-thread-index";
 import { WorkspaceLauncher } from "@/features/workspace/ui/WorkspaceLauncher";
+import { SettingsDialog } from "@/features/settings/ui/SettingsDialog";
 
 interface ConversationRailProps {
   readonly phase: ChatRunPhase;
@@ -56,6 +57,11 @@ interface ConversationRailProps {
   readonly onRenameThread: (threadId: string, title: string) => Promise<void>;
   readonly onDeleteThread: (threadId: string) => Promise<void>;
   readonly onReferenceProjectFile?: (path: string) => void;
+  readonly onStartSkillCreation?: (
+    mode: "balanced" | "guided" | "automatic",
+    requirement: string,
+    expectedName?: string,
+  ) => void | Promise<void>;
 }
 
 const PHASE_SUMMARIES: Record<ChatRunPhase, string> = {
@@ -156,6 +162,7 @@ export function ConversationRail({
   onRenameThread,
   onDeleteThread,
   onReferenceProjectFile = () => undefined,
+  onStartSkillCreation,
 }: ConversationRailProps) {
   const [editingThreadId, setEditingThreadId] = useState<string | null>(null);
   const [titleDraft, setTitleDraft] = useState("");
@@ -168,6 +175,7 @@ export function ConversationRail({
   const [isDeleting, setIsDeleting] = useState(false);
   const resizeStart = useRef<{ x: number; width: number } | null>(null);
   const [isResizing, setIsResizing] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [navigationQuery, setNavigationQuery] = useState("");
   const [navigationScope, setNavigationScope] = useState<NavigationThreadScope>(
     () => readNavigationFilters().scope,
@@ -759,8 +767,18 @@ export function ConversationRail({
             </div>
 
             <footer className="rail-footer">
-              <span className="rail-footer__dot" aria-hidden="true" />
-              本地开发环境
+              <span className="rail-footer__environment">
+                <span className="rail-footer__dot" aria-hidden="true" />
+                本地开发环境
+              </span>
+              <button
+                type="button"
+                className="rail-settings-button"
+                aria-label="打开设置"
+                onClick={() => setSettingsOpen(true)}
+              >
+                <span aria-hidden="true">⚙</span>
+              </button>
             </footer>
           </>
         )}
@@ -781,6 +799,13 @@ export function ConversationRail({
           onPointerCancel={finishResize}
         />
       </aside>
+      <SettingsDialog
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        {...(onStartSkillCreation === undefined
+          ? {}
+          : { onStartSkillCreation })}
+      />
     </Fragment>
   );
 }

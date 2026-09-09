@@ -27,6 +27,7 @@ from mini_deer_agent.server.schemas import (
     RunStreamRequest,
 )
 from mini_deer_agent.streaming import aiter_run_sse_frames, aiter_sse_frames
+from mini_deer_agent.skills import SkillCatalogError
 
 
 router = APIRouter(prefix="/api/v1/threads", tags=["runs"])
@@ -90,6 +91,9 @@ async def stream_thread_run(
             str(request.message_id),
             request.to_domain_attachments(),
             request.to_domain_human_input_response(),
+            skill_install_authorization_token=(
+                request.skill_install_authorization_token
+            ),
             **benchmark_kwargs,
         )
     except ActiveRunConflictError as exc:
@@ -99,6 +103,14 @@ async def stream_thread_run(
             detail={
                 "code": "run_conflict",
                 "message": "Thread already has an active run",
+            },
+        ) from exc
+    except SkillCatalogError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "skill_install_authorization_invalid",
+                "message": str(exc),
             },
         ) from exc
     return _streaming_response(

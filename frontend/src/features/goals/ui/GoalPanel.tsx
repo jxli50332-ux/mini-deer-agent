@@ -85,6 +85,9 @@ export function GoalPanel({
             <details className="goal-panel__evaluation">
               <summary>最近评估：{goal.lastEvaluation.reason}</summary>
               <p>{goal.lastEvaluation.evidenceSummary}</p>
+              {goal.lastEvaluation.modelProfile !== null && (
+                <small>评估模型：{goal.lastEvaluation.modelProfile}</small>
+              )}
             </details>
           )}
           {goal.stopReason !== null && (

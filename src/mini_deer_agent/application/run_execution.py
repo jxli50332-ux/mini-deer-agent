@@ -9,7 +9,7 @@ from enum import StrEnum
 from uuid import uuid4
 
 from mini_deer_agent.application.conversations import ConversationRepository
-from mini_deer_agent.application.run_stream import RunStreamService
+from mini_deer_agent.application.run_stream import RunContextSnapshot, RunStreamService
 from mini_deer_agent.application.goals import GoalEvaluationService
 from mini_deer_agent.domain import TextAttachment
 from mini_deer_agent.domain import require_benchmark_case
@@ -70,6 +70,8 @@ class _ActiveRun:
     last_sequence: int = 0
     abort_reason: str = "user_cancelled"
     terminal: bool = False
+    context_snapshot: RunContextSnapshot | None = None
+    goal_context_revision: str | None = None
 
 
 class RunExecutionManager:
@@ -96,6 +98,7 @@ class RunExecutionManager:
         self._active_runs: dict[str, _ActiveRun] = {}
         self._shutting_down = False
         self._goal_evaluation_service = goal_evaluation_service
+        self._goal_context_snapshots: dict[str, RunContextSnapshot] = {}
 
     async def start_run(
         self,
@@ -106,11 +109,60 @@ class RunExecutionManager:
         human_input_response: dict[str, object] | None = None,
         benchmark_case_id: str | None = None,
         internal_continuation: bool = False,
+        skill_install_authorization_token: str | None = None,
     ) -> StartedRun:
         """先持久化 Run，再无等待窗口地附加后台执行 Task。"""
         if self._shutting_down:
             raise RuntimeError("Run execution manager is shutting down")
 
+        snapshot_factory = getattr(self._stream_service, "create_context_snapshot", None)
+        goal_context_revision: str | None = None
+        revision_reader = getattr(
+            self._goal_evaluation_service,
+            "current_revision",
+            None,
+        )
+        if callable(revision_reader):
+            goal_context_revision = await revision_reader(thread_id)
+        context_snapshot = (
+            self._goal_context_snapshots.get(thread_id)
+            if goal_context_revision is not None
+            else None
+        )
+        if context_snapshot is None and goal_context_revision is not None:
+            loader = getattr(
+                self._conversation_repository,
+                "get_goal_context_snapshot",
+                None,
+            )
+            restorer = getattr(
+                self._stream_service,
+                "restore_context_snapshot",
+                None,
+            )
+            stored = (
+                await asyncio.to_thread(loader, thread_id)
+                if callable(loader)
+                else None
+            )
+            if stored is not None and stored[0] == goal_context_revision:
+                if not callable(restorer):
+                    raise RuntimeError("Stored Goal context cannot be restored")
+                try:
+                    context_snapshot = restorer(stored[1])
+                except Exception as exc:
+                    raise RuntimeError("Stored Goal context cannot be restored") from exc
+                self._goal_context_snapshots[thread_id] = context_snapshot
+            elif stored is not None:
+                deleter = getattr(
+                    self._conversation_repository,
+                    "delete_goal_context_snapshot",
+                    None,
+                )
+                if callable(deleter):
+                    await asyncio.to_thread(deleter, thread_id)
+        if context_snapshot is None:
+            context_snapshot = snapshot_factory() if callable(snapshot_factory) else None
         run_id = str(uuid4())
         create_run_kwargs: dict[str, object] = dict(
             thread_id=thread_id,
@@ -129,13 +181,44 @@ class RunExecutionManager:
             **create_run_kwargs,
         )
 
+        if skill_install_authorization_token is not None:
+            binder = getattr(
+                self._stream_service,
+                "bind_skill_install_authorization",
+                None,
+            )
+            try:
+                if not callable(binder):
+                    raise RuntimeError(
+                        "Skill install authorization is unavailable"
+                    )
+                await asyncio.to_thread(
+                    binder,
+                    skill_install_authorization_token,
+                    thread_id=thread_id,
+                    run_id=run_id,
+                )
+            except BaseException:
+                await asyncio.shield(
+                    asyncio.to_thread(
+                        self._conversation_repository.interrupt_run,
+                        thread_id=thread_id,
+                        run_id=run_id,
+                        error_code="skill_install_authorization_failed",
+                    )
+                )
+                raise
+
         started_event = RunEvent(
             event="run_started",
             run_id=run_id,
             thread_id=thread_id,
             sequence=1,
             message_id=None,
-            payload={"created_at": datetime.now(UTC).isoformat()},
+            payload={
+                "created_at": datetime.now(UTC).isoformat(),
+                **(context_snapshot.metadata if context_snapshot is not None else {}),
+            },
         )
         try:
             await asyncio.to_thread(
@@ -153,7 +236,12 @@ class RunExecutionManager:
             )
             raise
 
-        active = _ActiveRun(run_id=run_id, thread_id=thread_id)
+        active = _ActiveRun(
+            run_id=run_id,
+            thread_id=thread_id,
+            context_snapshot=context_snapshot,
+            goal_context_revision=goal_context_revision,
+        )
         active.last_sequence = 1
         active.events.put_nowait(started_event)
         # 从注册到 create_task 之间没有 await，取消请求不会观察到半附加状态。
@@ -216,6 +304,33 @@ class RunExecutionManager:
                 if self._goal_evaluation_service is not None
                 else None
             )
+            if goal_revision is not None and active.context_snapshot is not None:
+                if (
+                    active.goal_context_revision is not None
+                    and active.goal_context_revision != goal_revision
+                ):
+                    raise RuntimeError("Goal changed while restoring its context snapshot")
+                self._goal_context_snapshots.setdefault(
+                    active.thread_id,
+                    active.context_snapshot,
+                )
+                serializer = getattr(
+                    self._stream_service,
+                    "serialize_context_snapshot",
+                    None,
+                )
+                saver = getattr(
+                    self._conversation_repository,
+                    "save_goal_context_snapshot",
+                    None,
+                )
+                if callable(serializer) and callable(saver):
+                    await asyncio.to_thread(
+                        saver,
+                        thread_id=active.thread_id,
+                        goal_revision=goal_revision,
+                        snapshot_json=serializer(active.context_snapshot),
+                    )
             goal_budget_tracker = (
                 self._stream_service.create_run_budget_tracker(active.run_id)
                 if goal_revision is not None
@@ -241,6 +356,17 @@ class RunExecutionManager:
             round_human_response = human_input_response
             internal_continuation = initial_internal_continuation
             while True:
+                snapshot_options = (
+                    {
+                        "model_snapshot": active.context_snapshot.model,
+                        "skill_catalog": active.context_snapshot.skill_catalog,
+                        "skill_creation_enabled": (
+                            active.context_snapshot.skill_creation_enabled
+                        ),
+                    }
+                    if active.context_snapshot is not None
+                    else {}
+                )
                 if goal_budget_tracker is not None:
                     stream = self._stream_service.astream_run_events(
                         round_message,
@@ -250,6 +376,7 @@ class RunExecutionManager:
                         round_human_response,
                         run_budget_tracker=goal_budget_tracker,
                         internal_continuation=internal_continuation,
+                        **snapshot_options,
                     )
                 elif round_human_response is None:
                     stream = self._stream_service.astream_run_events(
@@ -257,6 +384,7 @@ class RunExecutionManager:
                         active.thread_id,
                         active.run_id,
                         round_attachments,
+                        **snapshot_options,
                     )
                 else:
                     stream = self._stream_service.astream_run_events(
@@ -265,6 +393,7 @@ class RunExecutionManager:
                         active.run_id,
                         round_attachments,
                         round_human_response,
+                        **snapshot_options,
                     )
                 held_terminal: RunEvent | None = None
                 async for source_event in stream:
@@ -305,6 +434,8 @@ class RunExecutionManager:
                         expected_revision=goal_revision,
                     )
                     goal_evaluated = True
+                    if evaluation is not None and evaluation["satisfied"]:
+                        await self._release_goal_context(active.thread_id)
                     if evaluation is not None and held_terminal.event == "run_completed":
                         finish_reason = held_terminal.payload.get("finish_reason")
                         decision = (
@@ -446,12 +577,14 @@ class RunExecutionManager:
                 and active.abort_reason not in _GOAL_CONTROL_ABORT_REASONS
             ):
                 try:
-                    await self._goal_evaluation_service.evaluate_run(
+                    evaluation = await self._goal_evaluation_service.evaluate_run(
                         thread_id=active.thread_id,
                         run_id=active.run_id,
                         terminal_event=terminal_event,
                         expected_revision=goal_revision,
                     )
+                    if evaluation is not None and evaluation["satisfied"]:
+                        await self._release_goal_context(active.thread_id)
                 except Exception as exc:
                     logger.error(
                         "Goal evaluation failed after Run terminal: error_type=%s",
@@ -490,12 +623,14 @@ class RunExecutionManager:
             )
             if not await self._persist_and_publish(active, evaluating_event):
                 return True
-            await self._goal_evaluation_service.evaluate_run(
+            evaluation = await self._goal_evaluation_service.evaluate_run(
                 thread_id=active.thread_id,
                 run_id=active.run_id,
                 terminal_event=terminal_event,
                 expected_revision=goal_revision,
             )
+            if evaluation is not None and evaluation["satisfied"]:
+                await self._release_goal_context(active.thread_id)
             updated_event = RunEvent(
                 event="goal_status",
                 run_id=active.run_id,
@@ -718,8 +853,27 @@ class RunExecutionManager:
             None,
         )
         if active is None:
+            if reason in _GOAL_CONTROL_ABORT_REASONS:
+                await self._release_goal_context(thread_id)
             return CancelOutcome.not_active
+        if reason in _GOAL_CONTROL_ABORT_REASONS:
+            await self._release_goal_context(thread_id)
         return await self.cancel_run(thread_id, active.run_id, reason=reason)
+
+    async def _release_goal_context(self, thread_id: str) -> None:
+        """同时释放进程内和 SQLite 中的 Goal 冻结上下文。"""
+        self._goal_context_snapshots.pop(thread_id, None)
+        deleter = getattr(
+            self._conversation_repository,
+            "delete_goal_context_snapshot",
+            None,
+        )
+        if callable(deleter):
+            await asyncio.to_thread(deleter, thread_id)
+
+    async def release_goal_context(self, thread_id: str) -> None:
+        """供空闲 Thread 的 Goal 控制面显式释放持久快照。"""
+        await self._release_goal_context(thread_id)
 
     async def _subscribe(self, active: _ActiveRun) -> AsyncIterator[RunEvent]:
         """订阅一个 Run；浏览器断开时复用同一取消状态机。"""

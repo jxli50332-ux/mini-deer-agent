@@ -25,6 +25,7 @@ export interface ChatStreamRequest {
   readonly humanInputResponse?: HumanInputResponse;
   readonly benchmarkCaseId?: string;
   readonly goalResumeRevision?: string;
+  readonly skillInstallAuthorizationToken?: string;
   readonly signal?: AbortSignal;
   readonly onRunId?: (runId: string) => void;
 }
@@ -55,6 +56,10 @@ export interface ChatRunDetail {
   readonly outputTokens?: number | null;
   readonly totalTokens?: number | null;
   readonly modelCalls?: number | null;
+  readonly modelProfile?: string | null;
+  readonly modelProfileRevision?: string | null;
+  readonly modelSelectionRevision?: number | null;
+  readonly skillCatalogHash?: string | null;
 }
 
 export type ChatRunReconciler = (
@@ -142,6 +147,7 @@ function validateRequest(request: ChatStreamRequest): {
   readonly humanInputResponse: HumanInputResponse | null;
   readonly benchmarkCaseId: string | null;
   readonly goalResumeRevision: string | null;
+  readonly skillInstallAuthorizationToken: string | null;
 } {
   const threadId = request.threadId.trim().toLowerCase();
   if (!UUID_PATTERN.test(threadId)) {
@@ -209,15 +215,28 @@ function validateRequest(request: ChatStreamRequest): {
       { retryable: false },
     );
   }
+  const skillInstallAuthorizationToken =
+    request.skillInstallAuthorizationToken?.trim().toLowerCase() ?? null;
+  if (
+    skillInstallAuthorizationToken !== null &&
+    !/^[a-f0-9]{32}$/.test(skillInstallAuthorizationToken)
+  ) {
+    throw new ChatStreamClientError(
+      "invalid_request",
+      "skillInstallAuthorizationToken 格式无效",
+      { retryable: false },
+    );
+  }
   if (
     goalResumeRevision !== null &&
     (attachments.length > 0 ||
       humanInputResponse !== null ||
-      benchmarkCaseId !== null)
+      benchmarkCaseId !== null ||
+      skillInstallAuthorizationToken !== null)
   ) {
     throw new ChatStreamClientError(
       "invalid_request",
-      "恢复 Goal 时不能同时提交附件、澄清回答或基准任务",
+      "恢复 Goal 时不能同时提交附件、澄清回答、基准任务或 Skill 安装授权",
       { retryable: false },
     );
   }
@@ -229,6 +248,7 @@ function validateRequest(request: ChatStreamRequest): {
     humanInputResponse,
     benchmarkCaseId,
     goalResumeRevision,
+    skillInstallAuthorizationToken,
   };
 }
 
@@ -373,6 +393,25 @@ export function parseChatRunDetail(
     ...(value.model_calls === undefined
       ? {}
       : { modelCalls: optionalNullableInteger(value, "model_calls") }),
+    ...(value.model_profile === undefined
+      ? {}
+      : { modelProfile: nullableString(value, "model_profile") }),
+    ...(value.model_profile_revision === undefined
+      ? {}
+      : {
+          modelProfileRevision: nullableString(value, "model_profile_revision"),
+        }),
+    ...(value.model_selection_revision === undefined
+      ? {}
+      : {
+          modelSelectionRevision: optionalNullableInteger(
+            value,
+            "model_selection_revision",
+          ),
+        }),
+    ...(value.skill_catalog_hash === undefined
+      ? {}
+      : { skillCatalogHash: nullableString(value, "skill_catalog_hash") }),
   };
 }
 
@@ -743,6 +782,12 @@ export async function* streamChatRun(
               ...(validated.benchmarkCaseId === null
                 ? {}
                 : { benchmark_case_id: validated.benchmarkCaseId }),
+              ...(validated.skillInstallAuthorizationToken === null
+                ? {}
+                : {
+                    skill_install_authorization_token:
+                      validated.skillInstallAuthorizationToken,
+                  }),
             }
           : {
               message_id: validated.messageId,

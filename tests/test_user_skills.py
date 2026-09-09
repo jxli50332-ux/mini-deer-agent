@@ -130,6 +130,40 @@ def test_user_skill_install_enable_resource_projection_and_restart(
     assert restarted.catalog().get("custom-review") is None
 
 
+def test_skill_http_list_unifies_builtin_and_user_metadata(tmp_path: Path) -> None:
+    builtin_root = tmp_path / "builtin"
+    _write_skill(builtin_root, name="structured-explainer")
+    manager = UserSkillManager(
+        tmp_path / "managed-skills",
+        builtin_root=builtin_root,
+    )
+    manager.install(_write_skill(tmp_path / "source"), enabled=False)
+    app = FastAPI()
+    app.state.user_skill_manager = manager
+    app.include_router(skills_router.router)
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/skills")
+
+    assert response.status_code == 200
+    records = {item["name"]: item for item in response.json()["skills"]}
+    assert records["structured-explainer"] == {
+        "name": "structured-explainer",
+        "description": "使用本地检查清单审阅代码。",
+        "source": "builtin",
+        "enabled": True,
+        "editable": False,
+        "allowed_tools": ["read_file"],
+        "resource_paths": ["references/checklist.md"],
+        "resource_count": 1,
+        "modified_at": records["structured-explainer"]["modified_at"],
+        "check_status": "valid",
+    }
+    assert records["custom-review"]["source"] == "user"
+    assert records["custom-review"]["editable"] is True
+    assert records["custom-review"]["enabled"] is False
+
+
 def test_user_skill_accepts_windows_utf8_bom(tmp_path: Path) -> None:
     """PowerShell 写出的带 BOM UTF-8 技能和参考文件仍应正常安装。"""
     manager = _manager(tmp_path)
@@ -278,7 +312,7 @@ def test_user_skill_http_install_list_and_disable(tmp_path: Path) -> None:
     with TestClient(app) as client:
         installed = client.post(
             "/api/v1/skills/install",
-            json={"source_path": str(source), "enabled": True},
+            json={"source_path": str(source), "enabled": True, "revision": 0},
         )
         assert installed.status_code == 201
         assert installed.json()["resource_paths"] == ["references/checklist.md"]
@@ -286,7 +320,32 @@ def test_user_skill_http_install_list_and_disable(tmp_path: Path) -> None:
 
         disabled = client.patch(
             "/api/v1/skills/custom-review",
-            json={"enabled": False},
+            json={"enabled": False, "revision": 1},
         )
         assert disabled.status_code == 200
         assert disabled.json()["enabled"] is False
+
+
+def test_market_origin_failure_rolls_back_package_and_settings_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    source = _write_skill(tmp_path / "source")
+
+    def fail_origin(_origins: object) -> None:
+        raise OSError("simulated origin persistence failure")
+
+    monkeypatch.setattr(manager, "_write_market_origins", fail_origin)
+    with pytest.raises(OSError, match="origin persistence"):
+        manager.install(
+            source,
+            market_origin={
+                "provider": "clawhub",
+                "remote_id": "publisher/custom-review",
+                "version": "1.0.0",
+            },
+        )
+
+    assert not (manager.root / "custom-review").exists()
+    assert manager.revision == 0

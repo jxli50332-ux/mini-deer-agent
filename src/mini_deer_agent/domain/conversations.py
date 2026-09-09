@@ -70,6 +70,10 @@ class RunRecord:
     output_tokens: int | None
     total_tokens: int | None
     model_calls: int | None
+    model_profile: str | None = None
+    model_profile_revision: str | None = None
+    model_selection_revision: int | None = None
+    skill_catalog_hash: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

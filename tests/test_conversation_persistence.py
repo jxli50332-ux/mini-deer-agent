@@ -659,6 +659,8 @@ def test_repository_lists_recent_threads_with_stable_order_and_limit(
                 (12,),
                 (13,),
                 (14,),
+                (15,),
+                (16,),
             ]
     assert any("idx_threads_recent" in str(row) for row in query_plan)
 

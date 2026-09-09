@@ -107,6 +107,21 @@ class ConversationRepository(MemoryStore, Protocol):
     ) -> ConversationHistoryPage:
         """返回一页按时间正序排列的可见历史。"""
 
+    def save_goal_context_snapshot(
+        self,
+        *,
+        thread_id: str,
+        goal_revision: str,
+        snapshot_json: str,
+    ) -> None:
+        """保存当前 Goal 首次 Run 冻结的非敏感执行上下文。"""
+
+    def get_goal_context_snapshot(self, thread_id: str) -> tuple[str, str] | None:
+        """返回 (goal_revision, snapshot_json)，不存在时返回 None。"""
+
+    def delete_goal_context_snapshot(self, thread_id: str) -> None:
+        """在 Goal 完成、清除、替换或停止时释放冻结上下文。"""
+
 
 class ConversationHistoryService:
     """封装 Thread、Run、标题与消息历史应用用例。"""

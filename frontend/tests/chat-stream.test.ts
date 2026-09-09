@@ -18,6 +18,7 @@ const OTHER_RUN_ID = "33333333-3333-4333-8333-333333333333";
 const THREAD_ID = "22222222-2222-4222-8222-222222222222";
 const MESSAGE_ID = "44444444-4444-4444-8444-444444444444";
 const GOAL_REVISION = "55555555-5555-4555-8555-555555555555";
+const SKILL_AUTHORIZATION_TOKEN = "a".repeat(32);
 
 function byteStream(chunks: readonly string[]): ReadableStream<Uint8Array> {
   return new ReadableStream({
@@ -164,6 +165,7 @@ describe("POST SSE chat client", () => {
           value: "北京",
         },
         benchmarkCaseId: "simple-qa",
+        skillInstallAuthorizationToken: SKILL_AUTHORIZATION_TOKEN,
         onRunId: (runId) => observedRunIds.push(runId),
       },
       { fetcher },
@@ -196,6 +198,7 @@ describe("POST SSE chat client", () => {
           value: "北京",
         },
         benchmark_case_id: "simple-qa",
+        skill_install_authorization_token: SKILL_AUTHORIZATION_TOKEN,
       }),
     });
     expect(new Headers(init?.headers).get("accept")).toBe("text/event-stream");

@@ -86,6 +86,9 @@ class GoalEvaluationState(TypedDict):
     reason: str
     evidence_summary: str
     evaluated_at: str
+    model_profile: NotRequired[str | None]
+    model_profile_revision: NotRequired[str | None]
+    model_selection_revision: NotRequired[int | None]
 
 
 class GoalState(TypedDict):
