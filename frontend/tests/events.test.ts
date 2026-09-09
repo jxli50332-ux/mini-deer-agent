@@ -145,6 +145,50 @@ describe("v1 ChatRunEvent 校验器", () => {
     expect(event.messageId).toBe("message-ai-1");
   });
 
+  it("解码 Goal 评估阶段事件并拒绝未知阶段", () => {
+    const event = decodeChatRunEvent(
+      runFrame("goal_status", 2, { phase: "evaluating" }),
+    );
+    expect(event).toMatchObject({
+      event: "goal_status",
+      messageId: null,
+      payload: { phase: "evaluating" },
+    });
+    expect(() =>
+      decodeChatRunEvent(runFrame("goal_status", 2, { phase: "guessing" })),
+    ).toThrowError(expect.objectContaining({ code: "invalid_payload" }));
+  });
+
+  it("校验并公开统一工具结果元数据", () => {
+    const event = decodeChatRunEvent(
+      runFrame(
+        "tool_result",
+        4,
+        {
+          tool_call_id: "call-search-1",
+          name: "web_search",
+          content: "[]",
+          result_meta: {
+            status: "no_results",
+            recoverable_by_model: true,
+            recommended_next_action: "rewrite_parameters",
+            error_summary: null,
+          },
+        },
+        { messageId: "message-tool-1" },
+      ),
+    );
+
+    expect(event.payload).toMatchObject({
+      resultMeta: {
+        status: "no_results",
+        recoverableByModel: true,
+        recommendedNextAction: "rewrite_parameters",
+        errorSummary: null,
+      },
+    });
+  });
+
   it("拒绝无法解析的 JSON，且错误中不复制原始数据", () => {
     const secret = "sk-sensitive-value";
     const decode = () =>

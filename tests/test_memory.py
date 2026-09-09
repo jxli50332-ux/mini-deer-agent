@@ -333,7 +333,7 @@ def test_prompt_enables_explicit_memory_without_silent_writes() -> None:
     )
     content = str(prompt.system_message.content)
 
-    assert prompt.version == "mini-deer-agent/system/v38"
+    assert prompt.version == "mini-deer-agent/system/v47"
     assert "<memory_policy>" in content
     assert "跨 Thread" in content
     assert "明确要求" in content

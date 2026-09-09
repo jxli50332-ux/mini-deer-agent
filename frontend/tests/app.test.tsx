@@ -16,6 +16,7 @@ import {
 import type { ChatRunEvent } from "@/features/chat/model/events";
 import type { ChatStreamRunner } from "@/features/chat/model/use-chat-run";
 import { ChatPage } from "@/features/chat/ui/ChatPage";
+import type { ThreadGoal } from "@/features/goals/api/thread-goal";
 import type { ThreadHistoryPageLoader } from "@/features/threads/api/thread-history";
 import type {
   ThreadDeleter,
@@ -239,6 +240,84 @@ describe("Mini Deer Agent 实时聊天页", () => {
     expect(screen.queryByText("北京 24°C")).not.toBeInTheDocument();
     expect(screen.getByText("北京当前天气为 24°C。")).toBeInTheDocument();
     expect(textbox).toBeEnabled();
+  });
+
+  it("运行中停止 Goal 时同时停止续跑状态和当前 Run", async () => {
+    let releaseRun: (() => void) | undefined;
+    const runGate = new Promise<void>((resolve) => {
+      releaseRun = resolve;
+    });
+    const runner = vi.fn<ChatStreamRunner>(async function* () {
+      yield {
+        ...baseEvent(1),
+        event: "run_started",
+        messageId: null,
+        payload: { createdAt: "2026-09-08T02:00:00Z" },
+      } satisfies ChatRunEvent;
+      await runGate;
+      yield {
+        ...baseEvent(2),
+        event: "run_interrupted",
+        messageId: null,
+        payload: { reason: "user_cancelled" },
+      } satisfies ChatRunEvent;
+    });
+    const activeGoal: ThreadGoal = {
+      version: 1,
+      revision: "77777777-7777-4777-8777-777777777777",
+      objective: "完成当前修复",
+      continuationCount: 1,
+      maxContinuations: 6,
+      noProgressCount: 0,
+      lastEvaluation: null,
+      status: "active",
+      stopReason: null,
+      createdAt: "2026-09-08T01:00:00Z",
+      updatedAt: "2026-09-08T01:00:00Z",
+    };
+    let currentGoal = activeGoal;
+    const goalStopper = vi.fn(() => {
+      currentGoal = {
+        ...activeGoal,
+        revision: "88888888-8888-4888-8888-888888888888",
+        status: "stopped" as const,
+        stopReason: "user_stopped",
+      };
+      // 真实 Goal stop API 会在响应前收敛服务端 Run。
+      releaseRun?.();
+      return Promise.resolve(currentGoal);
+    });
+    const cancelRunner = vi.fn(() => {
+      releaseRun?.();
+      return Promise.resolve();
+    });
+    render(
+      <ChatPage
+        streamRunner={runner}
+        cancelRunner={cancelRunner}
+        currentThreadRepository={fixedThreadRepository()}
+        createMessageId={() => MESSAGE_ID}
+        goalLoader={() => Promise.resolve(currentGoal)}
+        goalStopper={goalStopper}
+      />,
+    );
+
+    expect(await screen.findByText("完成当前修复")).toBeVisible();
+    fireEvent.change(screen.getByRole("textbox", { name: "向 Agent 提问" }), {
+      target: { value: "开始执行" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await screen.findByRole("status", { name: "正在生成" });
+    fireEvent.click(screen.getByRole("button", { name: "停止执行与续跑" }));
+
+    await waitFor(() => {
+      expect(goalStopper).toHaveBeenCalledExactlyOnceWith({
+        threadId: THREAD_ID,
+        revision: activeGoal.revision,
+      });
+      expect(cancelRunner).not.toHaveBeenCalled();
+    });
+    expect(await screen.findByText("用户已停止")).toBeVisible();
   });
 
   it("Run 结束后用服务端时间定格当前轮次耗时", async () => {
@@ -620,7 +699,10 @@ describe("Mini Deer Agent 实时聊天页", () => {
     );
 
     fireEvent.click(
-      await screen.findByRole("button", { name: "重命名会话 原始标题" }),
+      await screen.findByRole("button", { name: "会话操作 原始标题" }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "重命名会话 原始标题" }),
     );
     const titleInput = screen.getByRole("textbox", { name: "会话标题" });
     fireEvent.change(titleInput, { target: { value: "新的会话标题" } });
@@ -689,6 +771,9 @@ describe("Mini Deer Agent 实时聊天页", () => {
 
     expect(await screen.findByText("删除前的历史")).toBeInTheDocument();
     fireEvent.click(
+      screen.getByRole("button", { name: "会话操作 准备删除的会话" }),
+    );
+    fireEvent.click(
       screen.getByRole("button", { name: "删除会话 准备删除的会话" }),
     );
     expect(screen.getByText("此操作不可撤销")).toBeInTheDocument();
@@ -700,9 +785,7 @@ describe("Mini Deer Agent 实时聊天页", () => {
       expect(createNewCurrentThreadId).toHaveBeenCalledOnce(),
     );
     expect(threadDeleter).toHaveBeenCalledWith({ threadId: THREAD_ID });
-    expect(
-      screen.getByTitle(`thread_id: ${NEXT_THREAD_ID}`),
-    ).toBeInTheDocument();
+    expect(screen.getByText("新对话")).toBeInTheDocument();
     expect(await screen.findByLabelText("开始新对话")).toBeInTheDocument();
     expect(screen.queryByText("删除前的历史")).not.toBeInTheDocument();
     expect(
@@ -733,8 +816,11 @@ describe("Mini Deer Agent 实时聊天页", () => {
 
     fireEvent.click(
       await screen.findByRole("button", {
-        name: "删除会话 不能删除的会话",
+        name: "会话操作 不能删除的会话",
       }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "删除会话 不能删除的会话" }),
     );
     fireEvent.click(
       screen.getByRole("button", { name: "确认删除 不能删除的会话" }),

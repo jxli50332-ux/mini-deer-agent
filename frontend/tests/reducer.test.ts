@@ -125,6 +125,15 @@ function completed(sequence: number): ChatRunEvent {
   };
 }
 
+function goalStatus(sequence: number): ChatRunEvent {
+  return {
+    ...baseEvent(sequence),
+    event: "goal_status",
+    messageId: null,
+    payload: { phase: "evaluating" },
+  };
+}
+
 function receive(state: ChatRunState, event: ChatRunEvent): ChatRunState {
   return chatRunReducer(state, { type: "run/event-received", event });
 }
@@ -178,6 +187,15 @@ describe("Chat run reducer", () => {
     expect(state.lastSequence).toBe(3);
   });
 
+  it("Goal 状态事件推进序号但不污染对话时间线", () => {
+    let state = receive(requestRun(), started());
+    state = receive(state, goalStatus(2));
+
+    expect(state.phase).toBe("streaming");
+    expect(state.lastSequence).toBe(2);
+    expect(state.timeline).toHaveLength(1);
+  });
+
   it("把 reasoning delta 与最终回答合并到同一条 assistant 消息", () => {
     let state = receive(requestRun(), started());
     state = receive(state, reasoningDelta(2, "先分析。"));
@@ -219,6 +237,33 @@ describe("Chat run reducer", () => {
       result: "北京 24°C",
       status: "completed",
     });
+  });
+
+  it("把可重试和终止工具错误显示为失败工具卡，而不是 Run 网络失败", () => {
+    let state = receive(requestRun(), started());
+    state = receive(state, toolCall(2, "{}", "web_search"));
+    state = receive(state, {
+      ...baseEvent(3),
+      event: "tool_result",
+      messageId: "tool-message-error",
+      payload: {
+        toolCallId: "call-weather-1",
+        name: "web_search",
+        content: '{"kind":"tool_error"}',
+        resultMeta: {
+          status: "retryable_error",
+          recoverableByModel: true,
+          recommendedNextAction: "try_alternative",
+          errorSummary: "暂时不可用",
+        },
+      },
+    });
+
+    expect(state.timeline.at(-1)).toMatchObject({
+      kind: "tool",
+      status: "failed",
+    });
+    expect(state.phase).toBe("streaming");
   });
 
   it("并发 task 使用各自 toolCallId 独立收敛，不会覆盖兄弟工具卡", () => {

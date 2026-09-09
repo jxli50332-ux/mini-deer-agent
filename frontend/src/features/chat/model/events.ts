@@ -23,6 +23,19 @@ export interface ToolResultPayload {
   readonly toolCallId: string;
   readonly name: string | null;
   readonly content: string;
+  readonly resultMeta?: ToolResultMeta | null;
+}
+
+export interface ToolResultMeta {
+  readonly status:
+    | "success"
+    | "no_results"
+    | "partial_success"
+    | "retryable_error"
+    | "terminal_error";
+  readonly recoverableByModel: boolean;
+  readonly recommendedNextAction: string;
+  readonly errorSummary: string | null;
 }
 
 export interface RunErrorPayload {
@@ -33,10 +46,18 @@ export interface RunErrorPayload {
 
 export interface RunCompletedPayload {
   readonly finishReason: string;
+  readonly inputTokens?: number;
+  readonly outputTokens?: number;
+  readonly totalTokens?: number;
+  readonly modelCalls?: number;
 }
 
 export interface RunInterruptedPayload {
   readonly reason: string;
+}
+
+export interface GoalStatusPayload {
+  readonly phase: "evaluating" | "updated" | "evaluation_failed";
 }
 
 interface ChatRunEventBase<TEvent extends string, TPayload> {
@@ -72,6 +93,10 @@ export type RunInterruptedEvent = ChatRunEventBase<
   "run_interrupted",
   RunInterruptedPayload
 >;
+export type GoalStatusEvent = ChatRunEventBase<
+  "goal_status",
+  GoalStatusPayload
+>;
 export type RunCompletedEvent = ChatRunEventBase<
   "run_completed",
   RunCompletedPayload
@@ -84,6 +109,7 @@ export type ChatRunEvent =
   | ReasoningDeltaEvent
   | ToolCallDeltaEvent
   | ToolResultEvent
+  | GoalStatusEvent
   | RunErrorEvent
   | RunInterruptedEvent
   | RunCompletedEvent;
@@ -203,6 +229,43 @@ function requireIsoDateTime(record: UnknownRecord, field: string): string {
   return value;
 }
 
+function parseToolResultMeta(value: unknown): ToolResultMeta | null {
+  if (value === undefined || value === null) return null;
+  const meta = requireRecord(value, "result_meta", "invalid_payload");
+  const status = requireString(meta, "status", "invalid_payload");
+  if (
+    status !== "success" &&
+    status !== "no_results" &&
+    status !== "partial_success" &&
+    status !== "retryable_error" &&
+    status !== "terminal_error"
+  ) {
+    fail("invalid_payload", "result_meta.status 不受支持");
+  }
+  const errorSummary = meta.error_summary;
+  if (
+    errorSummary !== null &&
+    errorSummary !== undefined &&
+    typeof errorSummary !== "string"
+  ) {
+    fail("invalid_payload", "result_meta.error_summary 必须是字符串或 null");
+  }
+  return {
+    status,
+    recoverableByModel: requireBoolean(
+      meta,
+      "recoverable_by_model",
+      "invalid_payload",
+    ),
+    recommendedNextAction: requireString(
+      meta,
+      "recommended_next_action",
+      "invalid_payload",
+    ),
+    errorSummary: errorSummary ?? null,
+  };
+}
+
 function isRunEventName(value: string): value is ChatRunEvent["event"] {
   return (
     value === "run_started" ||
@@ -210,6 +273,7 @@ function isRunEventName(value: string): value is ChatRunEvent["event"] {
     value === "reasoning_delta" ||
     value === "tool_call_delta" ||
     value === "tool_result" ||
+    value === "goal_status" ||
     value === "run_error" ||
     value === "run_interrupted" ||
     value === "run_completed"
@@ -315,7 +379,8 @@ export function decodeChatRunEvent(frame: SseFrame): ChatRunEvent {
           index: requireInteger(payload, "index", "invalid_payload", 0),
         },
       };
-    case "tool_result":
+    case "tool_result": {
+      const resultMeta = parseToolResultMeta(payload.result_meta);
       return {
         ...base,
         event: frame.event,
@@ -323,8 +388,26 @@ export function decodeChatRunEvent(frame: SseFrame): ChatRunEvent {
           toolCallId: requireString(payload, "tool_call_id", "invalid_payload"),
           name: requireNullableString(payload, "name", "invalid_payload"),
           content: requireString(payload, "content", "invalid_payload", true),
+          ...(resultMeta === null ? {} : { resultMeta }),
         },
       };
+    }
+    case "goal_status": {
+      requireNoMessageId(frame.event, messageId);
+      const phase = requireString(payload, "phase", "invalid_payload");
+      if (
+        phase !== "evaluating" &&
+        phase !== "updated" &&
+        phase !== "evaluation_failed"
+      ) {
+        fail("invalid_payload", "goal_status.phase 不受支持");
+      }
+      return {
+        ...base,
+        event: frame.event,
+        payload: { phase },
+      };
+    }
     case "run_error":
       requireNoMessageId(frame.event, messageId);
       return {
@@ -356,6 +439,46 @@ export function decodeChatRunEvent(frame: SseFrame): ChatRunEvent {
             "finish_reason",
             "invalid_payload",
           ),
+          ...(payload.input_tokens === undefined
+            ? {}
+            : {
+                inputTokens: requireInteger(
+                  payload,
+                  "input_tokens",
+                  "invalid_payload",
+                  0,
+                ),
+              }),
+          ...(payload.output_tokens === undefined
+            ? {}
+            : {
+                outputTokens: requireInteger(
+                  payload,
+                  "output_tokens",
+                  "invalid_payload",
+                  0,
+                ),
+              }),
+          ...(payload.total_tokens === undefined
+            ? {}
+            : {
+                totalTokens: requireInteger(
+                  payload,
+                  "total_tokens",
+                  "invalid_payload",
+                  0,
+                ),
+              }),
+          ...(payload.model_calls === undefined
+            ? {}
+            : {
+                modelCalls: requireInteger(
+                  payload,
+                  "model_calls",
+                  "invalid_payload",
+                  0,
+                ),
+              }),
         },
       };
   }

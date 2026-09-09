@@ -381,7 +381,7 @@ describe("useChatRun", () => {
     });
   });
 
-  it("Run 在核对预算后仍活动时保留原始连接错误", async () => {
+  it("Run 在核对后仍活动时主动取消并再次收敛服务端终态", async () => {
     const runner: ChatStreamRunner = async function* () {
       await Promise.resolve();
       yield started();
@@ -391,25 +391,65 @@ describe("useChatRun", () => {
         { retryable: true },
       );
     };
+    const cancelRunner = vi.fn(() => Promise.resolve());
+    const runReconciler = vi
+      .fn()
+      .mockResolvedValueOnce(persistedRun("running"))
+      .mockResolvedValueOnce(
+        persistedRun("interrupted", {
+          finishReason: "client_disconnected",
+        }),
+      );
     const { result } = renderHook(() =>
       useChatRun({
         threadId: THREAD_ID,
         streamRunner: runner,
-        runReconciler: () => Promise.resolve(persistedRun("running")),
+        cancelRunner,
+        runReconciler,
       }),
     );
 
     await act(async () => {
-      expect(await result.current.submit("仍在执行")).toBe(false);
+      expect(await result.current.submit("仍在执行")).toBe(true);
     });
 
+    expect(cancelRunner).toHaveBeenCalledExactlyOnceWith({
+      threadId: THREAD_ID,
+      runId: RUN_ID,
+    });
+    expect(runReconciler).toHaveBeenCalledTimes(2);
     expect(result.current.state).toMatchObject({
-      phase: "failed",
-      error: {
-        source: "client",
-        code: "network_error",
-        retryable: true,
-      },
+      phase: "cancelled",
+      finishReason: "client_disconnected",
+      error: null,
+    });
+  });
+
+  it("服务端拒绝并发 Run 时回滚未落库的 optimistic 用户消息", async () => {
+    const runner: ChatStreamRunner = async function* () {
+      await Promise.resolve();
+      throw new ChatStreamClientError(
+        "run_conflict",
+        "当前会话已有 Run 正在执行",
+        { retryable: true },
+      );
+    };
+    const { result } = renderHook(() =>
+      useChatRun({
+        threadId: THREAD_ID,
+        streamRunner: runner,
+        createMessageId: () => "optimistic-conflict-message",
+      }),
+    );
+
+    await act(async () => {
+      expect(await result.current.submit("不应残留")).toBe(false);
+    });
+
+    expect(result.current.state.timeline).toEqual([]);
+    expect(result.current.state.error).toMatchObject({
+      code: "run_conflict",
+      source: "client",
     });
   });
 

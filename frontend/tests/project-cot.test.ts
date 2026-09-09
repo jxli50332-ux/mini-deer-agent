@@ -551,3 +551,119 @@ it("删除文件显示被删除的路径", () => {
     }),
   );
 });
+
+it("task 投影 Agent 名称、生命周期、耗时、Token 和结果摘要", () => {
+  const rawResult = JSON.stringify({
+    version: 1,
+    kind: "subagent_result",
+    status: "completed",
+    subagent_type: "project-reader",
+    description: "定位预算实现",
+    result: "定义位于 run_budget.py，第 126 行创建独立计量视图。",
+    started_at: "2026-09-08T01:00:00Z",
+    finished_at: "2026-09-08T01:00:01Z",
+    duration_ms: 1250,
+    usage: {
+      input_tokens: 500,
+      output_tokens: 100,
+      total_tokens: 600,
+      model_calls: 2,
+    },
+  });
+
+  const steps = projectCotSteps(
+    [
+      {
+        kind: "tool",
+        id: "task-reader",
+        toolCallId: "call-reader",
+        name: "task",
+        input:
+          '{"description":"定位预算实现","subagent_type":"project-reader"}',
+        result: rawResult,
+        status: "completed",
+      },
+    ],
+    null,
+  );
+
+  expect(steps[0]).toEqual(
+    expect.objectContaining({
+      icon: "task",
+      status: "completed",
+      text: "project-reader：定位预算实现",
+      subagent: {
+        name: "project-reader",
+        description: "定位预算实现",
+        status: "completed",
+        durationMs: 1250,
+        stopReason: null,
+        totalTokens: 600,
+        modelCalls: 2,
+        resultSummary: "定义位于 run_budget.py，第 126 行创建独立计量视图。",
+        rawResult,
+      },
+    }),
+  );
+});
+
+it("task 在实时等待、超时和父 Run 取消时显示各自状态", () => {
+  const [running] = projectCotSteps(
+    [
+      {
+        kind: "tool",
+        id: "task-running",
+        toolCallId: "call-running",
+        name: "task",
+        input: '{"subagent_type":"research","description":"调研资料"}',
+        result: null,
+        status: "pending",
+      },
+    ],
+    null,
+  );
+  const [timedOut] = projectCotSteps(
+    [
+      {
+        kind: "tool",
+        id: "task-timeout",
+        toolCallId: "call-timeout",
+        name: "task",
+        input: '{"subagent_type":"research","description":"慢速调研"}',
+        result: JSON.stringify({
+          kind: "subagent_result",
+          status: "timed_out",
+          subagent_type: "research",
+          stop_reason: "timeout",
+          last_result: "已经找到一条来源",
+          duration_ms: 120000,
+          usage: { total_tokens: 900, model_calls: 3 },
+        }),
+        status: "failed",
+      },
+    ],
+    null,
+  );
+  const [cancelled] = projectCotSteps(
+    [
+      {
+        kind: "tool",
+        id: "task-cancelled",
+        toolCallId: "call-cancelled",
+        name: "task",
+        input: '{"subagent_type":"test-runner","description":"运行测试"}',
+        result: null,
+        status: "cancelled",
+      },
+    ],
+    null,
+  );
+
+  expect(running?.subagent?.status).toBe("running");
+  expect(timedOut?.subagent).toMatchObject({
+    status: "timed_out",
+    stopReason: "timeout",
+    resultSummary: "已经找到一条来源",
+  });
+  expect(cancelled?.subagent?.status).toBe("cancelled");
+});

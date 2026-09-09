@@ -17,6 +17,9 @@ export type ConversationRunTimingView =
       readonly kind: "settled";
       readonly durationSeconds: number;
       readonly outcome: "completed" | "failed" | "cancelled";
+      readonly finishReason?: string | null;
+      readonly totalTokens?: number | null;
+      readonly modelCalls?: number | null;
     };
 
 export interface ConversationRunTimingSource {
@@ -31,6 +34,9 @@ export interface ConversationRunTimingSource {
     | "interrupted";
   readonly startedAt: string | null;
   readonly finishedAt: string | null;
+  readonly finishReason?: string | null;
+  readonly totalTokens?: number | null;
+  readonly modelCalls?: number | null;
 }
 
 export interface ConversationTurnView {
@@ -94,6 +100,11 @@ function settledTimingFromRun(
         : run.status === "failed"
           ? "failed"
           : "cancelled",
+    ...(run.finishReason === undefined
+      ? {}
+      : { finishReason: run.finishReason }),
+    ...(run.totalTokens === undefined ? {} : { totalTokens: run.totalTokens }),
+    ...(run.modelCalls === undefined ? {} : { modelCalls: run.modelCalls }),
   };
 }
 

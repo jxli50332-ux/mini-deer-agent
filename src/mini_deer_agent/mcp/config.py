@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 _ENV_REFERENCE = re.compile(r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|(?P<plain>[A-Za-z_][A-Za-z0-9_]*))")
 _SAFE_SERVER_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
+_SAFE_TOOL_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 
 
 class McpConfigurationError(ValueError):
@@ -82,6 +83,10 @@ class McpConfiguration(BaseModel):
         default_factory=dict,
         alias="mcpServers",
     )
+    tool_routing_keywords: dict[str, tuple[str, ...]] = Field(
+        default_factory=dict,
+        alias="toolRoutingKeywords",
+    )
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     @model_validator(mode="after")
@@ -91,6 +96,19 @@ class McpConfiguration(BaseModel):
                 raise ValueError(
                     f"MCP server name {name!r} must match {_SAFE_SERVER_NAME.pattern}"
                 )
+        for name, keywords in self.tool_routing_keywords.items():
+            if _SAFE_TOOL_NAME.fullmatch(name) is None:
+                raise ValueError(f"invalid MCP routing tool name: {name!r}")
+            cleaned = tuple(" ".join(keyword.split()) for keyword in keywords)
+            if not 1 <= len(cleaned) <= 8:
+                raise ValueError(
+                    f"MCP routing keywords for {name!r} must contain 1-8 items"
+                )
+            if any(not keyword or len(keyword) > 64 for keyword in cleaned):
+                raise ValueError(f"invalid MCP routing keyword for {name!r}")
+            if len({keyword.casefold() for keyword in cleaned}) != len(cleaned):
+                raise ValueError(f"duplicate MCP routing keyword for {name!r}")
+            self.tool_routing_keywords[name] = cleaned
         return self
 
 

@@ -30,10 +30,21 @@ from mini_deer_agent.domain.memory import (
     MemoryCategory,
     MemoryFact,
 )
+from mini_deer_agent.domain.benchmarks import (
+    BENCHMARK_CASES,
+    BenchmarkAttempt,
+    BenchmarkCase,
+    BenchmarkScore,
+    require_benchmark_case,
+)
 
 
 __all__ = [
     "ConversationHistoryPage",
+    "BENCHMARK_CASES",
+    "BenchmarkAttempt",
+    "BenchmarkCase",
+    "BenchmarkScore",
     "MAX_TEXT_ATTACHMENT_BYTES",
     "MAX_TEXT_ATTACHMENT_COUNT",
     "MAX_TEXT_ATTACHMENT_FILENAME_LENGTH",
@@ -55,5 +66,6 @@ __all__ = [
     "ToolExecutionHistoryItem",
     "default_thread_title",
     "normalize_thread_title",
+    "require_benchmark_case",
     "validate_text_attachment_batch",
 ]

@@ -5,10 +5,11 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import yaml
 
-from mini_deer_agent.skills.contracts import BuiltInSkill, SkillSummary
+from mini_deer_agent.skills.contracts import BuiltInSkill, SkillResource, SkillSummary
 
 
 SKILL_FILE_NAME = "SKILL.md"
@@ -17,6 +18,9 @@ MAX_SKILL_FILE_BYTES = 32 * 1024
 MAX_SKILL_NAME_LENGTH = 64
 MAX_SKILL_DESCRIPTION_LENGTH = 500
 MAX_TOOL_NAME_LENGTH = 128
+MAX_SKILL_RESOURCE_FILES = 16
+MAX_SKILL_RESOURCE_FILE_BYTES = 64 * 1024
+MAX_SKILL_RESOURCE_TOTAL_BYTES = 128 * 1024
 _SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 _FRONTMATTER_PATTERN = re.compile(
@@ -103,10 +107,95 @@ def _validated_allowed_tools(
     return tuple(allowed_tools)
 
 
-def _parse_skill_file(skill_file: Path, *, directory_name: str) -> BuiltInSkill:
+def _load_skill_resources(skill_dir: Path) -> tuple[SkillResource, ...]:
+    """读取 references 下的 UTF-8 普通文件，并拒绝链接、越界和过大资源。"""
+    resources_root = skill_dir / "references"
+    if not resources_root.exists():
+        return ()
+    if not resources_root.is_dir() or resources_root.is_symlink():
+        raise SkillCatalogError(
+            f"Skill references must be a real directory: {resources_root}"
+        )
+    resolved_root = resources_root.resolve()
+    files = sorted(resources_root.rglob("*"), key=lambda path: path.as_posix())
+    resources: list[SkillResource] = []
+    total_bytes = 0
+    for path in files:
+        if path.is_symlink():
+            raise SkillCatalogError(f"Skill resource must not be a symbolic link: {path}")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise SkillCatalogError(f"Skill resource must be a regular file: {path}")
+        if len(resources) >= MAX_SKILL_RESOURCE_FILES:
+            raise SkillCatalogError(
+                f"Skill resources exceed {MAX_SKILL_RESOURCE_FILES} files: {skill_dir}"
+            )
+        resolved = path.resolve()
+        try:
+            relative = resolved.relative_to(resolved_root)
+        except ValueError as exc:
+            raise SkillCatalogError(f"Skill resource escaped package: {path}") from exc
+        size = resolved.stat().st_size
+        if size > MAX_SKILL_RESOURCE_FILE_BYTES:
+            raise SkillCatalogError(
+                f"Skill resource exceeds {MAX_SKILL_RESOURCE_FILE_BYTES} bytes: {path}"
+            )
+        total_bytes += size
+        if total_bytes > MAX_SKILL_RESOURCE_TOTAL_BYTES:
+            raise SkillCatalogError(
+                f"Skill resources exceed {MAX_SKILL_RESOURCE_TOTAL_BYTES} bytes: {skill_dir}"
+            )
+        try:
+            # Windows PowerShell 5.1 的 UTF-8 输出通常带 BOM；utf-8-sig
+            # 同时兼容有 BOM 和无 BOM 文件，并继续严格拒绝非 UTF-8 字节。
+            content = resolved.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeError) as exc:
+            raise SkillCatalogError(f"Cannot read UTF-8 skill resource: {path}") from exc
+        resources.append(
+            SkillResource(
+                path=f"references/{relative.as_posix()}",
+                content=content,
+            )
+        )
+    return tuple(resources)
+
+
+def load_skill_package(
+    skill_dir: Path,
+    *,
+    source: Literal["builtin", "user"] = "user",
+) -> BuiltInSkill:
+    """校验并读取单个真实目录中的技能包。"""
+    if not skill_dir.exists() or not skill_dir.is_dir() or skill_dir.is_symlink():
+        raise SkillCatalogError(f"Skill package must be a real directory: {skill_dir}")
+    directory_name = _validated_skill_name(
+        skill_dir.name,
+        source_file=skill_dir / SKILL_FILE_NAME,
+    )
+    skill_file = skill_dir / SKILL_FILE_NAME
+    if not skill_file.exists() or not skill_file.is_file() or skill_file.is_symlink():
+        raise SkillCatalogError(f"Skill package requires a real SKILL.md: {skill_file}")
+    return _parse_skill_file(
+        skill_file.resolve(),
+        directory_name=directory_name,
+        source=source,
+        resources=_load_skill_resources(skill_dir),
+    )
+
+
+def _parse_skill_file(
+    skill_file: Path,
+    *,
+    directory_name: str,
+    source: Literal["builtin", "user"] = "builtin",
+    resources: tuple[SkillResource, ...] = (),
+) -> BuiltInSkill:
     """解析一个经过路径收敛的内置技能文件，非法发布资产直接失败。"""
     try:
-        content = skill_file.read_text(encoding="utf-8")
+        # 接受 Windows 常见的 UTF-8 BOM，避免隐藏的 U+FEFF 破坏首行
+        # frontmatter 标记；无 BOM 的标准 UTF-8 读取行为保持不变。
+        content = skill_file.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeError) as exc:
         raise SkillCatalogError(f"Cannot read built-in skill file: {skill_file}") from exc
 
@@ -128,6 +217,12 @@ def _parse_skill_file(skill_file: Path, *, directory_name: str) -> BuiltInSkill:
     if not isinstance(metadata, dict):
         raise SkillCatalogError(
             f"Built-in skill frontmatter must be a mapping: {skill_file}"
+        )
+    unknown_fields = set(metadata) - {"name", "description", "allowed-tools"}
+    if unknown_fields:
+        raise SkillCatalogError(
+            "Unknown skill frontmatter field(s) in "
+            f"{skill_file}: {', '.join(sorted(map(str, unknown_fields)))}"
         )
 
     name = _validated_skill_name(metadata.get("name"), source_file=skill_file)
@@ -154,6 +249,8 @@ def _parse_skill_file(skill_file: Path, *, directory_name: str) -> BuiltInSkill:
         instructions=instructions,
         source_file=skill_file,
         allowed_tools=allowed_tools,
+        resources=resources,
+        source=source,
     )
 
 
@@ -212,6 +309,7 @@ class BuiltInSkillCatalog:
             skill = _parse_skill_file(
                 resolved_file,
                 directory_name=directory_name,
+                resources=_load_skill_resources(skill_dir),
             )
             if skill.name in seen_names:
                 raise SkillCatalogError(

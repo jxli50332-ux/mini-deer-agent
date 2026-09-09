@@ -14,10 +14,12 @@ from mini_deer_agent.skills.catalog import (
     DEFAULT_BUILTIN_SKILLS_ROOT,
     BuiltInSkillCatalog,
     SkillCatalogError,
+    load_skill_package,
 )
 from mini_deer_agent.skills.contracts import (
     BuiltInSkill,
     SkillActivationProjection,
+    SkillResource,
     SkillSummary,
     SlashSkillReference,
 )
@@ -28,6 +30,7 @@ from mini_deer_agent.skills.tool_policy import (
     resolve_skill_tool_policy,
     validate_skill_tool_policies,
 )
+from mini_deer_agent.skills.user import UserSkillManager, UserSkillRecord
 
 
 __all__ = [
@@ -36,6 +39,7 @@ __all__ = [
     "BuiltInSkillCatalog",
     "SkillActivationProjection",
     "SkillCatalogError",
+    "SkillResource",
     "SkillSummary",
     "ALWAYS_AVAILABLE_SKILL_TOOL_NAMES",
     "SkillToolPolicyDecision",
@@ -43,9 +47,12 @@ __all__ = [
     "SKILL_ACTIVATION_TOOL_NAME",
     "create_skill_activation_tool",
     "find_automatic_skill_name",
+    "load_skill_package",
     "parse_slash_skill_reference",
     "project_skill_activation",
     "project_skill_tool_policy",
     "resolve_skill_tool_policy",
     "validate_skill_tool_policies",
+    "UserSkillManager",
+    "UserSkillRecord",
 ]

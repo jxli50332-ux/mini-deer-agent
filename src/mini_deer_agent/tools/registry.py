@@ -22,6 +22,7 @@ _DYNAMIC_AGENT_TOOL_NAMES = (
     "read_file",
     "inspect_project_sandbox",
     "run_project_command",
+    "tool_search",
 )
 
 

@@ -61,6 +61,10 @@ class RunResponse(BaseModel):
     finished_at: str | None
     finish_reason: str | None
     error_code: str | None
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)
+    model_calls: int | None = Field(default=None, ge=0)
 
 
 class RunEventResponse(BaseModel):
@@ -75,6 +79,7 @@ class RunEventResponse(BaseModel):
         "ai_delta",
         "tool_call_delta",
         "tool_result",
+        "goal_status",
         "run_error",
         "run_interrupted",
         "run_completed",

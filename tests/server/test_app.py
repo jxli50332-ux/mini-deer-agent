@@ -23,6 +23,11 @@ def test_openapi_exposes_only_versioned_public_contract() -> None:
     documented_paths = set(app.openapi()["paths"])
 
     assert documented_paths == {
+        "/api/v1/benchmarks/cases",
+        "/api/v1/benchmarks/attempts",
+        "/api/v1/benchmarks/attempts/{run_id}",
+            "/api/v1/benchmarks/attempts/{run_id}/score",
+            "/api/v1/benchmarks/regression",
         "/api/v1/health",
         "/api/v1/mcp/status",
         "/api/v1/projects",
@@ -32,8 +37,14 @@ def test_openapi_exposes_only_versioned_public_contract() -> None:
         "/api/v1/projects/{project_id}/directory",
         "/api/v1/projects/{project_id}/file",
         "/api/v1/ready",
+        "/api/v1/skills",
+        "/api/v1/skills/install",
+        "/api/v1/skills/{name}",
         "/api/v1/threads",
         "/api/v1/threads/{thread_id}",
+        "/api/v1/threads/{thread_id}/goal",
+        "/api/v1/threads/{thread_id}/goal/resume",
+        "/api/v1/threads/{thread_id}/goal/stop",
         "/api/v1/threads/{thread_id}/messages",
         "/api/v1/threads/{thread_id}/runs",
         "/api/v1/threads/{thread_id}/runs/{run_id}",
@@ -97,6 +108,7 @@ def test_lifespan_initializes_and_closes_shared_resources_once(
     settings = Settings(
         checkpoint_database_path=database_path,
         application_database_path=tmp_path / "application.sqlite",
+        user_skills_directory=tmp_path / "skills",
         _env_file=None,
     )
     application = create_app(
@@ -121,6 +133,9 @@ def test_lifespan_initializes_and_closes_shared_resources_once(
         assert hasattr(application.state, "conversation_history_service")
         assert hasattr(application.state, "run_event_history_service")
         assert application.state.mcp_runtime.tools == ()
+        assert application.state.user_skill_manager.root == (
+            tmp_path / "skills"
+        ).resolve()
         assert client.get("/api/v1/ready").json() == {"status": "ready"}
         assert client.get("/api/v1/mcp/status").json() == {
             "configured": False,
@@ -141,6 +156,7 @@ def test_lifespan_initializes_and_closes_shared_resources_once(
     assert not hasattr(application.state, "conversation_history_service")
     assert not hasattr(application.state, "run_event_history_service")
     assert not hasattr(application.state, "mcp_runtime")
+    assert not hasattr(application.state, "user_skill_manager")
 
 
 def test_mcp_status_projects_lifespan_runtime_without_secrets(

@@ -20,10 +20,44 @@ from mini_deer_agent.server.schemas.threads import (
     TextAttachmentResponse,
     ToolHistoryItemResponse,
 )
+from mini_deer_agent.server.schemas.benchmarks import (
+    BenchmarkAttemptResponse,
+    BenchmarkCaseResponse,
+    BenchmarkMetricsResponse,
+    BenchmarkReportResponse,
+    BenchmarkRegressionSummaryResponse,
+    BenchmarkScoreRequest,
+    BenchmarkToolStepResponse,
+)
+from mini_deer_agent.server.schemas.skills import (
+    UserSkillEnabledRequest,
+    UserSkillInstallRequest,
+    UserSkillListResponse,
+    UserSkillResponse,
+)
+from mini_deer_agent.server.schemas.goals import (
+    GoalEvaluationResponse,
+    GoalResumeRequest,
+    GoalResponse,
+    GoalRevisionRequest,
+    GoalSetRequest,
+)
 
 
 __all__ = [
     "HistoryItemResponse",
+    "GoalEvaluationResponse",
+    "GoalResumeRequest",
+    "GoalResponse",
+    "GoalRevisionRequest",
+    "GoalSetRequest",
+    "BenchmarkAttemptResponse",
+    "BenchmarkCaseResponse",
+    "BenchmarkMetricsResponse",
+    "BenchmarkReportResponse",
+    "BenchmarkRegressionSummaryResponse",
+    "BenchmarkScoreRequest",
+    "BenchmarkToolStepResponse",
     "LegacyChatStreamRequest",
     "McpServerStatusResponse",
     "McpStatusResponse",
@@ -37,4 +71,8 @@ __all__ = [
     "TextAttachmentRequest",
     "TextAttachmentResponse",
     "ToolHistoryItemResponse",
+    "UserSkillEnabledRequest",
+    "UserSkillInstallRequest",
+    "UserSkillListResponse",
+    "UserSkillResponse",
 ]

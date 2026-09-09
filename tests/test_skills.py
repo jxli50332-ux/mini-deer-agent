@@ -350,7 +350,7 @@ def test_automatic_skill_projection_requires_paired_trusted_tool_result(
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
-        ("/missing-skill 执行任务", "未找到内置技能 `/missing-skill`"),
+        ("/missing-skill 执行任务", "未找到技能 `/missing-skill`"),
         ("/structured-explainer", "请在 `/structured-explainer` 后提供任务内容"),
     ],
 )

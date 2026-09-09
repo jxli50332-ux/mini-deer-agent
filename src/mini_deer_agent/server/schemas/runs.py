@@ -99,6 +99,10 @@ class RunStreamRequest(BaseModel):
         max_length=MAX_TEXT_ATTACHMENT_COUNT,
     )
     human_input_response: HumanInputResponseRequest | None = None
+    benchmark_case_id: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=1, max_length=64),
+    ] | None = None
 
     def to_domain_attachments(self) -> tuple[TextAttachment, ...]:
         """由服务端重新推导附件类型和 UTF-8 字节数。"""
@@ -116,6 +120,10 @@ class RunStreamRequest(BaseModel):
     def validate_attachment_business_rules(self) -> Self:
         """让非法扩展名和按字节超限在启动 Run 前返回 422。"""
         self.to_domain_attachments()
+        if self.benchmark_case_id is not None:
+            from mini_deer_agent.domain import require_benchmark_case
+
+            require_benchmark_case(self.benchmark_case_id)
         return self
 
 

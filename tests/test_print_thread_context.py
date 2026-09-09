@@ -66,7 +66,7 @@ def _create_checkpoint_database(path: Path, thread_id: str) -> None:
                         "id": "task-1",
                         "turn_id": "human-old",
                         "description": "核对资料",
-                        "subagent_type": "general-purpose",
+                        "subagent_type": "research",
                         "status": "completed",
                         "result_brief": "资料已经核对。",
                         "result_sha256": "abc123",

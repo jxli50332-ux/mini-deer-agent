@@ -33,6 +33,16 @@ def test_settings_has_non_sensitive_defaults(monkeypatch: pytest.MonkeyPatch) ->
     assert settings.context_summary_input_tokens == 25_000
     assert settings.mcp_config_path == Path("mcp_servers.json")
     assert settings.mcp_server_init_timeout_seconds == 10.0
+    assert settings.user_skills_directory.name == "skills"
+    assert settings.goal_evaluator_model_name is None
+    assert settings.tool_output_directory.name == "run-outputs"
+    assert settings.tool_output_max_inline_chars == 12_000
+    assert settings.tool_output_sample_chars == 1_200
+    assert settings.tool_output_read_chunk_chars == 8_000
+    assert settings.run_token_soft_limit == 80_000
+    assert settings.run_token_hard_limit == 120_000
+    assert settings.run_model_turn_soft_limit == 16
+    assert settings.run_model_turn_hard_limit == 24
 
 
 def test_environment_variables_override_settings(
@@ -125,3 +135,21 @@ def test_environment_can_override_mcp_runtime_settings(
 
     assert settings.mcp_config_path == Path("config/custom-mcp.json")
     assert settings.mcp_server_init_timeout_seconds == 2.5
+
+
+def test_environment_can_override_tool_output_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "private-run-outputs"
+    monkeypatch.setenv("MINI_DEER_TOOL_OUTPUT_DIRECTORY", str(output_root))
+    monkeypatch.setenv("MINI_DEER_TOOL_OUTPUT_MAX_INLINE_CHARS", "4096")
+    monkeypatch.setenv("MINI_DEER_TOOL_OUTPUT_SAMPLE_CHARS", "256")
+    monkeypatch.setenv("MINI_DEER_TOOL_OUTPUT_READ_CHUNK_CHARS", "2048")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.tool_output_directory == output_root
+    assert settings.tool_output_max_inline_chars == 4096
+    assert settings.tool_output_sample_chars == 256
+    assert settings.tool_output_read_chunk_chars == 2048

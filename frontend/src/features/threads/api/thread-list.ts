@@ -10,6 +10,8 @@ type UnknownRecord = Record<string, unknown>;
 
 export interface ThreadListRequest {
   readonly limit?: number;
+  readonly offset?: number;
+  readonly scope?: "all" | "standalone";
   readonly signal?: AbortSignal;
 }
 
@@ -21,6 +23,11 @@ export type ThreadListFetchLike = (
   input: RequestInfo | URL,
   init?: RequestInit,
 ) => Promise<Response>;
+
+export interface ThreadSummaryRequest {
+  readonly threadId: string;
+  readonly signal?: AbortSignal;
+}
 
 export interface ThreadTitleUpdateRequest {
   readonly threadId: string;
@@ -169,6 +176,8 @@ export async function fetchThreadList(
   options: { readonly fetcher?: ThreadListFetchLike } = {},
 ): Promise<readonly ThreadSummary[]> {
   const limit = request.limit ?? 20;
+  const offset = request.offset ?? 0;
+  const scope = request.scope ?? "all";
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
     throw new ThreadListClientError(
       "invalid_request",
@@ -176,10 +185,21 @@ export async function fetchThreadList(
       false,
     );
   }
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > 1_000_000) {
+    throw new ThreadListClientError(
+      "invalid_request",
+      "会话分页位置无效",
+      false,
+    );
+  }
 
   try {
     const response = await (options.fetcher ?? globalThis.fetch)(
-      `/api/v1/threads?limit=${limit}`,
+      `/api/v1/threads?${new URLSearchParams({
+        limit: String(limit),
+        offset: String(offset),
+        scope,
+      })}`,
       {
         method: "GET",
         headers: { Accept: "application/json" },
@@ -209,6 +229,44 @@ export async function fetchThreadList(
       "无法连接最近会话服务",
       true,
     );
+  }
+}
+
+/** 独立读取当前 Thread 元数据，避免项目归属依赖任意大小的侧栏分页。 */
+export async function fetchThreadSummary(
+  request: ThreadSummaryRequest,
+  options: { readonly fetcher?: ThreadListFetchLike } = {},
+): Promise<ThreadSummary> {
+  const threadId = request.threadId.toLowerCase();
+  if (!UUID_PATTERN.test(threadId)) {
+    throw new ThreadListClientError("invalid_request", "会话 ID 无效", false);
+  }
+  try {
+    const response = await (options.fetcher ?? globalThis.fetch)(
+      `/api/v1/threads/${threadId}`,
+      {
+        method: "GET",
+        headers: { Accept: "application/json" },
+        credentials: "same-origin",
+        cache: "no-store",
+        ...(request.signal === undefined ? {} : { signal: request.signal }),
+      },
+    );
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new ThreadListClientError(
+        "http_error",
+        response.status === 404 ? "这个会话尚未持久化" : "无法读取会话信息",
+        response.status >= 500,
+      );
+    }
+    return parseThreadSummary(await response.json());
+  } catch (error) {
+    if (error instanceof ThreadListClientError) throw error;
+    if (request.signal?.aborted === true || isAbortError(error)) {
+      throw new ThreadListClientError("aborted", "会话查询已取消", false);
+    }
+    throw new ThreadListClientError("network_error", "无法连接会话服务", true);
   }
 }
 

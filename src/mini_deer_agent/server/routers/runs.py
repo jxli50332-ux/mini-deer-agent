@@ -10,14 +10,19 @@ from fastapi.responses import Response, StreamingResponse
 from mini_deer_agent.application import (
     ActiveRunConflictError,
     CancelOutcome,
+    GoalMutationConflictError,
+    GoalNotFoundError,
+    GoalStateService,
     RunExecutionManager,
     RunStreamService,
 )
 from mini_deer_agent.server.dependencies import (
+    get_goal_state_service,
     get_run_execution_manager,
     get_run_stream_service,
 )
 from mini_deer_agent.server.schemas import (
+    GoalResumeRequest,
     LegacyChatStreamRequest,
     RunStreamRequest,
 )
@@ -52,6 +57,17 @@ def _streaming_response(
     )
 
 
+def _goal_resume_failure(code: str, message: str) -> HTTPException:
+    return HTTPException(
+        status_code=(
+            status.HTTP_404_NOT_FOUND
+            if code in {"thread_not_found", "goal_not_found"}
+            else status.HTTP_409_CONFLICT
+        ),
+        detail={"code": code, "message": message},
+    )
+
+
 @router.post("/{thread_id}/runs/stream")
 async def stream_thread_run(
     thread_id: UUID,
@@ -63,12 +79,18 @@ async def stream_thread_run(
 ) -> StreamingResponse:
     """为指定线程启动 run，并返回带版本、ID 和序号的 SSE 事件。"""
     try:
+        benchmark_kwargs = (
+            {"benchmark_case_id": request.benchmark_case_id}
+            if request.benchmark_case_id is not None
+            else {}
+        )
         started_run = await run_manager.start_run(
             request.message,
             str(thread_id),
             str(request.message_id),
             request.to_domain_attachments(),
             request.to_domain_human_input_response(),
+            **benchmark_kwargs,
         )
     except ActiveRunConflictError as exc:
         # 并发 Run 和重复客户端消息 ID 都是稳定冲突，不能作为内部异常泄露。
@@ -79,6 +101,76 @@ async def stream_thread_run(
                 "message": "Thread already has an active run",
             },
         ) from exc
+    return _streaming_response(
+        aiter_run_sse_frames(started_run.events),
+        run_id=started_run.run_id,
+    )
+
+
+@router.post("/{thread_id}/goal/resume", tags=["goals"])
+async def resume_thread_goal(
+    thread_id: UUID,
+    request: GoalResumeRequest,
+    goal_service: Annotated[GoalStateService, Depends(get_goal_state_service)],
+    run_manager: Annotated[
+        RunExecutionManager,
+        Depends(get_run_execution_manager),
+    ],
+) -> StreamingResponse:
+    """显式恢复 Goal，并以隐藏控制消息立即启动新的产品 Run。"""
+    normalized_thread_id = str(thread_id)
+    if goal_service.get_thread(normalized_thread_id) is None:
+        raise _goal_resume_failure("thread_not_found", "Thread does not exist")
+    try:
+        previous_goal = await goal_service.require_current_revision(
+            normalized_thread_id,
+            str(request.revision),
+        )
+        goal = await goal_service.resume_goal(
+            normalized_thread_id,
+            expected_revision=str(request.revision),
+        )
+    except GoalNotFoundError as exc:
+        raise _goal_resume_failure("goal_not_found", "Goal does not exist") from exc
+    except LookupError as exc:
+        raise _goal_resume_failure("thread_not_found", "Thread does not exist") from exc
+    except GoalMutationConflictError as exc:
+        raise _goal_resume_failure(
+            "goal_conflict", "Goal changed before it could be resumed"
+        ) from exc
+
+    continuation_message = (
+        "[Goal continuation] 用户通过 Goal 控制栏明确要求恢复并继续执行。"
+        f"继续完成线程目标：{goal['objective']}\n"
+        "这是 Runtime 控制消息，不是新的用户对话内容。"
+    )
+    try:
+        started_run = await run_manager.start_run(
+            continuation_message,
+            normalized_thread_id,
+            str(request.message_id),
+            internal_continuation=True,
+        )
+    except ActiveRunConflictError as exc:
+        await goal_service.restore_after_failed_resume(
+            normalized_thread_id,
+            failed_revision=goal["revision"],
+            previous_goal=previous_goal,
+        )
+        raise _goal_resume_failure(
+            "run_conflict", "Thread already has an active run"
+        ) from exc
+    except BaseException:
+        # Goal 和 Run 位于两个存储。启动在写入 Goal 后失败时，仅在 Thread
+        # 仍空闲且 revision 未被后续操作替换的情况下恢复原状态。
+        thread = goal_service.get_thread(normalized_thread_id)
+        if thread is None or thread.status != "busy":
+            await goal_service.restore_after_failed_resume(
+                normalized_thread_id,
+                failed_revision=goal["revision"],
+                previous_goal=previous_goal,
+            )
+        raise
     return _streaming_response(
         aiter_run_sse_frames(started_run.events),
         run_id=started_run.run_id,

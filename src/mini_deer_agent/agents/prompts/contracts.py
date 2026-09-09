@@ -6,6 +6,7 @@ from typing import Literal, Protocol
 from langchain_core.messages import SystemMessage
 
 from mini_deer_agent.skills import SkillSummary
+from mini_deer_agent.deferred_tools import DeferredToolSummary
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,6 +16,7 @@ class AgentPromptContext:
     agent_name: str = "Mini Deer Agent"
     available_tool_names: tuple[str, ...] = ()
     available_skills: tuple[SkillSummary, ...] = ()
+    deferred_tools: tuple[DeferredToolSummary, ...] = ()
     readonly_project_id: str | None = None
     readonly_file_access_source: (
         Literal["project", "explicit", "workspace"] | None
@@ -26,6 +28,7 @@ class AgentPromptContext:
         tuple[tuple[str, Literal["directory", "file"]], ...] | None
     ) = None
     readonly_project_root_truncated: bool = False
+    run_output_access_enabled: bool = False
 
 
 @dataclass(frozen=True, slots=True)

@@ -4,6 +4,20 @@ import { parseTodoList } from "@/entities/todo/model/todo-list";
 import { parseWebFetchResult } from "@/entities/web-page/model/web-fetch-result";
 
 export type CotStepKind = "reasoning" | "message" | "tool";
+export type SubagentDisplayStatus =
+  "pending" | "running" | "completed" | "failed" | "cancelled" | "timed_out";
+
+export interface SubagentStepDetail {
+  readonly name: string;
+  readonly description: string | null;
+  readonly status: SubagentDisplayStatus;
+  readonly durationMs: number | null;
+  readonly stopReason: string | null;
+  readonly totalTokens: number | null;
+  readonly modelCalls: number | null;
+  readonly resultSummary: string | null;
+  readonly rawResult: string | null;
+}
 export type CotStepIcon =
   | "reasoning"
   | "message"
@@ -25,10 +39,11 @@ export interface CotStep {
   readonly icon: CotStepIcon;
   readonly text: string;
   readonly toolName?: string;
-  readonly status?: "pending" | "completed" | "failed" | "cancelled";
+  readonly status?: SubagentDisplayStatus;
   readonly detail?: string;
   readonly links?: readonly CotStepLink[];
   readonly todoContents?: readonly string[];
+  readonly subagent?: SubagentStepDetail;
 }
 
 type UnknownRecord = Record<string, unknown>;
@@ -64,6 +79,63 @@ function compactText(value: string, maxLength = 96): string {
   return normalized.length > maxLength
     ? `${normalized.slice(0, maxLength)}…`
     : normalized;
+}
+
+function nonnegativeInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : null;
+}
+
+function taskDisplayStatus(
+  itemStatus: Extract<ChatTimelineItem, { kind: "tool" }>["status"],
+  result: UnknownRecord | null,
+): SubagentDisplayStatus {
+  if (itemStatus === "pending") return "running";
+  if (itemStatus === "cancelled") return "cancelled";
+  const status = result?.status;
+  if (
+    status === "pending" ||
+    status === "running" ||
+    status === "completed" ||
+    status === "failed" ||
+    status === "cancelled" ||
+    status === "timed_out"
+  ) {
+    return status;
+  }
+  return itemStatus === "failed" ? "failed" : "completed";
+}
+
+function projectSubagent(
+  item: Extract<ChatTimelineItem, { kind: "tool" }>,
+  input: UnknownRecord | null,
+): SubagentStepDetail {
+  const result = item.result === null ? null : parseObject(item.result);
+  const usage =
+    result?.usage !== null &&
+    typeof result?.usage === "object" &&
+    !Array.isArray(result.usage)
+      ? (result.usage as UnknownRecord)
+      : null;
+  const name =
+    stringValue(result, "subagent_type") ??
+    stringValue(input, "subagent_type") ??
+    "未知 Agent";
+  const description =
+    stringValue(result, "description") ?? stringValue(input, "description");
+  const resultText = stringValue(result, "result", "last_result", "message");
+  return {
+    name,
+    description,
+    status: taskDisplayStatus(item.status, result),
+    durationMs: nonnegativeInteger(result?.duration_ms),
+    stopReason: stringValue(result, "stop_reason"),
+    totalTokens: nonnegativeInteger(usage?.total_tokens),
+    modelCalls: nonnegativeInteger(usage?.model_calls),
+    resultSummary: resultText === null ? null : compactText(resultText, 240),
+    rawResult: item.result,
+  };
 }
 
 function toolStep(item: Extract<ChatTimelineItem, { kind: "tool" }>): CotStep {
@@ -133,14 +205,13 @@ function toolStep(item: Extract<ChatTimelineItem, { kind: "tool" }>): CotStep {
   }
 
   if (name === "task") {
-    const taskDescription = stringValue(input, "description", "prompt");
+    const subagent = projectSubagent(item, input);
     return {
       ...base,
       icon: "task",
-      text:
-        taskDescription === null
-          ? "委派子任务"
-          : `委派子任务：${compactText(taskDescription)}`,
+      status: subagent.status,
+      text: `${subagent.name}：${subagent.description ?? "委派子任务"}`,
+      subagent,
     };
   }
 

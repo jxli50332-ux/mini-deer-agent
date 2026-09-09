@@ -171,7 +171,7 @@ def _delegation_from_call(
         "turn_id": turn_id,
         "description": description.strip()[:200],
         "subagent_type": subagent_type.strip()[:64],
-        "status": "in_progress",
+        "status": "pending",
     }
 
 
@@ -200,7 +200,9 @@ def _completed_delegation(
             status = "completed"
             result_text = str(payload["result"])
         else:
-            candidate = payload.get("message")
+            if raw_status in {"failed", "cancelled", "timed_out"}:
+                status = str(raw_status)
+            candidate = payload.get("last_result") or payload.get("message")
             result_text = candidate if isinstance(candidate, str) else _message_text(message)
             raw_error_code = payload.get("error_code")
             error_code = raw_error_code if isinstance(raw_error_code, str) else None
@@ -222,6 +224,25 @@ def _completed_delegation(
         ).hexdigest()
     if error_code:
         result["error_code"] = error_code[:128]
+    if payload is not None:
+        for field_name in ("stop_reason", "started_at", "finished_at"):
+            raw_value = payload.get(field_name)
+            if isinstance(raw_value, str) and raw_value:
+                result[field_name] = raw_value[:128]
+        duration_ms = payload.get("duration_ms")
+        if isinstance(duration_ms, int) and not isinstance(duration_ms, bool):
+            result["duration_ms"] = max(0, duration_ms)
+        usage = payload.get("usage")
+        if isinstance(usage, Mapping):
+            for field_name in (
+                "input_tokens",
+                "output_tokens",
+                "total_tokens",
+                "model_calls",
+            ):
+                raw_value = usage.get(field_name)
+                if isinstance(raw_value, int) and not isinstance(raw_value, bool):
+                    result[field_name] = max(0, raw_value)
     return result  # type: ignore[return-value]
 
 

@@ -19,6 +19,36 @@ const THREAD: ThreadSummary = {
 };
 
 describe("useThreadList", () => {
+  it("按 offset 追加普通会话，直到完整列表加载完毕", async () => {
+    const firstPage = Array.from({ length: 50 }, (_, index) => ({
+      ...THREAD,
+      threadId: `${String(index).padStart(8, "0")}-1111-4111-8111-111111111111`,
+    }));
+    const finalThread = {
+      ...THREAD,
+      threadId: "99999999-1111-4111-8111-111111111111",
+    };
+    const loader = vi
+      .fn<ThreadListLoader>()
+      .mockResolvedValueOnce(firstPage)
+      .mockResolvedValueOnce([finalThread]);
+    const { result } = renderHook(() => useThreadList({ loader }));
+
+    await waitFor(() => expect(result.current.hasMore).toBe(true));
+    await act(() => result.current.loadMore());
+
+    expect(loader).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        limit: 50,
+        offset: 50,
+        scope: "standalone",
+      }),
+    );
+    expect(result.current.items).toHaveLength(51);
+    expect(result.current.hasMore).toBe(false);
+  });
+
   it("加载最近 Thread，并允许失败后显式重试", async () => {
     const loader = vi
       .fn<ThreadListLoader>()

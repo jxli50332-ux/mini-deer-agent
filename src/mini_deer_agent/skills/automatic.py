@@ -54,7 +54,7 @@ def create_skill_activation_tool(catalog: BuiltInSkillCatalog) -> BaseTool:
         name: SkillName,
         tool_call_id: Annotated[str, InjectedToolCallId],
     ) -> ToolMessage:
-        """为当前 Run 激活一个明确匹配任务的只读内置技能。
+        """为当前 Run 激活一个明确匹配任务的只读受管技能。
 
         仅当技能描述与用户任务高度匹配、专用工作流会带来明确收益时调用。
         简单问题或仅有主题词相似时不要调用。调用必须独占一次模型响应，且每个
@@ -66,7 +66,7 @@ def create_skill_activation_tool(catalog: BuiltInSkillCatalog) -> BaseTool:
                 content=_activation_payload(
                     name=name,
                     status="error",
-                    message="当前 Run 的内置技能目录中不存在该技能。",
+                    message="当前 Run 的受管技能目录中不存在该技能。",
                 ),
                 tool_call_id=tool_call_id,
                 name=SKILL_ACTIVATION_TOOL_NAME,

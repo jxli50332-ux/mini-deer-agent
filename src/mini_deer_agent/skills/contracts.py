@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from langchain_core.messages import BaseMessage, SystemMessage
 
@@ -15,8 +16,16 @@ class SkillSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class SkillResource:
+    """表示只在技能激活后加载的有界只读文本资源。"""
+
+    path: str
+    content: str
+
+
+@dataclass(frozen=True, slots=True)
 class BuiltInSkill:
-    """表示一个已经从受信任包目录解析完成的只读内置技能。"""
+    """表示一个已经从受管包目录解析完成的只读技能。"""
 
     name: str
     description: str
@@ -24,6 +33,8 @@ class BuiltInSkill:
     source_file: Path
     # None 保留旧技能的主 Agent 工具集合；显式元组会启用最小权限策略。
     allowed_tools: tuple[str, ...] | None = None
+    resources: tuple[SkillResource, ...] = ()
+    source: Literal["builtin", "user"] = "builtin"
 
     @property
     def summary(self) -> SkillSummary:

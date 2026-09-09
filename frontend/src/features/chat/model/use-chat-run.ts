@@ -68,6 +68,8 @@ export interface UseChatRunResult {
 
 export interface ChatSubmitOptions {
   readonly humanInputResponse?: HumanInputResponse;
+  readonly benchmarkCaseId?: string;
+  readonly goalResumeRevision?: string;
 }
 
 interface ActiveOperation {
@@ -247,6 +249,9 @@ export function useChatRun(options: UseChatRunOptions): UseChatRunResult {
                 hiddenFromUi: true,
                 humanInputResponse: submitOptions.humanInputResponse,
               }),
+          ...(submitOptions.goalResumeRevision === undefined
+            ? {}
+            : { hiddenFromUi: true }),
         },
       });
 
@@ -266,6 +271,12 @@ export function useChatRun(options: UseChatRunOptions): UseChatRunResult {
           ...(submitOptions.humanInputResponse === undefined
             ? {}
             : { humanInputResponse: submitOptions.humanInputResponse }),
+          ...(submitOptions.benchmarkCaseId === undefined
+            ? {}
+            : { benchmarkCaseId: submitOptions.benchmarkCaseId }),
+          ...(submitOptions.goalResumeRevision === undefined
+            ? {}
+            : { goalResumeRevision: submitOptions.goalResumeRevision }),
           signal: operation.controller.signal,
           onRunId: (runId) => {
             // 响应头先建立取消寻址；旧 operation 的回调不能覆盖当前 Run。
@@ -321,6 +332,28 @@ export function useChatRun(options: UseChatRunOptions): UseChatRunResult {
                 onRunSettled?.(operation.threadId, run.runId);
                 return true;
               }
+              // 服务端仍在运行时不能只丢掉本地 operation；主动取消后再次
+              // 核对终态，避免下一次提交稳定命中 thread_busy。
+              await cancelRunner({
+                threadId: operation.threadId,
+                runId: operation.runId,
+              });
+              const cancelledRun = await runReconciler({
+                threadId: operation.threadId,
+                runId: operation.runId,
+                signal: operation.controller.signal,
+              });
+              if (!isCurrentOperation()) {
+                return false;
+              }
+              if (isTerminalRun(cancelledRun)) {
+                dispatchForThread(operation.threadId, {
+                  type: "run/status-reconciled",
+                  run: cancelledRun,
+                });
+                onRunSettled?.(operation.threadId, cancelledRun.runId);
+                return true;
+              }
             } catch {
               // 状态查询失败不能覆盖最初的连接错误，更不能伪装已经恢复。
               if (!isCurrentOperation()) {
@@ -331,6 +364,9 @@ export function useChatRun(options: UseChatRunOptions): UseChatRunResult {
           dispatchForThread(operation.threadId, {
             type: "run/client-failed",
             error: failure,
+            ...(operation.runId === null && failure.code === "run_conflict"
+              ? { optimisticMessageId: userMessageId }
+              : {}),
           });
         }
         return false;
@@ -348,6 +384,7 @@ export function useChatRun(options: UseChatRunOptions): UseChatRunResult {
     },
     [
       createMessageId,
+      cancelRunner,
       dispatchForThread,
       onRunRequested,
       onRunSettled,

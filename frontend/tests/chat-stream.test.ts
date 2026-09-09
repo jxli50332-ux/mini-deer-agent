@@ -17,6 +17,7 @@ const RUN_ID = "11111111-1111-4111-8111-111111111111";
 const OTHER_RUN_ID = "33333333-3333-4333-8333-333333333333";
 const THREAD_ID = "22222222-2222-4222-8222-222222222222";
 const MESSAGE_ID = "44444444-4444-4444-8444-444444444444";
+const GOAL_REVISION = "55555555-5555-4555-8555-555555555555";
 
 function byteStream(chunks: readonly string[]): ReadableStream<Uint8Array> {
   return new ReadableStream({
@@ -162,6 +163,7 @@ describe("POST SSE chat client", () => {
           option_id: "option-1",
           value: "北京",
         },
+        benchmarkCaseId: "simple-qa",
         onRunId: (runId) => observedRunIds.push(runId),
       },
       { fetcher },
@@ -193,11 +195,50 @@ describe("POST SSE chat client", () => {
           option_id: "option-1",
           value: "北京",
         },
+        benchmark_case_id: "simple-qa",
       }),
     });
     expect(new Headers(init?.headers).get("accept")).toBe("text/event-stream");
     expect(new Headers(init?.headers).get("content-type")).toBe(
       "application/json",
+    );
+  });
+
+  it("恢复 Goal 时改用专用端点且只发送 revision 与消息身份", async () => {
+    const fetcher = vi.fn<FetchLike>(() =>
+      Promise.resolve(
+        successResponse([
+          wireFrame("run_started", 1, {
+            created_at: "2026-09-08T01:00:00Z",
+          }),
+          wireFrame("run_completed", 2, { finish_reason: "stop" }),
+        ]),
+      ),
+    );
+
+    const events: ChatRunEvent[] = [];
+    for await (const event of streamChatRun(
+      {
+        threadId: THREAD_ID,
+        messageId: MESSAGE_ID,
+        message: "继续执行当前 Goal。",
+        goalResumeRevision: GOAL_REVISION,
+      },
+      { fetcher },
+    )) {
+      events.push(event);
+    }
+
+    expect(events).toHaveLength(2);
+    expect(fetcher).toHaveBeenCalledWith(
+      `/api/v1/threads/${THREAD_ID}/goal/resume`,
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          message_id: MESSAGE_ID,
+          revision: GOAL_REVISION,
+        }),
+      }),
     );
   });
 

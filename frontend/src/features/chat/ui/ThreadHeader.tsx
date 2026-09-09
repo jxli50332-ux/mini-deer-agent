@@ -7,6 +7,7 @@ interface ThreadHeaderProps {
   readonly runId: string | null;
   readonly navigationOpen: boolean;
   readonly onOpenNavigation: () => void;
+  readonly onOpenBenchmarks: () => void;
 }
 
 const PHASE_LABELS: Record<ChatRunPhase, string> = {
@@ -25,6 +26,7 @@ export function ThreadHeader({
   runId,
   navigationOpen,
   onOpenNavigation,
+  onOpenBenchmarks,
 }: ThreadHeaderProps) {
   return (
     <header className="thread-header" data-phase={phase}>
@@ -43,6 +45,13 @@ export function ThreadHeader({
         <h1>Mini Deer 对话</h1>
       </div>
       <div className="thread-header__status">
+        <button
+          type="button"
+          className="benchmark-open-button"
+          onClick={onOpenBenchmarks}
+        >
+          能力基准
+        </button>
         <StatusIndicator label={PHASE_LABELS[phase]} />
         <span className="thread-id" title={`thread_id: ${threadId}`}>
           thread {threadId.slice(0, 8)}

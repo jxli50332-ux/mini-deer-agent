@@ -66,7 +66,10 @@ def test_mcp_config_parses_stdio_http_and_environment_references(
                         "transport": "stdio",
                         "command": "ignored",
                     },
-                }
+                },
+                "toolRoutingKeywords": {
+                    "local_math_add": ["加法", "add numbers"],
+                },
             }
         ),
         encoding="utf-8",
@@ -90,6 +93,37 @@ def test_mcp_config_parses_stdio_http_and_environment_references(
         "headers": {"Authorization": "Bearer docs-secret"},
     }
     assert loaded.configuration.mcp_servers["disabled"].enabled is False
+    assert loaded.configuration.tool_routing_keywords == {
+        "local_math_add": ("加法", "add numbers")
+    }
+
+
+@pytest.mark.parametrize(
+    "routing",
+    [
+        {"unsafe tool": ["query"]},
+        {"safe_tool": []},
+        {"safe_tool": ["same", " SAME "]},
+        {"safe_tool": ["x" * 65]},
+    ],
+)
+def test_mcp_config_rejects_invalid_routing_keywords(
+    tmp_path: Path,
+    routing: dict[str, list[str]],
+) -> None:
+    path = tmp_path / "mcp.json"
+    path.write_text(
+        json.dumps(
+            {
+                "mcpServers": {},
+                "toolRoutingKeywords": routing,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(McpConfigurationError, match="routing"):
+        load_mcp_configuration(path)
 
 
 def test_mcp_config_rejects_missing_environment_reference(tmp_path: Path) -> None:
@@ -143,7 +177,11 @@ def test_mcp_runtime_isolates_failed_servers_and_keeps_healthy_tools(
                     "healthy": {"command": "healthy-server"},
                     "broken": {"command": "broken-server"},
                     "disabled": {"enabled": False, "command": "unused"},
-                }
+                },
+                "toolRoutingKeywords": {
+                    "healthy_echo": ["健康回显", "echo health"],
+                    "missing_tool": ["不可用工具"],
+                },
             }
         ),
         encoding="utf-8",
@@ -174,6 +212,9 @@ def test_mcp_runtime_isolates_failed_servers_and_keeps_healthy_tools(
     )
 
     assert runtime.tool_names == ("healthy_echo",)
+    assert runtime.tool_routing_keywords == {
+        "healthy_echo": ("健康回显", "echo health")
+    }
     assert factory_calls == [
         (
             {

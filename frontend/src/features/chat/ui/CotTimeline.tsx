@@ -6,7 +6,11 @@ import {
   navigateToTodo,
   type CotNavigationDetail,
 } from "@/features/chat/model/cot-navigation";
-import type { CotStep, CotStepIcon } from "@/features/chat/model/project-cot";
+import type {
+  CotStep,
+  CotStepIcon,
+  SubagentStepDetail,
+} from "@/features/chat/model/project-cot";
 import { MessageContent } from "@/features/chat/ui/MessageContent";
 
 interface CotTimelineProps {
@@ -26,9 +30,11 @@ const ICON_LABEL: Record<CotStepIcon, string> = {
 
 const STATUS_LABEL = {
   pending: "进行中",
+  running: "运行中",
   completed: "已完成",
   failed: "失败",
   cancelled: "已取消",
+  timed_out: "已超时",
 } as const;
 
 const LONG_REASONING_CHARACTER_LIMIT = 700;
@@ -63,6 +69,68 @@ function ReasoningDisclosure({ text }: { readonly text: string }) {
   );
 }
 
+function formatDuration(durationMs: number | null): string | null {
+  if (durationMs === null) return null;
+  if (durationMs < 1_000) return `${durationMs} ms`;
+  return `${(durationMs / 1_000).toFixed(durationMs < 10_000 ? 1 : 0)} s`;
+}
+
+function SubagentDisclosure({ agent }: { readonly agent: SubagentStepDetail }) {
+  const duration = formatDuration(agent.durationMs);
+  const lifecycleFacts = [
+    duration === null ? null : `耗时 ${duration}`,
+    agent.totalTokens === null ? null : `${agent.totalTokens} tokens`,
+    agent.modelCalls === null ? null : `${agent.modelCalls} 次模型调用`,
+  ].filter((value): value is string => value !== null);
+
+  return (
+    <details
+      className="subagent-step"
+      data-status={agent.status}
+      open={agent.status === "failed" || agent.status === "timed_out"}
+    >
+      <summary className="subagent-step__summary">
+        <span className="subagent-step__identity">
+          <strong>{agent.name}</strong>
+          {agent.description !== null && <span>{agent.description}</span>}
+        </span>
+        <span className="subagent-step__status">
+          {STATUS_LABEL[agent.status]}
+        </span>
+        <span className="subagent-step__toggle" aria-hidden="true">
+          ▾
+        </span>
+      </summary>
+      <div className="subagent-step__content">
+        {lifecycleFacts.length > 0 && (
+          <p className="subagent-step__facts">{lifecycleFacts.join(" · ")}</p>
+        )}
+        {agent.stopReason !== null && (
+          <p className="subagent-step__stop">
+            <strong>停止原因</strong>
+            <span>{agent.stopReason}</span>
+          </p>
+        )}
+        {agent.resultSummary !== null && (
+          <div className="subagent-step__result">
+            <strong>结果摘要</strong>
+            <p>{agent.resultSummary}</p>
+          </div>
+        )}
+        {agent.rawResult !== null && (
+          <details className="subagent-step__raw">
+            <summary>查看原始结果</summary>
+            <pre>{agent.rawResult}</pre>
+          </details>
+        )}
+        {agent.rawResult === null && agent.status === "running" && (
+          <p className="subagent-step__placeholder">等待 Agent 返回结果……</p>
+        )}
+      </div>
+    </details>
+  );
+}
+
 function CotStepRow({
   step,
   highlighted,
@@ -93,40 +161,50 @@ function CotStepRow({
         <span className="cot-step__icon">{ICON_LABEL[step.icon]}</span>
       </span>
       <div className="cot-step__body">
-        <div className="cot-step__main">
-          {step.kind === "reasoning" ? (
-            <ReasoningDisclosure text={step.text} />
-          ) : isTextStep ? (
-            <MessageContent role="assistant" content={step.text} />
-          ) : step.icon === "todo" && step.todoContents !== undefined ? (
-            <button
-              type="button"
-              className="cot-step__todo-link"
-              onClick={() => navigateToTodo(step.id)}
-            >
-              {step.text}
-              <span aria-hidden="true">↘</span>
-            </button>
-          ) : (
-            <span className="cot-step__label">{step.text}</span>
-          )}
-          {statusLabel !== null && step.status !== "completed" && (
-            <span className="cot-step__status">{statusLabel}</span>
-          )}
-        </div>
-        {step.detail !== undefined && (
-          <p className="cot-step__detail">{step.detail}</p>
-        )}
-        {step.links !== undefined && step.links.length > 0 && (
-          <ul className="cot-step__links" aria-label="步骤相关链接">
-            {step.links.map((link) => (
-              <li key={link.url}>
-                <a href={link.url} target="_blank" rel="noopener noreferrer">
-                  {link.label}
-                </a>
-              </li>
-            ))}
-          </ul>
+        {step.subagent !== undefined ? (
+          <SubagentDisclosure agent={step.subagent} />
+        ) : (
+          <>
+            <div className="cot-step__main">
+              {step.kind === "reasoning" ? (
+                <ReasoningDisclosure text={step.text} />
+              ) : isTextStep ? (
+                <MessageContent role="assistant" content={step.text} />
+              ) : step.icon === "todo" && step.todoContents !== undefined ? (
+                <button
+                  type="button"
+                  className="cot-step__todo-link"
+                  onClick={() => navigateToTodo(step.id)}
+                >
+                  {step.text}
+                  <span aria-hidden="true">↘</span>
+                </button>
+              ) : (
+                <span className="cot-step__label">{step.text}</span>
+              )}
+              {statusLabel !== null && step.status !== "completed" && (
+                <span className="cot-step__status">{statusLabel}</span>
+              )}
+            </div>
+            {step.detail !== undefined && (
+              <p className="cot-step__detail">{step.detail}</p>
+            )}
+            {step.links !== undefined && step.links.length > 0 && (
+              <ul className="cot-step__links" aria-label="步骤相关链接">
+                {step.links.map((link) => (
+                  <li key={link.url}>
+                    <a
+                      href={link.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      {link.label}
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </>
         )}
       </div>
     </li>

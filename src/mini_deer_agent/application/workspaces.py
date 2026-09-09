@@ -77,7 +77,7 @@ class ProjectThreadRepository(Protocol):
         """创建或幂等读回同归属 Thread，禁止重绑已有身份。"""
 
     def list_project_threads(
-        self, project_id: str, *, limit: int
+        self, project_id: str, *, limit: int, offset: int = 0
     ) -> tuple[ThreadRecord, ...]:
         """按最近活动时间返回指定 Project 的 Thread。"""
 
@@ -1116,12 +1116,16 @@ class ProjectThreadService:
             thread_id=thread_id, project_id=project_id
         )
 
-    def list(self, *, project_id: str, limit: int = 20) -> tuple[ThreadRecord, ...]:
+    def list(
+        self, *, project_id: str, limit: int = 20, offset: int = 0
+    ) -> tuple[ThreadRecord, ...]:
         """查询归属列表前确认 Project 仍登记，避免跨身份猜测关系。"""
-        if not 1 <= limit <= 100:
+        if not 1 <= limit <= 100 or not 0 <= offset <= 1_000_000:
             raise ProjectError("project_thread_page_invalid", "项目会话数量范围无效。")
         self._require_project(project_id)
-        return self._threads.list_project_threads(project_id, limit=limit)
+        return self._threads.list_project_threads(
+            project_id, limit=limit, offset=offset
+        )
 
     def _require_project(self, project_id: str) -> ProjectRecord:
         """返回当前 Project 事实；解除登记后的旧身份不能再创建或枚举会话。"""

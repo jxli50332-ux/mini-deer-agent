@@ -8,6 +8,8 @@ from mini_deer_agent.agents.durable_state import (
     DelegationEntry,
     SkillContextEntry,
     TodoSnapshot,
+    PromotedToolState,
+    GoalState,
     merge_delegations,
     merge_skill_context,
     merge_todos,
@@ -25,3 +27,5 @@ class MiniDeerAgentState(MessagesState):
         Annotated[list[SkillContextEntry], merge_skill_context]
     ]
     todos: NotRequired[Annotated[TodoSnapshot | None, merge_todos]]
+    promoted_tools: NotRequired[PromotedToolState]
+    goal: NotRequired[GoalState | None]

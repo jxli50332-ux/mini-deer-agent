@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from functools import partial
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, Mapping
 
 from langchain_core.language_models import BaseChatModel, LanguageModelInput
 from langchain_core.messages import (
@@ -38,9 +39,26 @@ from mini_deer_agent.agents.middleware import (
     latest_human_turn_id,
     prepare_model_messages,
     project_dynamic_context,
+    ToolResultMeta,
+    ToolLoopDetector,
+    ToolLoopPolicy,
+    ToolProgressPolicy,
+    ToolProgressTracker,
+    RunOutputStore,
+    ToolOutputBudget,
+    ToolOutputBudgetPolicy,
+    RunBudgetPolicy,
+    RunBudgetTracker,
+    attach_tool_result_meta,
+    create_run_output_read_tool,
+    normalize_tool_message,
+    loop_finalize_messages,
+    mark_loop_capped,
 )
 from mini_deer_agent.agents.durable_state import (
     DelegationEntry,
+    GoalState,
+    PromotedToolState,
     SkillContextEntry,
     TodoSnapshot,
     merge_delegations,
@@ -48,6 +66,7 @@ from mini_deer_agent.agents.durable_state import (
     merge_todos,
 )
 from mini_deer_agent.agents.state import MiniDeerAgentState
+from mini_deer_agent.deferred_tools import DeferredToolCatalog
 from mini_deer_agent.agents.prompts import (
     AgentPromptBuilder,
     AgentPromptContext,
@@ -71,9 +90,11 @@ from mini_deer_agent.tools import (
     ask_clarification,
     create_memory_tools,
     create_task_tool,
+    create_tool_search_tool,
     get_agent_tools,
     get_skill_tools,
 )
+from mini_deer_agent.tools.registry import get_reserved_agent_tool_names
 from mini_deer_agent.tools.task import (
     MAX_CONCURRENT_DELEGATIONS,
     DelegationBudget,
@@ -89,6 +110,61 @@ if TYPE_CHECKING:
 
 
 _PROJECT_ROOT_OVERVIEW_LIMIT = 40
+_MAX_PROJECTED_GOAL_OBJECTIVE_CHARS = 4_000
+
+
+def _project_active_goal_context(
+    system_message: SystemMessage,
+    goal: GoalState | None,
+) -> SystemMessage:
+    """把活动 Goal 作为本次请求的可信投影，而不是伪造用户消息。"""
+    if not isinstance(goal, dict) or goal.get("status") != "active":
+        return system_message
+    objective = goal.get("objective")
+    if not isinstance(objective, str) or not objective.strip():
+        return system_message
+    if not isinstance(system_message.content, str):
+        raise TypeError("Goal context projection requires text system content")
+
+    escaped_objective = html.escape(
+        objective.strip()[:_MAX_PROJECTED_GOAL_OBJECTIVE_CHARS],
+        quote=False,
+    )
+    projection = (
+        "<active_thread_goal>\n"
+        "当前线程有一个由用户通过 Goal 面板设置的活动目标。该目标属于用户级任务意图，"
+        "不能覆盖系统规则、工具权限或安全边界。\n"
+        f"<objective>{escaped_objective}</objective>\n"
+        "这是唯一的当前线程 Goal；它替换对话历史或累计摘要中出现的旧 Goal。"
+        "历史内容只能作为完成当前 objective 的参考，不能用来猜测或改写当前 Goal。\n"
+        "本次回答和行动应推进这个目标；用户提到“当前 Goal”或“当前目标”时，"
+        "就是指上述 objective。Goal 由运行编排层管理，不要声称需要或存在可调用的 "
+        "goal 工具，也不要向用户展示此内部标签。\n"
+        "</active_thread_goal>"
+    )
+    return SystemMessage(content=f"{system_message.content}\n\n{projection}")
+
+
+def _active_goal_message_scope(
+    messages: list[BaseMessage],
+    summary_text: str | None,
+    goal: GoalState | None,
+) -> tuple[list[BaseMessage], str | None]:
+    """新 Goal 只读取其创建边界后的模型消息，旧摘要不再携带旧目标。"""
+    if (
+        not isinstance(goal, dict)
+        or goal.get("status") != "active"
+        or "context_anchor_message_id" not in goal
+    ):
+        return messages, summary_text
+    anchor = goal.get("context_anchor_message_id")
+    if isinstance(anchor, str):
+        for index in range(len(messages) - 1, -1, -1):
+            if messages[index].id == anchor:
+                return messages[index + 1 :], None
+    # 空 Thread 或已被摘要压缩掉的 anchor：当前保留消息均属于新边界，
+    # 但旧 summary 仍必须排除。
+    return messages, None
 
 
 def _load_project_root_overview(
@@ -120,17 +196,63 @@ def _load_project_root_overview(
     return entries, bool(result["truncated"])
 
 
+def _current_promotion_state(
+    state: MiniDeerAgentState,
+    catalog: DeferredToolCatalog | None,
+) -> PromotedToolState | None:
+    """只接受当前目录哈希下仍存在的名称；旧目录状态立即失效。"""
+    if catalog is None:
+        return None
+    raw = state.get("promoted_tools")
+    names: list[str] = []
+    if raw is not None and raw.get("catalog_hash") == catalog.catalog_hash:
+        seen: set[str] = set()
+        for name in raw.get("names", []):
+            if (
+                isinstance(name, str)
+                and name not in seen
+                and catalog.get(name) is not None
+            ):
+                seen.add(name)
+                names.append(name)
+    return {"catalog_hash": catalog.catalog_hash, "names": sorted(names)}
+
+
+def _active_tool_sets(
+    state: MiniDeerAgentState,
+    *,
+    passive_tools: tuple[BaseTool, ...],
+    execution_tools: tuple[BaseTool, ...],
+    deferred_tool_catalog: DeferredToolCatalog | None,
+) -> tuple[tuple[BaseTool, ...], tuple[BaseTool, ...], PromotedToolState | None]:
+    """把有效提升加入模型与执行注册表，未提升工具保持完全隐藏。"""
+    promotion = _current_promotion_state(state, deferred_tool_catalog)
+    promoted = (
+        tuple(
+            tool
+            for name in promotion["names"]
+            if deferred_tool_catalog is not None
+            and (tool := deferred_tool_catalog.get(name)) is not None
+        )
+        if promotion is not None
+        else ()
+    )
+    return (*passive_tools, *promoted), (*execution_tools, *promoted), promotion
+
+
 def route_after_model(
     state: MiniDeerAgentState,
     *,
     skill_catalog: BuiltInSkillCatalog | None = None,
     passive_tool_names: tuple[str, ...] = (),
     execution_tool_names: tuple[str, ...] = (),
+    deferred_tool_catalog: DeferredToolCatalog | None = None,
 ) -> Literal[
     "clarification",
     "skill_activation",
     "skill_policy_block",
     "delegation",
+    "tool_discovery",
     "tools",
     "__end__",
 ]:
@@ -141,16 +263,25 @@ def route_after_model(
         return "clarification"
     if any(call.get("name") == SKILL_ACTIVATION_TOOL_NAME for call in tool_calls):
         return "skill_activation"
+    active_passive_names = passive_tool_names
+    active_execution_names = execution_tool_names
+    promotion = _current_promotion_state(state, deferred_tool_catalog)
+    if promotion is not None and deferred_tool_catalog is not None:
+        promoted_names = tuple(promotion["names"])
+        active_passive_names = (*active_passive_names, *promoted_names)
+        active_execution_names = (*active_execution_names, *promoted_names)
     if skill_catalog is not None and tool_calls:
         decision = _skill_policy_decision(
             state,
             catalog=skill_catalog,
-            passive_tool_names=passive_tool_names,
-            execution_tool_names=execution_tool_names,
+            passive_tool_names=active_passive_names,
+            execution_tool_names=active_execution_names,
         )
         allowed_names = set(decision.allowed_tool_names)
         if any(call.get("name") not in allowed_names for call in tool_calls):
             return "skill_policy_block"
+    if any(call.get("name") == "tool_search" for call in tool_calls):
+        return "tool_discovery"
     if any(call.get("name") == "task" for call in tool_calls):
         return "delegation"
     # 普通工具继续复用 LangGraph 的标准条件，避免维护第二份路由规则。
@@ -208,11 +339,20 @@ def _skipped_tool_message(
         ensure_ascii=False,
         indent=2,
     )
-    return ToolMessage(
-        content=content,
-        tool_call_id=tool_call_id,
-        name=tool_name,
-        status="error",
+    return attach_tool_result_meta(
+        ToolMessage(
+            content=content,
+            tool_call_id=tool_call_id,
+            name=tool_name,
+            status="error",
+        ),
+        ToolResultMeta(
+            status="retryable_error",
+            recoverable_by_model=True,
+            recommended_next_action="rewrite_parameters",
+            error_summary=message,
+            error_type=reason,
+        ),
     )
 
 
@@ -237,11 +377,20 @@ def _blocked_tool_message(
         ensure_ascii=False,
         indent=2,
     )
-    return ToolMessage(
-        content=content,
-        tool_call_id=tool_call_id,
-        name=tool_name,
-        status="error",
+    return attach_tool_result_meta(
+        ToolMessage(
+            content=content,
+            tool_call_id=tool_call_id,
+            name=tool_name,
+            status="error",
+        ),
+        ToolResultMeta(
+            status="terminal_error",
+            recoverable_by_model=False,
+            recommended_next_action="stop_using_tool",
+            error_summary=message,
+            error_type="skill_tool_not_allowed",
+        ),
     )
 
 
@@ -251,16 +400,24 @@ def skill_policy_block_node(
     catalog: BuiltInSkillCatalog,
     passive_tool_names: tuple[str, ...],
     execution_tool_names: tuple[str, ...],
+    deferred_tool_catalog: DeferredToolCatalog | None = None,
 ) -> dict[str, list[BaseMessage]]:
     """拒绝含越权调用的整个批次，避免同批其他工具产生部分副作用。"""
     last_message = state["messages"][-1]
     if not isinstance(last_message, AIMessage):
         raise RuntimeError("Skill policy node requires an AIMessage")
+    active_passive_names = passive_tool_names
+    active_execution_names = execution_tool_names
+    promotion = _current_promotion_state(state, deferred_tool_catalog)
+    if promotion is not None:
+        promoted_names = tuple(promotion["names"])
+        active_passive_names = (*active_passive_names, *promoted_names)
+        active_execution_names = (*active_execution_names, *promoted_names)
     decision = _skill_policy_decision(
         state,
         catalog=catalog,
-        passive_tool_names=passive_tool_names,
-        execution_tool_names=execution_tool_names,
+        passive_tool_names=active_passive_names,
+        execution_tool_names=active_execution_names,
     )
     allowed_names = set(decision.allowed_tool_names)
     active_scope = (
@@ -286,6 +443,94 @@ def skill_policy_block_node(
             )
         )
     return {"messages": results}
+
+
+def _discovered_tool_names(
+    message: ToolMessage,
+    catalog: DeferredToolCatalog,
+) -> tuple[str, ...]:
+    """只信任当前目录中确实存在、且由当前哈希结果返回的名称。"""
+    try:
+        payload = json.loads(message.text)
+    except (TypeError, ValueError):
+        return ()
+    if (
+        not isinstance(payload, dict)
+        or payload.get("kind") != "tool_search_results"
+        or payload.get("catalog_hash") != catalog.catalog_hash
+        or not isinstance(payload.get("matches"), list)
+    ):
+        return ()
+    names: list[str] = []
+    for match in payload["matches"]:
+        name = match.get("name") if isinstance(match, dict) else None
+        if (
+            isinstance(name, str)
+            and catalog.get(name) is not None
+            and name not in names
+        ):
+            names.append(name)
+    return tuple(names)
+
+
+def tool_discovery_node(
+    state: MiniDeerAgentState,
+    *,
+    search_tool: BaseTool,
+    catalog: DeferredToolCatalog,
+) -> dict[str, object]:
+    """执行首个 tool_search，原子保存提升状态并结算同批其他调用。"""
+    last_message = state["messages"][-1]
+    if not isinstance(last_message, AIMessage):
+        raise RuntimeError("Tool discovery node requires an AIMessage")
+    search_index = next(
+        (
+            index
+            for index, call in enumerate(last_message.tool_calls)
+            if call.get("name") == "tool_search"
+        ),
+        None,
+    )
+    if search_index is None:
+        raise RuntimeError("Tool discovery node requires tool_search")
+    promotion = _current_promotion_state(state, catalog)
+    existing_names = list(promotion["names"] if promotion is not None else [])
+    results: list[BaseMessage] = []
+    for index, tool_call in enumerate(last_message.tool_calls):
+        if index != search_index:
+            results.append(
+                _skipped_tool_message(
+                    tool_call,
+                    reason="tool_discovery_batch_exclusive",
+                    message="tool_search 必须独占模型响应，本批未执行其他工具。",
+                )
+            )
+            continue
+        try:
+            result = search_tool.invoke(tool_call)
+        except Exception:
+            results.append(
+                _skipped_tool_message(
+                    tool_call,
+                    reason="invalid_tool_search_call",
+                    message="工具搜索参数无效，本次未提升任何工具。",
+                )
+            )
+            continue
+        if not isinstance(result, ToolMessage):
+            raise RuntimeError("tool_search must return a ToolMessage")
+        result = normalize_tool_message(result)
+        results.append(result)
+        for name in _discovered_tool_names(result, catalog):
+            if name not in existing_names:
+                existing_names.append(name)
+    return {
+        "messages": results,
+        "promoted_tools": {
+            "catalog_hash": catalog.catalog_hash,
+            "names": sorted(existing_names),
+        },
+    }
 
 
 def clarification_node(state: MessagesState) -> dict[str, list[BaseMessage]]:
@@ -320,7 +565,7 @@ def clarification_node(state: MessagesState) -> dict[str, list[BaseMessage]]:
         result = ask_clarification.invoke(tool_call)
         if not isinstance(result, ToolMessage):
             raise RuntimeError("ask_clarification must return a ToolMessage")
-        results.append(result)
+        results.append(normalize_tool_message(result))
     return {"messages": results}
 
 
@@ -436,7 +681,7 @@ def skill_activation_node(
             continue
         if not isinstance(result, ToolMessage):
             raise RuntimeError("activate_skill must return a ToolMessage")
-        results.append(result)
+        results.append(normalize_tool_message(result))
     return {"messages": results}
 
 
@@ -476,37 +721,62 @@ def _task_description(tool_call: dict) -> str:
 
 def _task_invocation_failure(tool_call: dict) -> ToolMessage:
     """把工具参数或运行时包装错误转换为可交给主模型的失败结果。"""
-    return create_task_failure_message(
-        tool_call_id=_required_tool_call_id(tool_call),
-        description=_task_description(tool_call),
-        error_code="invalid_task_call",
-        message="子 Agent 委派参数无效或无法启动。",
+    return normalize_tool_message(
+        create_task_failure_message(
+            tool_call_id=_required_tool_call_id(tool_call),
+            description=_task_description(tool_call),
+            error_code="invalid_task_call",
+            message="子 Agent 委派参数无效或无法启动。",
+        )
     )
 
 
-def _invoke_task_call(task_tool: BaseTool, tool_call: dict) -> ToolMessage:
+def _task_call_with_skill(
+    tool_call: dict,
+    active_skill_name: str | None,
+) -> dict:
+    """向模型不可见的 task 参数注入本轮可信 Skill 身份。"""
+    args = tool_call.get("args")
+    if not isinstance(args, dict):
+        return tool_call
+    return {
+        **tool_call,
+        "args": {**args, "active_skill_name": active_skill_name},
+    }
+
+
+def _invoke_task_call(
+    task_tool: BaseTool,
+    tool_call: dict,
+    active_skill_name: str | None,
+) -> ToolMessage:
     """同步执行单个已获预算的 task，并隔离该调用自身的包装错误。"""
     try:
-        result = task_tool.invoke(tool_call)
+        result = task_tool.invoke(
+            _task_call_with_skill(tool_call, active_skill_name)
+        )
     except Exception:
         return _task_invocation_failure(tool_call)
     if not isinstance(result, ToolMessage):
         return _task_invocation_failure(tool_call)
-    return result
+    return normalize_tool_message(result)
 
 
 async def _async_invoke_task_call(
     task_tool: BaseTool,
     tool_call: dict,
+    active_skill_name: str | None,
 ) -> ToolMessage:
     """异步执行单个 task；CancelledError 不会被普通异常包装吞掉。"""
     try:
-        result = await task_tool.ainvoke(tool_call)
+        result = await task_tool.ainvoke(
+            _task_call_with_skill(tool_call, active_skill_name)
+        )
     except Exception:
         return _task_invocation_failure(tool_call)
     if not isinstance(result, ToolMessage):
         return _task_invocation_failure(tool_call)
-    return result
+    return normalize_tool_message(result)
 
 
 def _prepare_delegation_batch(
@@ -579,6 +849,7 @@ def delegation_node(
     state: MessagesState,
     task_tool: BaseTool,
     budget: DelegationBudget,
+    skill_catalog: BuiltInSkillCatalog | None = None,
 ) -> dict[str, list[BaseMessage]]:
     """使用有界线程池并发执行本批 task，再按原顺序返回主模型。"""
     last_message, accepted_indices, rejected_reason = _prepare_delegation_batch(
@@ -586,6 +857,7 @@ def delegation_node(
         budget,
     )
     accepted_calls = [last_message.tool_calls[index] for index in accepted_indices]
+    active_skill_name = _delegation_active_skill_name(state, skill_catalog)
     if accepted_calls:
         with ThreadPoolExecutor(
             max_workers=len(accepted_calls),
@@ -593,7 +865,11 @@ def delegation_node(
         ) as executor:
             executed_results = list(
                 executor.map(
-                    lambda call: _invoke_task_call(task_tool, call),
+                    lambda call: _invoke_task_call(
+                        task_tool,
+                        call,
+                        active_skill_name,
+                    ),
                     accepted_calls,
                 )
             )
@@ -607,10 +883,35 @@ def delegation_node(
     )
 
 
+def delegation_prepare_node(
+    state: MiniDeerAgentState,
+    skill_catalog: BuiltInSkillCatalog | None = None,
+) -> dict[str, object]:
+    """在实际执行前单独 checkpoint 当前批次的 running 生命周期。"""
+    delegations, _, _, _ = _durable_context_values(state, skill_catalog)
+    last_message = state["messages"][-1]
+    if not isinstance(last_message, AIMessage):
+        return {}
+    task_ids = {
+        str(call.get("id"))
+        for call in last_message.tool_calls
+        if call.get("name") == "task" and call.get("id")
+    }
+    running: list[DelegationEntry] = []
+    for entry in delegations:
+        if entry["id"] not in task_ids or entry["status"] != "pending":
+            continue
+        updated = dict(entry)
+        updated["status"] = "running"
+        running.append(updated)  # type: ignore[arg-type]
+    return {"delegations": running} if running else {}
+
+
 async def async_delegation_node(
     state: MessagesState,
     task_tool: BaseTool,
     budget: DelegationBudget,
+    skill_catalog: BuiltInSkillCatalog | None = None,
 ) -> dict[str, list[BaseMessage]]:
     """使用 gather 并发等待本批 task，使取消传播到全部活动子图。"""
     last_message, accepted_indices, rejected_reason = _prepare_delegation_batch(
@@ -618,10 +919,15 @@ async def async_delegation_node(
         budget,
     )
     accepted_calls = [last_message.tool_calls[index] for index in accepted_indices]
+    active_skill_name = _delegation_active_skill_name(state, skill_catalog)
     executed_results = list(
         await asyncio.gather(
             *(
-                _async_invoke_task_call(task_tool, tool_call)
+                _async_invoke_task_call(
+                    task_tool,
+                    tool_call,
+                    active_skill_name,
+                )
                 for tool_call in accepted_calls
             )
         )
@@ -632,6 +938,20 @@ async def async_delegation_node(
         executed_results,
         rejected_reason,
     )
+
+
+def _delegation_active_skill_name(
+    state: MessagesState,
+    catalog: BuiltInSkillCatalog | None,
+) -> str | None:
+    """从当前回合持久事实解析 task 应继承的活动 Skill。"""
+    if catalog is None:
+        return None
+    _, skill_context, _, current_turn_id = _durable_context_values(
+        state,
+        catalog,
+    )
+    return current_turn_skill_name(skill_context, current_turn_id)
 
 
 def _model_request_with_skill_policy(
@@ -670,6 +990,123 @@ def _model_request_with_skill_policy(
     return request_model, request_system_message
 
 
+def _authorized_execution_tools(
+    state: MiniDeerAgentState,
+    *,
+    skill_catalog: BuiltInSkillCatalog | None,
+    passive_tools: tuple[BaseTool, ...],
+    execution_tools: tuple[BaseTool, ...],
+    deferred_tool_catalog: DeferredToolCatalog | None,
+) -> tuple[BaseTool, ...]:
+    """从当前提升状态和 Skill 策略计算本批真正可执行的注册表。"""
+    active_passive, active_execution, _ = _active_tool_sets(
+        state,
+        passive_tools=passive_tools,
+        execution_tools=execution_tools,
+        deferred_tool_catalog=deferred_tool_catalog,
+    )
+    if skill_catalog is None:
+        return active_execution
+    decision = _skill_policy_decision(
+        state,
+        catalog=skill_catalog,
+        passive_tool_names=tuple(tool.name for tool in active_passive),
+        execution_tool_names=tuple(tool.name for tool in active_execution),
+    )
+    allowed = set(decision.allowed_tool_names)
+    return tuple(tool for tool in active_execution if tool.name in allowed)
+
+
+def _unauthorized_execution_result(
+    state: MiniDeerAgentState,
+    allowed_names: set[str],
+) -> dict[str, list[BaseMessage]] | None:
+    """执行节点自身再次拒绝未提升或越权名称，避免只依赖路由正确性。"""
+    last_message = state["messages"][-1]
+    if not isinstance(last_message, AIMessage):
+        raise RuntimeError("Tool execution node requires an AIMessage")
+    if all(call.get("name") in allowed_names for call in last_message.tool_calls):
+        return None
+    results: list[BaseMessage] = []
+    for call in last_message.tool_calls:
+        if call.get("name") not in allowed_names:
+            results.append(
+                _blocked_tool_message(
+                    call,
+                    message="该工具尚未被当前目录提升，执行层已拒绝调用。",
+                )
+            )
+        else:
+            results.append(
+                _skipped_tool_message(
+                    call,
+                    reason="unauthorized_tool_batch",
+                    message="同批包含未提升工具，本批未执行任何工具。",
+                )
+            )
+    return {"messages": results}
+
+
+def tools_node(
+    state: MiniDeerAgentState,
+    *,
+    skill_catalog: BuiltInSkillCatalog | None,
+    passive_tools: tuple[BaseTool, ...],
+    execution_tools: tuple[BaseTool, ...],
+    deferred_tool_catalog: DeferredToolCatalog | None,
+    progress_tracker: ToolProgressTracker,
+) -> dict[str, list[BaseMessage]]:
+    """用当前最小授权注册表同步执行普通工具批次。"""
+    authorized = _authorized_execution_tools(
+        state,
+        skill_catalog=skill_catalog,
+        passive_tools=passive_tools,
+        execution_tools=execution_tools,
+        deferred_tool_catalog=deferred_tool_catalog,
+    )
+    blocked = _unauthorized_execution_result(
+        state, {tool.name for tool in authorized}
+    )
+    if blocked is not None:
+        return blocked
+    return ToolNode(
+        authorized,
+        handle_tool_errors=False,
+        wrap_tool_call=progress_tracker.wrap_tool_call,
+        awrap_tool_call=progress_tracker.awrap_tool_call,
+    ).invoke(state)
+
+
+async def async_tools_node(
+    state: MiniDeerAgentState,
+    *,
+    skill_catalog: BuiltInSkillCatalog | None,
+    passive_tools: tuple[BaseTool, ...],
+    execution_tools: tuple[BaseTool, ...],
+    deferred_tool_catalog: DeferredToolCatalog | None,
+    progress_tracker: ToolProgressTracker,
+) -> dict[str, list[BaseMessage]]:
+    """异步执行同一最小授权注册表，并保持取消传播。"""
+    authorized = _authorized_execution_tools(
+        state,
+        skill_catalog=skill_catalog,
+        passive_tools=passive_tools,
+        execution_tools=execution_tools,
+        deferred_tool_catalog=deferred_tool_catalog,
+    )
+    blocked = _unauthorized_execution_result(
+        state, {tool.name for tool in authorized}
+    )
+    if blocked is not None:
+        return blocked
+    return await ToolNode(
+        authorized,
+        handle_tool_errors=False,
+        wrap_tool_call=progress_tracker.wrap_tool_call,
+        awrap_tool_call=progress_tracker.awrap_tool_call,
+    ).ainvoke(state)
+
+
 def _model_state_update(
     response: BaseMessage,
     compaction: ContextSummaryResult | None,
@@ -677,6 +1114,7 @@ def _model_state_update(
     delegations: list[DelegationEntry],
     skill_context: list[SkillContextEntry],
     todos: TodoSnapshot | None,
+    promoted_tools: PromotedToolState | None = None,
 ) -> dict[str, object]:
     """原子保存消息、摘要和从本次请求/响应捕获的结构化状态。"""
     durable_update: dict[str, object] = {}
@@ -686,6 +1124,8 @@ def _model_state_update(
         durable_update["skill_context"] = skill_context
     if todos is not None:
         durable_update["todos"] = todos
+    if promoted_tools is not None:
+        durable_update["promoted_tools"] = promoted_tools
     if compaction is None:
         return {"messages": [response], **durable_update}
     return {
@@ -741,15 +1181,24 @@ def model_node(
     execution_tools: tuple[BaseTool, ...] | None = None,
     dynamic_context_clock: DynamicContextClock | None = None,
     context_summarizer: ContextSummarizer | None = None,
+    loop_detector: ToolLoopDetector | None = None,
+    progress_tracker: ToolProgressTracker | None = None,
+    run_budget_tracker: RunBudgetTracker | None = None,
+    deferred_tool_catalog: DeferredToolCatalog | None = None,
 ) -> dict[str, object]:
     """必要时压缩旧历史，再把安全投影后的上下文交给模型。"""
     delegations, skill_context, todos, current_turn_id = (
         _durable_context_values(state, skill_catalog)
     )
+    scoped_messages, scoped_summary = _active_goal_message_scope(
+        state["messages"],
+        state.get("summary_text"),
+        state.get("goal"),
+    )
     compaction = (
         context_summarizer.compact(
-            state["messages"],
-            previous_summary=state.get("summary_text"),
+            scoped_messages,
+            previous_summary=scoped_summary,
         )
         if context_summarizer is not None
         else None
@@ -757,12 +1206,12 @@ def model_node(
     working_messages = (
         list(compaction.preserved_messages)
         if compaction is not None
-        else state["messages"]
+        else scoped_messages
     )
     active_summary = (
         compaction.summary_text
         if compaction is not None
-        else state.get("summary_text")
+        else scoped_summary
     )
     skill_projection = project_skill_activation(
         system_message,
@@ -782,13 +1231,25 @@ def model_node(
             skill_context=skill_context,
             todos=todos,
         )
+    active_passive_tools, active_execution_tools, promotion_state = (
+        _active_tool_sets(
+            state,
+            passive_tools=passive_tools or (),
+            execution_tools=execution_tools or (),
+            deferred_tool_catalog=deferred_tool_catalog,
+        )
+    )
     request_model, request_system_message = _model_request_with_skill_policy(
         model=model,
         projected_system_message=skill_projection.system_message,
         active_skill_name=skill_projection.skill_name,
         skill_catalog=skill_catalog,
-        passive_tools=passive_tools,
-        execution_tools=execution_tools,
+        passive_tools=active_passive_tools,
+        execution_tools=active_execution_tools,
+    )
+    request_system_message = _project_active_goal_context(
+        request_system_message,
+        state.get("goal"),
     )
     if dynamic_context_clock is not None:
         # 动态事实放在技能与权限之后统一合并，且只存在于本次模型请求。
@@ -806,7 +1267,74 @@ def model_node(
         todos=todos,
         current_turn_id=current_turn_id,
     )
-    response = request_model.invoke(model_messages)
+    if loop_detector is not None:
+        loop_detector.begin_run(current_turn_id)
+        model_messages = loop_detector.append_pending_warning(model_messages)
+    if progress_tracker is not None:
+        progress_tracker.begin_run(current_turn_id)
+        model_messages = progress_tracker.append_pending_hints(model_messages)
+    if run_budget_tracker is not None:
+        run_budget_tracker.begin_run(current_turn_id)
+        model_messages = run_budget_tracker.append_pending_warning(model_messages)
+    budget_reason = (
+        run_budget_tracker.reserve_model_call()
+        if run_budget_tracker is not None
+        else None
+    )
+    if budget_reason is not None and run_budget_tracker is not None:
+        response = run_budget_tracker.capped_response(
+            budget_reason,
+            prior_messages=model_messages,
+        )
+    else:
+        response = request_model.invoke(model_messages)
+        budget_reason = (
+            run_budget_tracker.record_response(response)
+            if run_budget_tracker is not None
+            else None
+        )
+        if budget_reason is not None and run_budget_tracker is not None:
+            response = run_budget_tracker.capped_response(
+                budget_reason,
+                response,
+                prior_messages=model_messages,
+            )
+        elif loop_detector is not None and loop_detector.observe(response) == "cap":
+            final_budget_reason = (
+                run_budget_tracker.reserve_model_call()
+                if run_budget_tracker is not None
+                else None
+            )
+            if final_budget_reason is not None and run_budget_tracker is not None:
+                response = run_budget_tracker.capped_response(
+                    final_budget_reason,
+                    prior_messages=model_messages,
+                )
+            else:
+                try:
+                    final_response = model.invoke(
+                        loop_finalize_messages(model_messages)
+                    )
+                except Exception:
+                    final_response = None
+                final_budget_reason = (
+                    run_budget_tracker.record_response(final_response)
+                    if run_budget_tracker is not None
+                    and final_response is not None
+                    else None
+                )
+                response = (
+                    run_budget_tracker.capped_response(
+                        final_budget_reason,
+                        final_response,
+                        prior_messages=model_messages,
+                    )
+                    if final_budget_reason is not None
+                    and run_budget_tracker is not None
+                    else mark_loop_capped(final_response)
+                )
+    if run_budget_tracker is not None:
+        response = run_budget_tracker.stamp(response)
 
     # 压缩成功时由 MessagesState reducer 先清空旧历史，再保留近期窗口和公开响应。
     updated_delegations, updated_skills, updated_todos, _ = (
@@ -818,6 +1346,7 @@ def model_node(
         delegations=updated_delegations,
         skill_context=updated_skills,
         todos=updated_todos,
+        promoted_tools=promotion_state,
     )
 
 
@@ -830,15 +1359,24 @@ async def async_model_node(
     execution_tools: tuple[BaseTool, ...] | None = None,
     dynamic_context_clock: DynamicContextClock | None = None,
     context_summarizer: ContextSummarizer | None = None,
+    loop_detector: ToolLoopDetector | None = None,
+    progress_tracker: ToolProgressTracker | None = None,
+    run_budget_tracker: RunBudgetTracker | None = None,
+    deferred_tool_catalog: DeferredToolCatalog | None = None,
 ) -> dict[str, object]:
     """异步调用模型，使 Web Run 可以通过取消 asyncio Task 中断等待。"""
     delegations, skill_context, todos, current_turn_id = (
         _durable_context_values(state, skill_catalog)
     )
+    scoped_messages, scoped_summary = _active_goal_message_scope(
+        state["messages"],
+        state.get("summary_text"),
+        state.get("goal"),
+    )
     compaction = (
         await context_summarizer.acompact(
-            state["messages"],
-            previous_summary=state.get("summary_text"),
+            scoped_messages,
+            previous_summary=scoped_summary,
         )
         if context_summarizer is not None
         else None
@@ -846,12 +1384,12 @@ async def async_model_node(
     working_messages = (
         list(compaction.preserved_messages)
         if compaction is not None
-        else state["messages"]
+        else scoped_messages
     )
     active_summary = (
         compaction.summary_text
         if compaction is not None
-        else state.get("summary_text")
+        else scoped_summary
     )
     skill_projection = project_skill_activation(
         system_message,
@@ -870,13 +1408,25 @@ async def async_model_node(
             skill_context=skill_context,
             todos=todos,
         )
+    active_passive_tools, active_execution_tools, promotion_state = (
+        _active_tool_sets(
+            state,
+            passive_tools=passive_tools or (),
+            execution_tools=execution_tools or (),
+            deferred_tool_catalog=deferred_tool_catalog,
+        )
+    )
     request_model, request_system_message = _model_request_with_skill_policy(
         model=model,
         projected_system_message=skill_projection.system_message,
         active_skill_name=skill_projection.skill_name,
         skill_catalog=skill_catalog,
-        passive_tools=passive_tools,
-        execution_tools=execution_tools,
+        passive_tools=active_passive_tools,
+        execution_tools=active_execution_tools,
+    )
+    request_system_message = _project_active_goal_context(
+        request_system_message,
+        state.get("goal"),
     )
     if dynamic_context_clock is not None:
         request_system_message = project_dynamic_context(
@@ -893,7 +1443,74 @@ async def async_model_node(
         todos=todos,
         current_turn_id=current_turn_id,
     )
-    response = await request_model.ainvoke(model_messages)
+    if loop_detector is not None:
+        loop_detector.begin_run(current_turn_id)
+        model_messages = loop_detector.append_pending_warning(model_messages)
+    if progress_tracker is not None:
+        progress_tracker.begin_run(current_turn_id)
+        model_messages = progress_tracker.append_pending_hints(model_messages)
+    if run_budget_tracker is not None:
+        run_budget_tracker.begin_run(current_turn_id)
+        model_messages = run_budget_tracker.append_pending_warning(model_messages)
+    budget_reason = (
+        run_budget_tracker.reserve_model_call()
+        if run_budget_tracker is not None
+        else None
+    )
+    if budget_reason is not None and run_budget_tracker is not None:
+        response = run_budget_tracker.capped_response(
+            budget_reason,
+            prior_messages=model_messages,
+        )
+    else:
+        response = await request_model.ainvoke(model_messages)
+        budget_reason = (
+            run_budget_tracker.record_response(response)
+            if run_budget_tracker is not None
+            else None
+        )
+        if budget_reason is not None and run_budget_tracker is not None:
+            response = run_budget_tracker.capped_response(
+                budget_reason,
+                response,
+                prior_messages=model_messages,
+            )
+        elif loop_detector is not None and loop_detector.observe(response) == "cap":
+            final_budget_reason = (
+                run_budget_tracker.reserve_model_call()
+                if run_budget_tracker is not None
+                else None
+            )
+            if final_budget_reason is not None and run_budget_tracker is not None:
+                response = run_budget_tracker.capped_response(
+                    final_budget_reason,
+                    prior_messages=model_messages,
+                )
+            else:
+                try:
+                    final_response = await model.ainvoke(
+                        loop_finalize_messages(model_messages)
+                    )
+                except Exception:
+                    final_response = None
+                final_budget_reason = (
+                    run_budget_tracker.record_response(final_response)
+                    if run_budget_tracker is not None
+                    and final_response is not None
+                    else None
+                )
+                response = (
+                    run_budget_tracker.capped_response(
+                        final_budget_reason,
+                        final_response,
+                        prior_messages=model_messages,
+                    )
+                    if final_budget_reason is not None
+                    and run_budget_tracker is not None
+                    else mark_loop_capped(final_response)
+                )
+    if run_budget_tracker is not None:
+        response = run_budget_tracker.stamp(response)
     updated_delegations, updated_skills, updated_todos, _ = (
         _durable_context_values(state, skill_catalog, response=response)
     )
@@ -903,6 +1520,7 @@ async def async_model_node(
         delegations=updated_delegations,
         skill_context=updated_skills,
         todos=updated_todos,
+        promoted_tools=promotion_state,
     )
 
 
@@ -918,9 +1536,18 @@ def build_agent_graph(
     summary_model: BaseChatModel | None = None,
     memory_store: MemoryStore | None = None,
     mcp_tools: tuple[BaseTool, ...] = (),
+    mcp_tool_routing_keywords: Mapping[str, tuple[str, ...]] | None = None,
     project_service: ProjectService | None = None,
     project_id: str | None = None,
     file_access: FileAccess | None = None,
+    loop_soft_limit: int | None = None,
+    loop_hard_limit: int | None = None,
+    tool_transient_failure_limit: int | None = None,
+    tool_repeated_content_limit: int | None = None,
+    tool_output_store: RunOutputStore | None = None,
+    tool_output_policy: ToolOutputBudgetPolicy | None = None,
+    run_budget_policy: RunBudgetPolicy | None = None,
+    run_budget_tracker: RunBudgetTracker | None = None,
 ) -> CompiledStateGraph:
     """绑定模型、Prompt、工具和可选状态存储，并编译条件循环。"""
     # 项目身份只能由可信调用方提供；HTTP 接入前须先按持久 Thread 归属授权。
@@ -976,6 +1603,87 @@ def build_agent_graph(
             else 12_000
         ),
     )
+    loop_policy = ToolLoopPolicy(
+        soft_limit=(
+            loop_soft_limit
+            if loop_soft_limit is not None
+            else settings.tool_loop_soft_limit
+            if settings is not None
+            else 3
+        ),
+        hard_limit=(
+            loop_hard_limit
+            if loop_hard_limit is not None
+            else settings.tool_loop_hard_limit
+            if settings is not None
+            else 5
+        ),
+    )
+    loop_detector = ToolLoopDetector(loop_policy)
+    resolved_output_store = (
+        tool_output_store
+        if tool_output_store is not None
+        else RunOutputStore(settings.tool_output_directory)
+        if settings is not None
+        else None
+    )
+    resolved_output_policy = tool_output_policy or ToolOutputBudgetPolicy(
+        max_inline_chars=(
+            settings.tool_output_max_inline_chars
+            if settings is not None
+            else 12_000
+        ),
+        sample_chars=(
+            settings.tool_output_sample_chars if settings is not None else 1_200
+        ),
+        read_chunk_chars=(
+            settings.tool_output_read_chunk_chars
+            if settings is not None
+            else 8_000
+        ),
+    )
+    output_budget = ToolOutputBudget(
+        resolved_output_store,
+        resolved_output_policy,
+    )
+    resolved_run_budget_policy = run_budget_policy or RunBudgetPolicy(
+        soft_token_limit=(
+            settings.run_token_soft_limit if settings is not None else 80_000
+        ),
+        hard_token_limit=(
+            settings.run_token_hard_limit if settings is not None else 120_000
+        ),
+        soft_turn_limit=(
+            settings.run_model_turn_soft_limit if settings is not None else 16
+        ),
+        hard_turn_limit=(
+            settings.run_model_turn_hard_limit if settings is not None else 24
+        ),
+    )
+    resolved_run_budget_tracker = run_budget_tracker or RunBudgetTracker(
+        resolved_run_budget_policy
+    )
+    progress_policy = ToolProgressPolicy(
+        transient_failure_limit=(
+            tool_transient_failure_limit
+            if tool_transient_failure_limit is not None
+            else settings.tool_transient_failure_limit
+            if settings is not None
+            else 3
+        ),
+        repeated_content_limit=(
+            tool_repeated_content_limit
+            if tool_repeated_content_limit is not None
+            else settings.tool_repeated_content_limit
+            if settings is not None
+            else 2
+        ),
+    )
+    progress_tracker = ToolProgressTracker(
+        progress_policy,
+        sync_wrapper=output_budget.wrap_tool_call,
+        async_wrapper=output_budget.awrap_tool_call,
+    )
     # 每个产品 Run 使用一次稳定快照；技能文件更新只影响之后的新 Run。
     resolved_skill_catalog = (
         skill_catalog
@@ -985,7 +1693,49 @@ def build_agent_graph(
     resolved_dynamic_context_clock = (
         dynamic_context_clock or current_local_datetime
     )
-    # 每次构图只读取一次注册表，确保模型契约和工具执行节点使用完全相同的集合。
+    # 即使目录为空也保留一个仅供防御路由执行的闭包；模型注册表不会暴露它。
+    runtime_activation_tool = create_skill_activation_tool(resolved_skill_catalog)
+    model_activation_tool = (
+        runtime_activation_tool if resolved_skill_catalog.skills else None
+    )
+    memory_tools = (
+        create_memory_tools(memory_store) if memory_store is not None else ()
+    )
+    run_output_tools = (
+        (create_run_output_read_tool(),)
+        if resolved_output_store is not None
+        and not any(tool.name == "read_file" for tool in file_tools)
+        else ()
+    )
+    # 普通 Thread 也会获得 workspace 允许根的文件工具；只有真正的 Project
+    # Scope 才隔离 MCP，不能把“存在文件工具”误判成“属于 Project”。
+    project_scoped = project_id is not None or (
+        file_access is not None and file_access.scope.source == "project"
+    )
+    deferred_tool_catalog = DeferredToolCatalog(
+        (() if project_scoped else mcp_tools),
+        reserved_names=get_reserved_agent_tool_names(),
+        routing_keywords=(
+            None if project_scoped else mcp_tool_routing_keywords
+        ),
+    )
+    active_deferred_catalog = (
+        deferred_tool_catalog if deferred_tool_catalog.names else None
+    )
+    tool_search = create_tool_search_tool(deferred_tool_catalog)
+    discovery_tools = (tool_search,) if deferred_tool_catalog.names else ()
+    parent_extra_tools = (
+        *memory_tools,
+        *file_tools,
+        *run_output_tools,
+        *sandbox_tools,
+        *discovery_tools,
+    )
+    # task 在创建时获得父 Run 已绑定工具的冻结快照；子图不会重新发现项目或 MCP。
+    subagent_parent_tools = (
+        *get_agent_tools(extra_tools=parent_extra_tools),
+        *get_skill_tools(),
+    )
     delegation_budget = DelegationBudget()
     task_tool = create_task_tool(
         chat_model,
@@ -997,25 +1747,19 @@ def build_agent_graph(
             else None
         ),
         summary_model=summary_model,
-    )
-    # 即使目录为空也保留一个仅供防御路由执行的闭包；模型注册表不会暴露它。
-    runtime_activation_tool = create_skill_activation_tool(resolved_skill_catalog)
-    model_activation_tool = (
-        runtime_activation_tool if resolved_skill_catalog.skills else None
-    )
-    memory_tools = (
-        create_memory_tools(memory_store) if memory_store is not None else ()
+        tool_output_policy=(
+            resolved_output_policy if resolved_output_store is not None else None
+        ),
+        run_budget_tracker=resolved_run_budget_tracker,
+        parent_tools=subagent_parent_tools,
+        skill_catalog=resolved_skill_catalog,
+        deferred_tool_catalog=active_deferred_catalog,
     )
     passive_tools = get_agent_tools(
         task_tool,
         model_activation_tool,
         # 任意文件 Scope 都排除未声明路径边界的 MCP；task 保留独立工具集合。
-        extra_tools=(
-            *memory_tools,
-            *(() if file_tools else mcp_tools),
-            *file_tools,
-            *sandbox_tools,
-        ),
+        extra_tools=parent_extra_tools,
     )
     execution_tools = (*passive_tools, *get_skill_tools())
     passive_tool_names = tuple(tool.name for tool in passive_tools)
@@ -1031,6 +1775,7 @@ def build_agent_graph(
         prompt_context or AgentPromptContext(),
         available_tool_names=passive_tool_names,
         available_skills=resolved_skill_catalog.summaries,
+        deferred_tools=deferred_tool_catalog.summaries,
         readonly_project_id=(
             file_access.scope.project_id
             if file_access is not None
@@ -1056,6 +1801,7 @@ def build_agent_graph(
             if project_root_overview is not None
             else False
         ),
+        run_output_access_enabled=resolved_output_store is not None,
     )
     built_prompt = (prompt_builder or DefaultAgentPromptBuilder()).build(
         resolved_prompt_context
@@ -1078,6 +1824,10 @@ def build_agent_graph(
             execution_tools=execution_tools,
             dynamic_context_clock=resolved_dynamic_context_clock,
             context_summarizer=context_summarizer,
+            loop_detector=loop_detector,
+            progress_tracker=progress_tracker,
+            run_budget_tracker=resolved_run_budget_tracker,
+            deferred_tool_catalog=active_deferred_catalog,
         ),
         afunc=partial(
             async_model_node,
@@ -1088,12 +1838,37 @@ def build_agent_graph(
             execution_tools=execution_tools,
             dynamic_context_clock=resolved_dynamic_context_clock,
             context_summarizer=context_summarizer,
+            loop_detector=loop_detector,
+            progress_tracker=progress_tracker,
+            run_budget_tracker=resolved_run_budget_tracker,
+            deferred_tool_catalog=active_deferred_catalog,
         ),
         name="mini_deer_model",
     )
     builder.add_node("model", model_runnable)
-    # 执行注册表包含专用工具；条件路由会在进入 ToolNode 前复核同一权限决策。
-    builder.add_node("tools", ToolNode(execution_tools))
+    # 执行节点每次从 checkpoint 重新构建最小注册表，未提升 MCP 即使伪造调用也不可执行。
+    builder.add_node(
+        "tools",
+        RunnableLambda(
+            partial(
+                tools_node,
+                skill_catalog=resolved_skill_catalog,
+                passive_tools=passive_tools,
+                execution_tools=execution_tools,
+                deferred_tool_catalog=active_deferred_catalog,
+                progress_tracker=progress_tracker,
+            ),
+            afunc=partial(
+                async_tools_node,
+                skill_catalog=resolved_skill_catalog,
+                passive_tools=passive_tools,
+                execution_tools=execution_tools,
+                deferred_tool_catalog=active_deferred_catalog,
+                progress_tracker=progress_tracker,
+            ),
+            name="mini_deer_tools",
+        ),
+    )
     # 澄清节点不执行并列普通工具，生成问题后通过固定边结束当前图。
     builder.add_node("clarification", clarification_node)
     # 自动激活必须在独占节点落下可审计 ToolMessage，再回到模型获得技能正文。
@@ -1113,21 +1888,40 @@ def build_agent_graph(
             catalog=resolved_skill_catalog,
             passive_tool_names=passive_tool_names,
             execution_tool_names=execution_tool_names,
+            deferred_tool_catalog=active_deferred_catalog,
         ),
     )
-    # task 使用专用节点执行受控并发批次，并让执行、失败和跳过调用全部收敛。
+    builder.add_node(
+        "tool_discovery",
+        partial(
+            tool_discovery_node,
+            search_tool=tool_search,
+            catalog=deferred_tool_catalog,
+        ),
+    )
+    # task 先独立保存 running 状态，再执行受控并发批次；父 Run 取消时仍有
+    # 可恢复的执行中 checkpoint，正常终态则由 ToolMessage 再升级。
     builder.add_node(
         "delegation",
+        partial(
+            delegation_prepare_node,
+            skill_catalog=resolved_skill_catalog,
+        ),
+    )
+    builder.add_node(
+        "delegation_execute",
         RunnableLambda(
             partial(
                 delegation_node,
                 task_tool=task_tool,
                 budget=delegation_budget,
+                skill_catalog=resolved_skill_catalog,
             ),
             afunc=partial(
                 async_delegation_node,
                 task_tool=task_tool,
                 budget=delegation_budget,
+                skill_catalog=resolved_skill_catalog,
             ),
             name="mini_deer_delegation",
         ),
@@ -1142,14 +1936,17 @@ def build_agent_graph(
             skill_catalog=resolved_skill_catalog,
             passive_tool_names=passive_tool_names,
             execution_tool_names=execution_tool_names,
+            deferred_tool_catalog=active_deferred_catalog,
         ),
     )
     # 工具结果必须交回模型，第二次模型调用才能把结果组织成最终自然语言回答。
     builder.add_edge("tools", "model")
     builder.add_edge("skill_activation", "model")
     builder.add_edge("skill_policy_block", "model")
+    builder.add_edge("tool_discovery", "model")
     # 子 Agent 同步返回 ToolMessage 后，主模型必须核验并组织最终回答。
-    builder.add_edge("delegation", "model")
+    builder.add_edge("delegation", "delegation_execute")
+    builder.add_edge("delegation_execute", "model")
     # 第一版不挂起并恢复同一 Run；用户回答会在同一 Thread 创建新 Run。
     builder.add_edge("clarification", END)
 

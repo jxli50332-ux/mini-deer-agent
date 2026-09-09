@@ -275,7 +275,11 @@ function validUuid(value: string): boolean {
 
 /** 读取指定项目的持久会话归属，普通聊天和其他项目不会进入结果。 */
 export function fetchProjectThreads(
-  request: ProjectAccess & { readonly projectId: string },
+  request: ProjectAccess & {
+    readonly projectId: string;
+    readonly limit?: number;
+    readonly offset?: number;
+  },
   options: RequestOptions = {},
 ): Promise<readonly ThreadSummary[]> {
   if (!validUuid(request.projectId)) {
@@ -286,8 +290,25 @@ export function fetchProjectThreads(
       ),
     );
   }
+  const limit = request.limit ?? 50;
+  const offset = request.offset ?? 0;
+  if (
+    !Number.isSafeInteger(limit) ||
+    limit < 1 ||
+    limit > 100 ||
+    !Number.isSafeInteger(offset) ||
+    offset < 0 ||
+    offset > 1_000_000
+  ) {
+    return Promise.reject(
+      new ProjectClientError("invalid_request", "项目会话分页参数无效。"),
+    );
+  }
   return requestProject(
-    `/api/v1/projects/${request.projectId}/threads?limit=100`,
+    `/api/v1/projects/${request.projectId}/threads?${new URLSearchParams({
+      limit: String(limit),
+      offset: String(offset),
+    })}`,
     request,
     "GET",
     undefined,

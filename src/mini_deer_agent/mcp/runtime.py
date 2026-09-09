@@ -6,9 +6,10 @@ import asyncio
 import logging
 import re
 from collections.abc import Callable, Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, Protocol
+from types import MappingProxyType
+from typing import Literal, Mapping, Protocol
 
 from langchain_core.tools import BaseTool
 
@@ -48,6 +49,9 @@ class McpRuntime:
     config_path: Path
     tools: tuple[BaseTool, ...]
     servers: tuple[McpServerStatus, ...]
+    tool_routing_keywords: Mapping[str, tuple[str, ...]] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
 
     @property
     def tool_names(self) -> tuple[str, ...]:
@@ -159,6 +163,7 @@ async def initialize_mcp_runtime(
                 )
                 for name, config in server_items
             ),
+            tool_routing_keywords=MappingProxyType({}),
         )
 
     connections = {
@@ -182,6 +187,7 @@ async def initialize_mcp_runtime(
             config_path=loaded.path,
             tools=(),
             servers=statuses,
+            tool_routing_keywords=MappingProxyType({}),
         )
 
     discoveries = await asyncio.gather(
@@ -254,9 +260,22 @@ async def initialize_mcp_runtime(
             )
         )
 
+    accepted_names = {tool.name for tool in accepted_tools}
+    routing_keywords = {
+        name: tuple(keywords)
+        for name, keywords in loaded.configuration.tool_routing_keywords.items()
+        if name in accepted_names
+    }
+    ignored_names = set(loaded.configuration.tool_routing_keywords) - accepted_names
+    if ignored_names:
+        logger.warning(
+            "Ignoring MCP routing keywords for unavailable tools: %s",
+            ", ".join(sorted(ignored_names)),
+        )
     return McpRuntime(
         configured=loaded.configured,
         config_path=loaded.path,
         tools=tuple(accepted_tools),
         servers=tuple(statuses),
+        tool_routing_keywords=MappingProxyType(routing_keywords),
     )

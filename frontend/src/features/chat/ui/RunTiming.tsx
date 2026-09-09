@@ -52,6 +52,12 @@ const SETTLED_LABEL = {
   cancelled: "执行已停止",
 } as const;
 
+const CAPPED_REASON_LABEL: Readonly<Record<string, string>> = {
+  token_capped: "Token 预算已达上限",
+  turn_capped: "模型轮次预算已达上限",
+  loop_capped: "重复工具调用已安全收敛",
+};
+
 export function RunTiming({ timing }: RunTimingProps) {
   if (timing.kind === "active") {
     return <ActiveRunTiming startedAt={timing.startedAt} />;
@@ -62,18 +68,41 @@ export function RunTiming({ timing }: RunTimingProps) {
     return null;
   }
   const label = SETTLED_LABEL[timing.outcome];
+  const reasonLabel =
+    timing.finishReason === undefined || timing.finishReason === null
+      ? undefined
+      : CAPPED_REASON_LABEL[timing.finishReason];
+  const usageLabel = [
+    timing.totalTokens === undefined || timing.totalTokens === null
+      ? null
+      : `${timing.totalTokens.toLocaleString("zh-CN")} tokens`,
+    timing.modelCalls === undefined || timing.modelCalls === null
+      ? null
+      : `${timing.modelCalls} 次模型调用`,
+  ]
+    .filter((value): value is string => value !== null)
+    .join("，");
+  const detailLabel = [reasonLabel, usageLabel || null]
+    .filter((value): value is string => value !== undefined && value !== null)
+    .join("；");
+  const ariaLabel = `${label}，用时 ${formatted}${
+    detailLabel ? `；${detailLabel}` : ""
+  }`;
   return (
     <div
       className="run-timing"
       data-testid="run-timing"
       data-outcome={timing.outcome}
-      aria-label={`${label}，用时 ${formatted}`}
+      aria-label={ariaLabel}
     >
       <span className="run-timing__clock" aria-hidden="true">
         ◷
       </span>
       <span>{label}</span>
       <span className="run-timing__elapsed">，用时 {formatted}</span>
+      {detailLabel && (
+        <span className="run-timing__budget">；{detailLabel}</span>
+      )}
     </div>
   );
 }

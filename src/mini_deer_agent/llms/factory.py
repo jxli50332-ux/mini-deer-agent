@@ -27,6 +27,8 @@ def create_chat_model(settings: Settings | None = None) -> ChatOpenAI:
     model_kwargs: dict[str, object] = {
         "model": model_name,
         "api_key": settings.api_key,
+        # 流式响应显式请求最终用量块，供 Run 预算与基准指标累计。
+        "stream_usage": True,
     }
 
     if provider == "openai":

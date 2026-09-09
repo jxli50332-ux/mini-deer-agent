@@ -66,6 +66,10 @@ class RunRecord:
     finished_at: str | None
     finish_reason: str | None
     error_code: str | None
+    input_tokens: int | None
+    output_tokens: int | None
+    total_tokens: int | None
+    model_calls: int | None
 
 
 @dataclass(frozen=True, slots=True)

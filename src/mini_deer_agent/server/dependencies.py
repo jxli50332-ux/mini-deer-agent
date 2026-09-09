@@ -6,12 +6,15 @@ from fastapi import HTTPException, Request, status
 
 from mini_deer_agent.application import (
     ConversationHistoryService,
+    BenchmarkService,
     RunExecutionManager,
     RunEventHistoryService,
     RunStreamService,
     ThreadLifecycleService,
+    GoalStateService,
 )
 from mini_deer_agent.mcp import McpRuntime
+from mini_deer_agent.skills import UserSkillManager
 from mini_deer_agent.application.workspaces import ProjectService, ProjectThreadService
 from mini_deer_agent.workspace.picker import DirectoryPicker
 
@@ -99,6 +102,17 @@ def get_conversation_history_service(
     return cast(ConversationHistoryService, service)
 
 
+def get_benchmark_service(request: Request) -> BenchmarkService:
+    """取得固定能力基准服务，未就绪时失败关闭。"""
+    service = getattr(request.app.state, "benchmark_service", None)
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "service_not_ready", "message": "Benchmark service is not ready"},
+        )
+    return cast(BenchmarkService, service)
+
+
 def get_thread_lifecycle_service(request: Request) -> ThreadLifecycleService:
     """取得跨业务库与 Checkpointer 的 Thread 生命周期服务。"""
     service = getattr(request.app.state, "thread_lifecycle_service", None)
@@ -139,3 +153,31 @@ def get_mcp_runtime(request: Request) -> McpRuntime:
             },
         )
     return cast(McpRuntime, runtime)
+
+
+def get_user_skill_manager(request: Request) -> UserSkillManager:
+    """取得本地用户 Skill 管理器，未就绪时返回稳定 503。"""
+    manager = getattr(request.app.state, "user_skill_manager", None)
+    if manager is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "service_not_ready",
+                "message": "User skill manager is not ready",
+            },
+        )
+    return cast(UserSkillManager, manager)
+
+
+def get_goal_state_service(request: Request) -> GoalStateService:
+    """取得线程 Goal checkpoint 服务，未就绪时返回稳定 503。"""
+    service = getattr(request.app.state, "goal_state_service", None)
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "service_not_ready",
+                "message": "Goal state service is not ready",
+            },
+        )
+    return cast(GoalStateService, service)

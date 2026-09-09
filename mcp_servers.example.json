@@ -6,5 +6,9 @@
       "command": "python",
       "args": ["examples/mcp_learning_server.py"]
     }
+  },
+  "toolRoutingKeywords": {
+    "learning_add_numbers": ["加法", "两数求和", "add numbers"],
+    "learning_reverse_text": ["反转文本", "倒序字符串", "reverse text"]
   }
 }

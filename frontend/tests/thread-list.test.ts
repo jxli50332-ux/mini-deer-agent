@@ -123,7 +123,7 @@ describe("最近 Thread 列表 client", () => {
 
     expect(result[0]?.threadId).toBe(THREAD_ID);
     expect(fetcher).toHaveBeenCalledWith(
-      "/api/v1/threads?limit=20",
+      "/api/v1/threads?limit=20&offset=0&scope=all",
       expect.objectContaining({ method: "GET", cache: "no-store" }),
     );
   });

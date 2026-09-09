@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { ThreadSummary } from "@/entities/thread/model/types";
 import {
@@ -14,6 +14,8 @@ import {
 interface ThreadListState {
   readonly items: readonly ThreadSummary[];
   readonly isLoading: boolean;
+  readonly isLoadingMore: boolean;
+  readonly hasMore: boolean;
   readonly error: string | null;
 }
 
@@ -25,6 +27,7 @@ export interface UseThreadListOptions {
 
 export interface UseThreadListResult extends ThreadListState {
   readonly retry: () => void;
+  readonly loadMore: () => Promise<void>;
   readonly renameTitle: (threadId: string, title: string) => Promise<void>;
   readonly deleteThread: (threadId: string) => Promise<void>;
 }
@@ -44,12 +47,62 @@ export function useThreadList(
   const updater = options.updater ?? updateThreadTitle;
   const deleter = options.deleter ?? requestThreadDeletion;
   const [revision, setRevision] = useState(0);
+  const loadMoreController = useRef<AbortController | null>(null);
+  const pageSize = 50;
   const [state, setState] = useState<ThreadListState>({
     items: [],
     isLoading: true,
+    isLoadingMore: false,
+    hasMore: false,
     error: null,
   });
   const retry = useCallback(() => setRevision((value) => value + 1), []);
+  const loadMore = useCallback(async () => {
+    if (
+      loadMoreController.current !== null ||
+      !state.hasMore ||
+      state.isLoading
+    )
+      return;
+    const offset = state.items.length;
+    setState((current) => ({
+      ...current,
+      isLoadingMore: true,
+      error: null,
+    }));
+    const controller = new AbortController();
+    loadMoreController.current = controller;
+    try {
+      const items = await loader({
+        limit: pageSize,
+        offset,
+        scope: "standalone",
+        signal: controller.signal,
+      });
+      if (controller.signal.aborted) return;
+      setState((current) => ({
+        ...current,
+        items: [
+          ...new Map(
+            [...current.items, ...items].map((item) => [item.threadId, item]),
+          ).values(),
+        ],
+        isLoadingMore: false,
+        hasMore: items.length === pageSize,
+      }));
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      setState((current) => ({
+        ...current,
+        isLoadingMore: false,
+        error: errorMessage(error),
+      }));
+    } finally {
+      if (loadMoreController.current === controller) {
+        loadMoreController.current = null;
+      }
+    }
+  }, [loader, state.hasMore, state.isLoading, state.items.length]);
   const renameTitle = useCallback(
     async (threadId: string, title: string) => {
       const updated = await updater({ threadId, title });
@@ -77,6 +130,8 @@ export function useThreadList(
 
   useEffect(() => {
     const controller = new AbortController();
+    loadMoreController.current?.abort();
+    loadMoreController.current = null;
     setState((current) => ({
       ...current,
       isLoading: true,
@@ -85,9 +140,20 @@ export function useThreadList(
 
     void (async () => {
       try {
-        const items = await loader({ limit: 20, signal: controller.signal });
+        const items = await loader({
+          limit: pageSize,
+          offset: 0,
+          scope: "standalone",
+          signal: controller.signal,
+        });
         if (!controller.signal.aborted) {
-          setState({ items, isLoading: false, error: null });
+          setState({
+            items,
+            isLoading: false,
+            isLoadingMore: false,
+            hasMore: items.length === pageSize,
+            error: null,
+          });
         }
       } catch (error) {
         if (
@@ -104,8 +170,12 @@ export function useThreadList(
       }
     })();
 
-    return () => controller.abort();
+    return () => {
+      controller.abort();
+      loadMoreController.current?.abort();
+      loadMoreController.current = null;
+    };
   }, [loader, revision]);
 
-  return { ...state, retry, renameTitle, deleteThread };
+  return { ...state, retry, loadMore, renameTitle, deleteThread };
 }

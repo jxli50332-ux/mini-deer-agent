@@ -14,12 +14,32 @@ import {
   unregisterProject,
 } from "@/features/workspace/api/projects";
 
+const EXPANDED_PROJECT_KEY = "mini-deer-agent.navigation.expanded-project.v1";
+
+function readExpandedProject(): string | null {
+  try {
+    return localStorage.getItem(EXPANDED_PROJECT_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function writeExpandedProject(projectId: string | null): void {
+  try {
+    if (projectId === null) localStorage.removeItem(EXPANDED_PROJECT_KEY);
+    else localStorage.setItem(EXPANDED_PROJECT_KEY, projectId);
+  } catch {
+    // 浏览器禁用存储时保持当前会话内的展开状态即可。
+  }
+}
+
 interface ProjectState {
   readonly items: readonly ProjectSummary[];
   readonly nextOffset: number | null;
   readonly selectedProjectId: string | null;
   readonly autoOpenProjectId: string | null;
   readonly projectThreads: readonly ThreadSummary[];
+  readonly nextProjectThreadOffset: number | null;
   readonly pending:
     | "refresh"
     | "more"
@@ -27,6 +47,7 @@ interface ProjectState {
     | "pick"
     | "unregister"
     | "project_threads"
+    | "more_project_threads"
     | "create_thread"
     | null;
   readonly error: string | null;
@@ -38,6 +59,7 @@ const INITIAL_STATE: ProjectState = {
   selectedProjectId: null,
   autoOpenProjectId: null,
   projectThreads: [],
+  nextProjectThreadOffset: null,
   pending: "refresh",
   error: null,
   notice: null,
@@ -47,6 +69,7 @@ const INITIAL_STATE: ProjectState = {
 export function useProjects() {
   const [state, setState] = useState<ProjectState>(INITIAL_STATE);
   const active = useRef<AbortController | null>(null);
+  const restoreAttempted = useRef(false);
 
   useEffect(() => {
     // StrictMode 重挂载时取消旧请求，迟到结果不能覆盖新的页面状态。
@@ -90,7 +113,7 @@ export function useProjects() {
   }, []);
 
   /** 一次只允许一个请求；ref 门闩避免连续点击在 React 更新前重复提交。 */
-  async function execute<T>(
+  const execute = useCallback(async function execute<T>(
     kind: NonNullable<ProjectState["pending"]>,
     operation: (signal: AbortSignal) => Promise<T>,
     accept: (result: T) => void,
@@ -127,7 +150,7 @@ export function useProjects() {
         setState((current) => ({ ...current, pending: null }));
       }
     }
-  }
+  }, []);
 
   /** 显式刷新从第一页重建状态，续页合并按项目 ID 去重。 */
   async function load(offset: number, kind: "refresh" | "more"): Promise<void> {
@@ -203,6 +226,7 @@ export function useProjects() {
           selectedProjectId: project.projectId,
           autoOpenProjectId: project.projectId,
           projectThreads: [],
+          nextProjectThreadOffset: null,
           notice: `已添加文件夹“${project.name}”。`,
         }));
       },
@@ -242,26 +266,83 @@ export function useProjects() {
             current.selectedProjectId === project.projectId
               ? []
               : current.projectThreads,
+          nextProjectThreadOffset:
+            current.selectedProjectId === project.projectId
+              ? null
+              : current.nextProjectThreadOffset,
           notice: `已解除“${project.name}”的登记，原目录及文件已保留。`,
         })),
     );
   }
 
   /** 选择项目时从受保护接口重读会话，切换项目不会复用上一项目的数组。 */
-  async function openProject(project: ProjectSummary): Promise<boolean> {
-    return execute(
-      "project_threads",
+  const openProject = useCallback(
+    (project: ProjectSummary): Promise<boolean> =>
+      execute(
+        "project_threads",
+        (signal) =>
+          fetchProjectThreads({
+            projectId: project.projectId,
+            limit: 50,
+            offset: 0,
+            signal,
+          }),
+        (threads) => {
+          writeExpandedProject(project.projectId);
+          setState((current) => ({
+            ...current,
+            selectedProjectId: project.projectId,
+            autoOpenProjectId: null,
+            projectThreads: threads,
+            nextProjectThreadOffset: threads.length === 50 ? 50 : null,
+          }));
+        },
+      ),
+    [execute],
+  );
+
+  useEffect(() => {
+    if (
+      restoreAttempted.current ||
+      state.pending !== null ||
+      state.items.length === 0
+    ) {
+      return;
+    }
+    restoreAttempted.current = true;
+    const projectId = readExpandedProject();
+    const project = state.items.find((item) => item.projectId === projectId);
+    if (project !== undefined) void openProject(project);
+  }, [openProject, state.items, state.pending]);
+
+  async function loadMoreProjectThreads(
+    project: ProjectSummary,
+  ): Promise<void> {
+    const offset = state.nextProjectThreadOffset;
+    if (offset === null || state.selectedProjectId !== project.projectId)
+      return;
+    await execute(
+      "more_project_threads",
       (signal) =>
         fetchProjectThreads({
           projectId: project.projectId,
+          limit: 50,
+          offset,
           signal,
         }),
       (threads) =>
         setState((current) => ({
           ...current,
-          selectedProjectId: project.projectId,
-          autoOpenProjectId: null,
-          projectThreads: threads,
+          projectThreads: [
+            ...new Map(
+              [...current.projectThreads, ...threads].map((thread) => [
+                thread.threadId,
+                thread,
+              ]),
+            ).values(),
+          ],
+          nextProjectThreadOffset:
+            threads.length === 50 ? offset + threads.length : null,
         })),
     );
   }
@@ -292,6 +373,12 @@ export function useProjects() {
               : []
             ).filter((item) => item.threadId !== thread.threadId),
           ],
+          nextProjectThreadOffset:
+            current.selectedProjectId === project.projectId
+              ? current.nextProjectThreadOffset === null
+                ? null
+                : current.nextProjectThreadOffset + 1
+              : null,
           notice: `已在“${project.name}”中新建会话。`,
         }));
       },
@@ -321,16 +408,52 @@ export function useProjects() {
     pickDirectory,
     unregister,
     openProject,
-    closeProject: () =>
+    closeProject: () => {
+      writeExpandedProject(null);
       setState((current) => ({
         ...current,
         selectedProjectId: null,
         autoOpenProjectId: null,
         projectThreads: [],
+        nextProjectThreadOffset: null,
         error: null,
         notice: null,
-      })),
+      }));
+    },
     createProjectThread,
+    loadMoreProjectThreads,
+    syncProjectThreadTitle: (threadId: string, title: string) =>
+      setState((current) => {
+        const existing = current.projectThreads.find(
+          (thread) => thread.threadId === threadId,
+        );
+        if (existing === undefined) return current;
+        const updated = {
+          ...existing,
+          title,
+          updatedAt: new Date().toISOString(),
+        };
+        return {
+          ...current,
+          projectThreads: [
+            updated,
+            ...current.projectThreads.filter(
+              (thread) => thread.threadId !== threadId,
+            ),
+          ],
+        };
+      }),
+    removeProjectThread: (threadId: string) =>
+      setState((current) => ({
+        ...current,
+        projectThreads: current.projectThreads.filter(
+          (thread) => thread.threadId !== threadId,
+        ),
+        nextProjectThreadOffset:
+          current.nextProjectThreadOffset === null
+            ? null
+            : Math.max(0, current.nextProjectThreadOffset - 1),
+      })),
     refresh: () => load(0, "refresh"),
     loadMore: () =>
       state.nextOffset === null

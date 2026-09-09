@@ -17,6 +17,7 @@ type RunEventName = Literal[
     "ai_delta",
     "tool_call_delta",
     "tool_result",
+    "goal_status",
     "run_error",
     "run_interrupted",
     "run_completed",

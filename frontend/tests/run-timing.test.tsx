@@ -62,6 +62,28 @@ describe("RunTiming", () => {
       outcome,
     );
   });
+
+  it("把预算触顶显示为正常 Run 终态并保留用量", () => {
+    render(
+      <RunTiming
+        timing={{
+          kind: "settled",
+          outcome: "completed",
+          durationSeconds: 12,
+          finishReason: "token_capped",
+          totalTokens: 120_321,
+          modelCalls: 19,
+        }}
+      />,
+    );
+
+    const timing = screen.getByTestId("run-timing");
+    expect(timing).toHaveAttribute("data-outcome", "completed");
+    expect(timing).toHaveTextContent("Token 预算已达上限");
+    expect(timing).toHaveTextContent("120,321 tokens");
+    expect(timing).toHaveTextContent("19 次模型调用");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
 });
 
 describe("formatRunDuration", () => {

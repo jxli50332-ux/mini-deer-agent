@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Self
+from uuid import uuid4
 
 import pytest
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
@@ -27,6 +28,11 @@ from mini_deer_agent.agents import (
     async_model_node,
     build_agent_graph,
     model_node,
+)
+from mini_deer_agent.agents.middleware import (
+    RunOutputStore,
+    ToolOutputBudgetPolicy,
+    tool_result_meta,
 )
 from mini_deer_agent.skills import (
     BuiltInSkill,
@@ -84,7 +90,7 @@ def _delegation_task_call(
         "args": {
             "description": description,
             "prompt": f"独立完成：{description}",
-            "subagent_type": "general-purpose",
+            "subagent_type": "research",
         },
         "id": call_id,
         "type": "tool_call",
@@ -810,7 +816,7 @@ def test_explicit_slash_skill_cannot_be_replaced_by_automatic_activation() -> No
 def test_unknown_or_empty_skill_command_finishes_without_calling_model() -> None:
     """确定性的 slash 错误应直接形成 Assistant 结果，不能消耗模型请求。"""
     for user_text, expected in [
-        ("/missing-skill 执行任务", "未找到内置技能 `/missing-skill`"),
+        ("/missing-skill 执行任务", "未找到技能 `/missing-skill`"),
         (
             "/structured-explainer",
             "请在 `/structured-explainer` 后提供任务内容",
@@ -854,7 +860,7 @@ def test_skill_command_failure_reaches_async_product_event_stream() -> None:
         "ai_delta",
         "run_completed",
     ]
-    assert "未找到内置技能 `/missing-skill`" in (
+    assert "未找到技能 `/missing-skill`" in (
         run_events[1].payload["text"]
     )
 
@@ -1108,8 +1114,8 @@ def test_compiled_graph_executes_web_search_and_returns_final_answer(
     )
 
 
-def test_compiled_graph_exposes_and_executes_injected_mcp_tool() -> None:
-    """MCP 工具必须和内置工具共用模型绑定、ToolNode 与回环。"""
+def test_compiled_graph_defers_injected_mcp_tool_until_discovery() -> None:
+    """16.1 基础请求只公开 MCP 摘要，不能绑定或执行完整 Schema。"""
     calls: list[tuple[int, int]] = []
 
     def add_numbers(left: int, right: int) -> int:
@@ -1134,7 +1140,7 @@ def test_compiled_graph_exposes_and_executes_injected_mcp_tool() -> None:
                     }
                 ],
             ),
-            AIMessage(content="MCP 计算结果是 42。"),
+            AIMessage(content="该 MCP 工具尚未提升，因此没有执行计算。"),
         ]
     )
 
@@ -1142,9 +1148,119 @@ def test_compiled_graph_exposes_and_executes_injected_mcp_tool() -> None:
         {"messages": [HumanMessage(content="请通过 MCP 计算 19+23。")]}
     )
 
-    assert "learning_add_numbers" in model.bound_tool_names
-    assert calls == [(19, 23)]
-    assert result["messages"][-1].text == "MCP 计算结果是 42。"
+    assert "learning_add_numbers" not in model.bound_tool_names
+    assert calls == []
+    blocked = result["messages"][-2]
+    assert isinstance(blocked, ToolMessage)
+    assert blocked.status == "error"
+    assert result["messages"][-1].text == "该 MCP 工具尚未提升，因此没有执行计算。"
+
+
+def test_mcp_exception_returns_tool_error_and_model_can_choose_alternative() -> None:
+    """外部工具普通异常不能终止图，下一轮模型仍可解释并收尾。"""
+
+    calls: list[str] = []
+
+    def unavailable_service() -> str:
+        calls.append("invoked")
+        raise RuntimeError("invalid API key secret-value")
+
+    mcp_tool = StructuredTool.from_function(
+        unavailable_service,
+        name="private_lookup",
+        description="查询需要认证的外部服务",
+    )
+    model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "tool_search",
+                        "args": {"query": "private_lookup"},
+                        "id": "call-search-private",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "private_lookup",
+                        "args": {},
+                        "id": "call-mcp-error",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="外部查询不可用；我会基于已有信息给出可完成部分。"),
+        ]
+    )
+
+    result = build_agent_graph(model, mcp_tools=(mcp_tool,)).invoke(
+        {"messages": [HumanMessage(content="查询外部资料，失败时说明替代方案。")]}
+    )
+
+    tool_message = result["messages"][-2]
+    assert calls == ["invoked"]
+    assert isinstance(tool_message, ToolMessage)
+    assert tool_message.status == "error"
+    assert tool_result_meta(tool_message).status == "terminal_error"
+    assert "secret-value" not in tool_message.text
+    assert result["messages"][-1].text.startswith("外部查询不可用")
+
+
+def test_repeated_identical_tool_calls_warn_then_force_final_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """硬阈值调用不再执行，收尾响应移除新工具并携带稳定停止原因。"""
+    calls: list[str] = []
+
+    def repeatable_lookup(query: str, max_results: int = 5) -> str:
+        del max_results
+        calls.append(query)
+        return json.dumps({"query": query, "results": []})
+    monkeypatch.setattr(web_search, "func", repeatable_lookup)
+
+    def repeated(call_id: str) -> AIMessage:
+        return AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "web_search",
+                    "args": {"query": "same"},
+                    "id": call_id,
+                    "type": "tool_call",
+                }
+            ],
+        )
+
+    model = ToolAwareFakeModel(
+        responses=[
+            repeated("call-loop-1"),
+            repeated("call-loop-2"),
+            repeated("call-loop-3"),
+            AIMessage(content="已有搜索均为空，因此无法确认目标存在。"),
+        ]
+    )
+
+    result = build_agent_graph(
+        model,
+        loop_soft_limit=2,
+        loop_hard_limit=3,
+    ).invoke({"messages": [HumanMessage(content="查找目标，空结果时收尾。")]})
+
+    assert calls == ["same", "same"]
+    assert any(
+        message.additional_kwargs.get("kind") == "loop_warning"
+        for message in model.received_histories[2]
+    )
+    final = result["messages"][-1]
+    assert isinstance(final, AIMessage)
+    assert final.text == "已有搜索均为空，因此无法确认目标存在。"
+    assert final.tool_calls == []
+    assert final.additional_kwargs["mini_deer_stop_reason"] == "loop_capped"
 
 
 def test_compiled_graph_can_search_fetch_and_cite_full_page(
@@ -1258,7 +1374,7 @@ def test_compiled_graph_delegates_with_isolated_context_and_synthesizes_result()
                         "args": {
                             "description": "比较两个方案",
                             "prompt": delegated_prompt,
-                            "subagent_type": "general-purpose",
+                            "subagent_type": "research",
                         },
                         "id": "call-task-1",
                         "type": "tool_call",
@@ -1309,14 +1425,26 @@ def test_compiled_graph_delegates_with_isolated_context_and_synthesizes_result()
         if isinstance(message, ToolMessage) and message.name == "task"
     )
     payload = json.loads(task_result.text)
-    assert payload == {
+    assert {
+        key: payload[key]
+        for key in (
+            "version",
+            "kind",
+            "status",
+            "subagent_type",
+            "description",
+            "result",
+        )
+    } == {
         "version": 1,
         "kind": "subagent_result",
         "status": "completed",
-        "subagent_type": "general-purpose",
+        "subagent_type": "research",
         "description": "比较两个方案",
         "result": "方案 A 更简单，方案 B 扩展性更好。",
     }
+    assert payload["duration_ms"] >= 0
+    assert payload["usage"]["model_calls"] == 1
     assert result["messages"][-1].text == "综合来看，当前阶段优先选择方案 A。"
 
 
@@ -1347,7 +1475,7 @@ def test_delegation_skips_coemitted_tools_and_settles_every_call(
                         "args": {
                             "description": "独立分析",
                             "prompt": "独立分析这个问题。",
-                            "subagent_type": "general-purpose",
+                            "subagent_type": "research",
                         },
                         "id": "call-priority-task",
                         "type": "tool_call",
@@ -1394,8 +1522,11 @@ def test_async_delegation_runs_three_tasks_concurrently_and_preserves_order(
             "独立完成：任务三": 0.0,
         }
 
-        async def concurrent_runner(model: Any, prompt: str) -> str:
+        async def concurrent_runner(
+            model: Any, prompt: str, **options: object
+        ) -> str:
             del model
+            del options
             started.append(prompt)
             if len(started) == 3:
                 all_started.set()
@@ -1464,8 +1595,9 @@ def test_delegation_limits_each_batch_and_settles_mixed_calls(
     subagent_module = import_module("mini_deer_agent.agents.subagent")
     executed_prompts: list[str] = []
 
-    def run_without_model(model: Any, prompt: str) -> str:
+    def run_without_model(model: Any, prompt: str, **options: object) -> str:
         del model
+        del options
         executed_prompts.append(prompt)
         return f"{prompt}的结果"
 
@@ -1525,8 +1657,9 @@ def test_delegation_enforces_six_task_total_across_batches(
     subagent_module = import_module("mini_deer_agent.agents.subagent")
     executed_prompts: list[str] = []
 
-    def run_without_model(model: Any, prompt: str) -> str:
+    def run_without_model(model: Any, prompt: str, **options: object) -> str:
         del model
+        del options
         executed_prompts.append(prompt)
         return f"{prompt}的结果"
 
@@ -1580,8 +1713,11 @@ def test_parallel_delegation_isolates_failure_and_cancels_all_children(
     subagent_module = import_module("mini_deer_agent.agents.subagent")
 
     async def failure_scenario() -> None:
-        async def partly_failing_runner(model: Any, prompt: str) -> str:
+        async def partly_failing_runner(
+            model: Any, prompt: str, **options: object
+        ) -> str:
             del model
+            del options
             if prompt.endswith("失败任务"):
                 raise RuntimeError("不应泄露的异常")
             return f"{prompt}的成功结果"
@@ -1620,9 +1756,12 @@ def test_parallel_delegation_isolates_failure_and_cancels_all_children(
         started_count = 0
         cancelled_prompts: list[str] = []
 
-        async def cancellable_runner(model: Any, prompt: str) -> str:
+        async def cancellable_runner(
+            model: Any, prompt: str, **options: object
+        ) -> str:
             nonlocal started_count
             del model
+            del options
             started_count += 1
             if started_count == 3:
                 started.set()
@@ -1648,9 +1787,22 @@ def test_parallel_delegation_isolates_failure_and_cancels_all_children(
                 )
             ]
         )
+        checkpointer = InMemorySaver()
+        graph = build_agent_graph(model, checkpointer=checkpointer)
+        config = {
+            "configurable": {"thread_id": "cancelled-delegation-lifecycle"}
+        }
         graph_task = asyncio.create_task(
-            build_agent_graph(model).ainvoke(
-                {"messages": [HumanMessage(content="启动后取消全部任务。")]}
+            graph.ainvoke(
+                {
+                    "messages": [
+                        HumanMessage(
+                            content="启动后取消全部任务。",
+                            id="turn-cancelled-delegation",
+                        )
+                    ]
+                },
+                config,
             )
         )
         await asyncio.wait_for(started.wait(), timeout=1)
@@ -1662,6 +1814,12 @@ def test_parallel_delegation_isolates_failure_and_cancels_all_children(
             "独立完成：取消1",
             "独立完成：取消2",
             "独立完成：取消3",
+        ]
+        snapshot = graph.get_state(config).values
+        assert [entry["status"] for entry in snapshot["delegations"]] == [
+            "running",
+            "running",
+            "running",
         ]
 
     asyncio.run(failure_scenario())
@@ -1868,3 +2026,94 @@ def test_checkpointer_requires_thread_id() -> None:
 
     with pytest.raises(ValueError, match="thread_id"):
         graph.invoke({"messages": [HumanMessage(content="缺少线程编号。")]})
+
+
+def test_large_tool_result_is_externalized_and_read_through_virtual_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实 ToolNode 回环只把摘要交给模型，并允许当前 Run 分段续读。"""
+    run_id = str(uuid4())
+    store = RunOutputStore(tmp_path / "run-outputs")
+    policy = ToolOutputBudgetPolicy(
+        max_inline_chars=1_024,
+        sample_chars=100,
+        read_chunk_chars=400,
+    )
+    large_content = json.dumps(
+        {
+            "records": ["x" * 100 for _ in range(40)],
+            "last_error": "target-error-marker",
+        }
+    )
+    output_path = store.virtual_path(
+        tool_name="web_search",
+        tool_call_id="call-large-output",
+        output_format="json",
+    )
+
+    def large_search(query: str, max_results: int = 5) -> str:
+        del query, max_results
+        return large_content
+    monkeypatch.setattr(web_search, "func", large_search)
+    model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "web_search",
+                        "args": {"query": "large result"},
+                        "id": "call-large-output",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {
+                            "path": output_path,
+                            "start_line": 1,
+                            "limit": 2,
+                        },
+                        "id": "call-read-output",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="已定位 target-error-marker。"),
+        ]
+    )
+
+    result = build_agent_graph(
+        model,
+        tool_output_store=store,
+        tool_output_policy=policy,
+    ).invoke(
+        {"messages": [HumanMessage(content="定位大型结果中的最后一个错误。")]},
+        {"configurable": {"run_id": run_id}},
+    )
+
+    tool_messages = [
+        message for message in result["messages"] if isinstance(message, ToolMessage)
+    ]
+    assert [message.name for message in tool_messages] == [
+        "web_search",
+        "read_file",
+    ]
+    reference = json.loads(tool_messages[0].text)
+    read_result = json.loads(tool_messages[1].text)
+    assert reference["path"] == output_path
+    assert reference["stored"] is True
+    assert read_result["path"] == output_path
+    assert read_result["virtual_chunks"] is True
+    assert len(tool_messages[0].text) <= policy.max_inline_chars
+    assert all(
+        large_content not in message.text
+        for history in model.received_histories
+        for message in history
+    )
+    assert result["messages"][-1].text == "已定位 target-error-marker。"

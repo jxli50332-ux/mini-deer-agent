@@ -1,4 +1,4 @@
-"""提供 write_todos 规划工具，让 Agent 对复杂任务先列计划并跟踪进度。"""
+"""提供 write_todos 规划工具，让 Agent 对复杂任列计划并跟踪进度。"""
 
 import json
 from typing import Literal

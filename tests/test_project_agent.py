@@ -3,6 +3,7 @@
 import asyncio
 import json
 import runpy
+from importlib import import_module
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from test_agent import ToolAwareFakeModel
 from mini_deer_agent.agents import AgentPromptContext, build_agent_graph
+from mini_deer_agent.agents.subagent import SubagentExecutionResult
 from mini_deer_agent.application.run_stream import RunStreamService
 from mini_deer_agent.application.workspaces import (
     ProjectFileAccessResolver,
@@ -87,6 +89,356 @@ def test_project_graph_reads_real_evidence(project, asynchronous):
     assert "`read_file.next_line = null` 表示文件已读到末尾" in prompt
     assert "不得根据正文是否以标点或换行结尾猜测截断" in prompt
     assert {"list_files", "read_file"}.issubset(model.bound_tool_names)
+
+
+def test_project_reader_inherits_frozen_scope_and_active_skill_intersection(
+    project,
+    tmp_path: Path,
+) -> None:
+    """project-reader 只能看到父 Run 项目只读工具，且不能读取根外文件。"""
+    service, record = project
+    access = ReadOnlyFileAccess.for_project(service, record.project_id)
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_text("不得读取", encoding="utf-8")
+    catalog = BuiltInSkillCatalog(
+        skills=(
+            BuiltInSkill(
+                name="reader-skill",
+                description="允许项目委派读取。",
+                instructions="委派 project-reader 查找真实证据。",
+                source_file=Path("reader-skill/SKILL.md"),
+                allowed_tools=("task", "read_file"),
+            ),
+        )
+    )
+    model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "task",
+                        "args": {
+                            "description": "读取项目证据",
+                            "prompt": "读取 main.py，并确认根外文件不可访问。",
+                            "subagent_type": "project-reader",
+                        },
+                        "id": "call-project-reader",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            call("read_file", {"path": "main.py"}, "child-read-project"),
+            call(
+                "read_file",
+                {"path": str(outside)},
+                "child-read-outside",
+            ),
+            AIMessage(content="项目文件可读，根外文件被拒绝。"),
+            AIMessage(content="已核验 project-reader 的只读结果。"),
+        ]
+    )
+
+    result = build_agent_graph(
+        model,
+        file_access=access,
+        skill_catalog=catalog,
+    ).invoke(
+        {
+            "messages": [
+                HumanMessage(content="/reader-skill 检查项目与根外访问边界。")
+            ]
+        }
+    )
+
+    assert ["read_file"] in model.bound_tool_name_histories
+    assert "`project-reader` 只继承本 Run 冻结范围" in (
+        model.received_histories[0][0].text
+    )
+    child_histories = [
+        history
+        for history in model.received_histories
+        if "project-reader 子 Agent" in history[0].text
+    ]
+    child_results = {
+        message.tool_call_id: json.loads(message.text)
+        for message in child_histories[-1]
+        if isinstance(message, ToolMessage)
+    }
+    assert child_results["child-read-project"]["project_id"] == record.project_id
+    assert child_results["child-read-project"]["lines"][1] == "answer = 42"
+    assert child_results["child-read-outside"]["ok"] is False
+    assert child_results["child-read-outside"]["error"]["code"] == (
+        "project_path_invalid"
+    )
+    task_result = next(
+        message
+        for message in result["messages"]
+        if isinstance(message, ToolMessage) and message.name == "task"
+    )
+    assert json.loads(task_result.text)["subagent_type"] == "project-reader"
+    assert result["messages"][-1].text == "已核验 project-reader 的只读结果。"
+
+
+def test_test_runner_executes_only_in_parent_project_sandbox(
+    project,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """test-runner 继承冻结项目命令工具，但看不到任何文件写工具。"""
+    service, record = project
+    access = ReadOnlyFileAccess.for_project(service, record.project_id)
+    executions: list[tuple[Path, str]] = []
+
+    def run_check(
+        path: Path,
+        command: str,
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        executions.append((path, command))
+        return {
+            "command_completed": True,
+            "exit_code": 0,
+            "stdout": "1 test passed\n",
+            "stderr": "",
+            "released": True,
+        }
+
+    monkeypatch.setattr(
+        project_sandbox,
+        "run_docker_project_command",
+        run_check,
+    )
+
+    async def run_check_async(
+        path: Path,
+        command: str,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        return run_check(path, command, **kwargs)
+
+    monkeypatch.setattr(
+        project_sandbox,
+        "run_docker_project_command_async",
+        run_check_async,
+    )
+    model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "task",
+                        "args": {
+                            "description": "运行聚焦测试",
+                            "prompt": "运行 python -m unittest 并返回证据。",
+                            "subagent_type": "test-runner",
+                        },
+                        "id": "call-test-runner",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            call(
+                "run_project_command",
+                {
+                    "description": "运行聚焦测试",
+                    "command": "python -m unittest",
+                },
+                "child-run-tests",
+            ),
+            AIMessage(content="测试 exit 0，1 test passed。"),
+            AIMessage(content="已核验测试通过。"),
+        ]
+    )
+
+    result = build_agent_graph(model, file_access=access).invoke(
+        {"messages": [HumanMessage(content="委派测试并汇总结论。")]}
+    )
+
+    expected_tools = [
+        "inspect_execution_environment",
+        "inspect_project_sandbox",
+        "run_project_command",
+    ]
+    assert expected_tools in model.bound_tool_name_histories
+    child_history = next(
+        history
+        for history in reversed(model.received_histories)
+        if "test-runner 子 Agent" in history[0].text
+        and any(isinstance(message, ToolMessage) for message in history)
+    )
+    tool_result = next(
+        message for message in child_history if isinstance(message, ToolMessage)
+    )
+    assert json.loads(tool_result.text)["exit_code"] == 0
+    assert executions == [(Path(record.root_path), "python -m unittest")]
+    task_result = next(
+        message
+        for message in result["messages"]
+        if isinstance(message, ToolMessage) and message.name == "task"
+    )
+    assert json.loads(task_result.text)["subagent_type"] == "test-runner"
+    assert all(
+        "write_file" not in names and "str_replace" not in names
+        for names in model.bound_tool_name_histories
+        if names == expected_tools
+    )
+
+
+def test_main_parallel_reader_and_runner_then_serially_fixes_project(
+    project,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """主 Agent 可并行取得读/测证据，但只有主图执行修改和最终检查。"""
+    service, record = project
+    access = ReadOnlyFileAccess.for_project(service, record.project_id)
+    subagent_module = import_module("mini_deer_agent.agents.subagent")
+    started_roles: set[str] = set()
+    selected_tools: dict[str, set[str]] = {}
+    both_started = asyncio.Event()
+
+    async def run_specialist(
+        _model,
+        prompt: str,
+        **options: object,
+    ) -> SubagentExecutionResult:
+        config = options["config"]
+        tools = options["available_tools"]
+        role = config.name
+        started_roles.add(role)
+        selected_tools[role] = {tool.name for tool in tools}
+        if len(started_roles) == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=1)
+        if role == "project-reader":
+            assert "定位" in prompt
+            return SubagentExecutionResult("main.py:2 的 answer 应改为 43。")
+        assert role == "test-runner"
+        assert "测试" in prompt
+        return SubagentExecutionResult("检查预期 answer == 43，当前失败。")
+
+    monkeypatch.setattr(
+        subagent_module,
+        "async_run_subagent",
+        run_specialist,
+    )
+    commands: list[str] = []
+
+    def run_check(
+        path: Path,
+        command: str,
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        commands.append(command)
+        passed = "answer = 43" in (path / "main.py").read_text(encoding="utf-8")
+        return {
+            "command_completed": True,
+            "exit_code": 0 if passed else 1,
+            "stdout": "1 test passed\n" if passed else "",
+            "stderr": "answer mismatch\n" if not passed else "",
+            "released": True,
+        }
+
+    monkeypatch.setattr(
+        project_sandbox,
+        "run_docker_project_command",
+        run_check,
+    )
+    async def run_parallel_check_async(
+        path: Path,
+        command: str,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        return run_check(path, command, **kwargs)
+
+    monkeypatch.setattr(
+        project_sandbox,
+        "run_docker_project_command_async",
+        run_parallel_check_async,
+    )
+    model = ToolAwareFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "task",
+                        "args": {
+                            "description": "定位缺陷",
+                            "prompt": "只读定位 answer 缺陷和修改位置。",
+                            "subagent_type": "project-reader",
+                        },
+                        "id": "call-reader-parallel",
+                        "type": "tool_call",
+                    },
+                    {
+                        "name": "task",
+                        "args": {
+                            "description": "诊断测试",
+                            "prompt": "运行或分析相关测试失败证据。",
+                            "subagent_type": "test-runner",
+                        },
+                        "id": "call-runner-parallel",
+                        "type": "tool_call",
+                    },
+                ],
+            ),
+            call(
+                "str_replace",
+                {
+                    "path": "main.py",
+                    "old_str": "answer = 42",
+                    "new_str": "answer = 43",
+                },
+                "main-fix",
+            ),
+            call(
+                "run_project_command",
+                {
+                    "description": "主 Agent 最终回归",
+                    "command": "python -m unittest",
+                },
+                "main-final-check",
+            ),
+            AIMessage(content="已根据并行证据修复，并完成最终检查。"),
+        ]
+    )
+
+    result = asyncio.run(
+        build_agent_graph(model, file_access=access).ainvoke(
+            {"messages": [HumanMessage(content="定位并修复 answer 测试失败。")]}
+        )
+    )
+
+    assert started_roles == {"project-reader", "test-runner"}
+    assert selected_tools["project-reader"] == {
+        "list_files",
+        "glob_files",
+        "search_files",
+        "read_file",
+    }
+    assert selected_tools["test-runner"] == {
+        "inspect_execution_environment",
+        "inspect_project_sandbox",
+        "run_project_command",
+    }
+    assert all(
+        "str_replace" not in names and "write_file" not in names
+        for names in selected_tools.values()
+    )
+    assert (Path(record.root_path) / "main.py").read_text(encoding="utf-8") == (
+        "# 示例\nanswer = 43\n"
+    )
+    assert commands == ["python -m unittest"]
+    task_results = [
+        json.loads(message.text)["subagent_type"]
+        for message in result["messages"]
+        if isinstance(message, ToolMessage) and message.name == "task"
+    ]
+    assert task_results == ["project-reader", "test-runner"]
+    assert result["messages"][-1].text == (
+        "已根据并行证据修复，并完成最终检查。"
+    )
 
 
 def test_project_file_scope_exposes_fixed_sandbox_mount_tool(project) -> None:
@@ -745,8 +1097,8 @@ def test_web_stream_passes_current_message_to_external_path_resolver(
     assert Path(payload["path"]) == external
 
 
-def test_project_graph_excludes_mcp_but_normal_chat_keeps_it(project):
-    """传入的 MCP 工具在项目图中既不可见也不可执行，普通聊天保持兼容。"""
+def test_project_graph_excludes_mcp_and_normal_chat_only_lists_summary(project):
+    """项目图排除 MCP；普通聊天也只列摘要，不默认绑定完整 Schema。"""
     service, record = project
     executed = []
 
@@ -778,7 +1130,8 @@ def test_project_graph_excludes_mcp_but_normal_chat_keeps_it(project):
     build_agent_graph(ordinary, mcp_tools=(mcp,)).invoke(
         {"messages": [HumanMessage(content="你好")]}
     )
-    assert "external_mcp" in ordinary.bound_tool_names
+    assert "external_mcp" not in ordinary.bound_tool_names
+    assert "external_mcp" in ordinary.received_histories[0][0].text
 
 
 def test_project_graph_still_enforces_skill_policy(project):

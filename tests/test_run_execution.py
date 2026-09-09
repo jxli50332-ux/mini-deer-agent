@@ -108,6 +108,41 @@ class CancellationResistantRunStreamService:
         self.finished.set()
 
 
+class FailingRunStreamService:
+    """在管理器边界抛错，验证客户端仍收到可审计终态。"""
+
+    async def astream_run_events(
+        self,
+        _message: str,
+        _thread_id: str,
+        _run_id: str,
+        _attachments: tuple[TextAttachment, ...] = (),
+    ) -> AsyncIterator[RunEvent]:
+        if False:
+            yield cast(RunEvent, None)
+        raise RuntimeError("private provider failure")
+
+
+class MissingTerminalRunStreamService:
+    """模拟上游静默结束，管理器必须补成失败终态而不能遗留 busy。"""
+
+    async def astream_run_events(
+        self,
+        _message: str,
+        thread_id: str,
+        run_id: str,
+        _attachments: tuple[TextAttachment, ...] = (),
+    ) -> AsyncIterator[RunEvent]:
+        yield RunEvent(
+            event="run_started",
+            run_id=run_id,
+            thread_id=thread_id,
+            sequence=1,
+            message_id=None,
+            payload={},
+        )
+
+
 def test_cancel_stops_background_task_and_is_idempotent(tmp_path: Path) -> None:
     """显式取消必须抵达后台 Task，并稳定物化一次 interrupted 终态。"""
 
@@ -199,6 +234,31 @@ def test_completed_run_rejects_late_cancel(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_stream_without_terminal_is_failed_and_releases_thread(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        with open_sqlite_conversation_repository(
+            tmp_path / "missing-terminal.sqlite"
+        ) as repository:
+            manager = RunExecutionManager(
+                cast(RunStreamService, MissingTerminalRunStreamService()),
+                repository,
+            )
+            started = await manager.start_run(
+                "静默结束",
+                THREAD_ID,
+                MESSAGE_ID,
+            )
+            events = [event async for event in started.events]
+            record = repository.get_run(started.run_id)
+            thread = repository.get_thread(THREAD_ID)
+
+        assert [event.event for event in events] == ["run_started", "run_error"]
+        assert record is not None and record.status == "failed"
+        assert thread is not None and thread.status == "error"
+
+    asyncio.run(scenario())
+
+
 def test_cancel_timeout_forces_terminal_state_and_releases_thread(
     tmp_path: Path,
 ) -> None:
@@ -283,5 +343,66 @@ def test_different_threads_can_run_and_cancel_independently(tmp_path: Path) -> N
             )
             second_record = repository.get_run(second.run_id)
             assert second_record is not None and second_record.status == "interrupted"
+
+    asyncio.run(scenario())
+
+
+def test_whole_run_timeout_interrupts_and_releases_thread(tmp_path: Path) -> None:
+    """无响应的模型/工具不能永久占用同一 Thread。"""
+
+    async def scenario() -> None:
+        with open_sqlite_conversation_repository(
+            tmp_path / "run-timeout.sqlite"
+        ) as repository:
+            manager = RunExecutionManager(
+                cast(RunStreamService, BlockingRunStreamService()),
+                repository,
+                run_timeout_seconds=0.01,
+            )
+            started = await manager.start_run("永久等待", THREAD_ID, MESSAGE_ID)
+            events = await asyncio.wait_for(
+                _collect(started.events),
+                timeout=1,
+            )
+            record = repository.get_run(started.run_id)
+            thread = repository.get_thread(THREAD_ID)
+
+            assert [event.event for event in events] == [
+                "run_started",
+                "run_interrupted",
+            ]
+            assert events[-1].payload == {"reason": "run_timeout"}
+            assert record is not None and record.status == "interrupted"
+            assert record.finish_reason == "run_timeout"
+            assert thread is not None and thread.status == "idle"
+
+    async def _collect(events: AsyncIterator[RunEvent]) -> list[RunEvent]:
+        return [event async for event in events]
+
+    asyncio.run(scenario())
+
+
+def test_manager_exception_publishes_run_error_terminal(tmp_path: Path) -> None:
+    """管理器异常必须同时收敛数据库和 SSE，不能只在库内静默中断。"""
+
+    async def scenario() -> None:
+        with open_sqlite_conversation_repository(
+            tmp_path / "manager-error.sqlite"
+        ) as repository:
+            manager = RunExecutionManager(
+                cast(RunStreamService, FailingRunStreamService()),
+                repository,
+            )
+            started = await manager.start_run("触发异常", THREAD_ID, MESSAGE_ID)
+            events = [event async for event in started.events]
+            record = repository.get_run(started.run_id)
+
+            assert [event.event for event in events] == [
+                "run_started",
+                "run_error",
+            ]
+            assert events[-1].payload["code"] == "run_execution_manager_failed"
+            assert "private provider failure" not in str(events[-1].payload)
+            assert record is not None and record.status == "failed"
 
     asyncio.run(scenario())

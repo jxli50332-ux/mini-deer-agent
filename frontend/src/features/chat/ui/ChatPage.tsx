@@ -21,6 +21,8 @@ import type {
   ThreadDeleter,
   ThreadTitleUpdater,
 } from "@/features/threads/api/thread-list";
+import { fetchThreadSummary } from "@/features/threads/api/thread-list";
+import type { ThreadSummary } from "@/entities/thread/model/types";
 import { useConversationScroll } from "@/features/chat/model/use-conversation-scroll";
 import { useThreadHistory } from "@/features/threads/model/use-thread-history";
 import { useThreadList } from "@/features/threads/model/use-thread-list";
@@ -33,6 +35,39 @@ import {
 } from "@/features/chat/model/human-input";
 import { projectToolResultChangesTree } from "@/features/chat/model/project-changes";
 import type { ChatRunEvent } from "@/features/chat/model/events";
+import type { PreparedTextAttachment } from "@/entities/attachment/model/text-attachments";
+import type { BenchmarkCase } from "@/features/benchmarks/api/benchmarks";
+import { BenchmarkPanel } from "@/features/benchmarks/ui/BenchmarkPanel";
+import type {
+  GoalClearer,
+  GoalLoader,
+  GoalSetter,
+  GoalStopper,
+} from "@/features/goals/api/thread-goal";
+import { useThreadGoal } from "@/features/goals/model/use-thread-goal";
+import { GoalPanel } from "@/features/goals/ui/GoalPanel";
+import { useResizablePreference } from "@/shared/model/use-resizable-preference";
+
+const RAIL_SIZE_PREFERENCE = {
+  storageKey: "mini-deer-agent.layout.rail-width.v1",
+  defaultValue: 280,
+  minValue: 240,
+  maxStoredValue: 480,
+  getMaxValue: () =>
+    Math.max(240, Math.min(480, (globalThis.innerWidth || 1200) * 0.45)),
+} as const;
+
+const COMPOSER_SIZE_PREFERENCE = {
+  storageKey: "mini-deer-agent.layout.composer-height.v1",
+  defaultValue: 88,
+  minValue: 64,
+  maxStoredValue: 420,
+  getMaxValue: () => {
+    const viewportHeight = globalThis.innerHeight || 900;
+    const ratio = (globalThis.innerWidth || 1200) <= 800 ? 0.35 : 0.42;
+    return Math.max(64, Math.min(420, viewportHeight * ratio));
+  },
+} as const;
 
 interface ChatPageProps {
   readonly streamRunner?: ChatStreamRunner;
@@ -44,12 +79,22 @@ interface ChatPageProps {
   readonly threadListLoader?: ThreadListLoader;
   readonly threadTitleUpdater?: ThreadTitleUpdater;
   readonly threadDeleter?: ThreadDeleter;
+  readonly goalLoader?: GoalLoader;
+  readonly goalSetter?: GoalSetter;
+  readonly goalStopper?: GoalStopper;
+  readonly goalClearer?: GoalClearer;
 }
 
 interface ComposerDraftInsertion {
   readonly id: number;
   readonly threadId: string;
   readonly text: string;
+}
+
+interface SelectedBenchmark {
+  readonly threadId: string;
+  readonly caseId: string;
+  readonly title: string;
 }
 
 export function ChatPage({
@@ -62,6 +107,10 @@ export function ChatPage({
   threadListLoader,
   threadTitleUpdater,
   threadDeleter,
+  goalLoader,
+  goalSetter,
+  goalStopper,
+  goalClearer,
 }: ChatPageProps) {
   // Repository 在组件生命周期内保持稳定，避免 render 时反复读取浏览器存储。
   const [threadRepository] = useState(
@@ -72,16 +121,46 @@ export function ChatPage({
   );
   const [isRailCollapsed, setIsRailCollapsed] = useState(false);
   const [isMobileNavigationOpen, setIsMobileNavigationOpen] = useState(false);
+  const [isBenchmarkPanelOpen, setIsBenchmarkPanelOpen] = useState(false);
+  const [selectedBenchmark, setSelectedBenchmark] =
+    useState<SelectedBenchmark | null>(null);
   const [projectFileTreeRevision, setProjectFileTreeRevision] = useState(0);
+  const [fetchedThreadMetadata, setFetchedThreadMetadata] = useState<{
+    readonly threadId: string;
+    readonly summary: ThreadSummary;
+  } | null>(null);
+  const [goalEvaluationThreadId, setGoalEvaluationThreadId] = useState<
+    string | null
+  >(null);
   const structureChangedRunIds = useRef(new Set<string>());
   const [composerDraftInsertion, setComposerDraftInsertion] =
     useState<ComposerDraftInsertion | null>(null);
+  const railSize = useResizablePreference(RAIL_SIZE_PREFERENCE);
+  const composerSize = useResizablePreference(COMPOSER_SIZE_PREFERENCE);
   const nextDraftInsertionId = useRef(0);
+  const {
+    goal,
+    isLoading: isGoalLoading,
+    isMutating: isGoalMutating,
+    error: goalError,
+    retry: retryGoal,
+    setGoal,
+    stopGoal: stopGoalState,
+    clearGoal,
+  } = useThreadGoal(threadId, {
+    ...(goalLoader === undefined ? {} : { loader: goalLoader }),
+    ...(goalSetter === undefined ? {} : { setter: goalSetter }),
+    ...(goalStopper === undefined ? {} : { stopper: goalStopper }),
+    ...(goalClearer === undefined ? {} : { clearer: goalClearer }),
+  });
   const {
     items: recentThreads,
     isLoading: isThreadListLoading,
+    isLoadingMore: isThreadListLoadingMore,
+    hasMore: hasMoreThreads,
     error: threadListError,
     retry: retryThreadList,
+    loadMore: loadMoreThreads,
     renameTitle,
     deleteThread,
   } = useThreadList({
@@ -106,22 +185,39 @@ export function ChatPage({
     },
     [markProjectThreadRunStarted, retryThreadList],
   );
-  const handleRunEvent = useCallback((event: ChatRunEvent) => {
-    if (
-      event.event === "tool_result" &&
-      projectToolResultChangesTree(event.payload.name, event.payload.content)
-    ) {
-      structureChangedRunIds.current.add(event.runId);
-    }
-  }, []);
+  const handleRunEvent = useCallback(
+    (event: ChatRunEvent) => {
+      if (
+        event.event === "tool_result" &&
+        projectToolResultChangesTree(event.payload.name, event.payload.content)
+      ) {
+        structureChangedRunIds.current.add(event.runId);
+      }
+      if (event.event === "goal_status") {
+        if (event.payload.phase === "evaluating") {
+          setGoalEvaluationThreadId(event.threadId);
+        } else {
+          setGoalEvaluationThreadId((current) =>
+            current === event.threadId ? null : current,
+          );
+          retryGoal();
+        }
+      }
+    },
+    [retryGoal],
+  );
   const handleRunSettled = useCallback(
-    (_settledThreadId: string, runId: string) => {
+    (settledThreadId: string, runId: string) => {
       retryThreadList();
+      retryGoal();
+      setGoalEvaluationThreadId((current) =>
+        current === settledThreadId ? null : current,
+      );
       if (structureChangedRunIds.current.delete(runId)) {
         setProjectFileTreeRevision((current) => current + 1);
       }
     },
-    [retryThreadList],
+    [retryGoal, retryThreadList],
   );
   const { state, isActive, activeThreadIds, hydrateHistory, submit, cancel } =
     useChatRun({
@@ -134,11 +230,45 @@ export function ChatPage({
       onRunSettled: handleRunSettled,
       onEventReceived: handleRunEvent,
     });
+  useEffect(() => {
+    if (!isActive || goal === null || isGoalMutating) return;
+    // 隐藏续跑期间没有伪造用户消息；短轮询让续跑计数和评估仍能及时反映服务端 checkpoint。
+    const intervalId = window.setInterval(retryGoal, 1_500);
+    return () => window.clearInterval(intervalId);
+  }, [goal, isActive, isGoalMutating, retryGoal]);
   const history = useThreadHistory(threadId, {
     ...(historyPageLoader === undefined
       ? {}
       : { pageLoader: historyPageLoader }),
   });
+  useEffect(() => {
+    const listed = recentThreads.find((thread) => thread.threadId === threadId);
+    if (listed !== undefined) return;
+    if (isThreadListLoading) return;
+    const controller = new AbortController();
+    void fetchThreadSummary({ threadId, signal: controller.signal }).then(
+      (summary) => setFetchedThreadMetadata({ threadId, summary }),
+      () => undefined,
+    );
+    return () => controller.abort();
+  }, [isThreadListLoading, recentThreads, threadId]);
+  const stopGoal = useCallback(async () => {
+    // Goal API 在服务端先收敛同 Thread Run；不要再发第二次取消请求制造假错误。
+    return await stopGoalState();
+  }, [stopGoalState]);
+  const continueGoal = useCallback(
+    (revision: string) =>
+      submit("继续执行当前 Goal。", [], { goalResumeRevision: revision }),
+    [submit],
+  );
+  const saveGoal = useCallback(
+    async (objective: string, maxContinuations: number) => {
+      const saved = await setGoal(objective, maxContinuations);
+      if (saved) retryThreadList();
+      return saved;
+    },
+    [retryThreadList, setGoal],
+  );
   const { runs: threadRuns, retry: retryThreadRuns } = useThreadRuns(threadId, {
     ...(threadRunsLoader === undefined ? {} : { loader: threadRunsLoader }),
   });
@@ -273,20 +403,77 @@ export function ChatPage({
       current?.id === id ? null : current,
     );
   }, []);
+  const useBenchmarkCase = useCallback(
+    (item: BenchmarkCase) => {
+      nextDraftInsertionId.current += 1;
+      setSelectedBenchmark({
+        threadId,
+        caseId: item.caseId,
+        title: item.title,
+      });
+      setComposerDraftInsertion({
+        id: nextDraftInsertionId.current,
+        threadId,
+        text: item.prompt,
+      });
+    },
+    [threadId],
+  );
+  const submitComposer = useCallback(
+    async (message: string, attachments: readonly PreparedTextAttachment[]) => {
+      const benchmark =
+        selectedBenchmark?.threadId === threadId ? selectedBenchmark : null;
+      const accepted = await submit(message, attachments, {
+        ...(benchmark === null ? {} : { benchmarkCaseId: benchmark.caseId }),
+      });
+      if (accepted && benchmark !== null) setSelectedBenchmark(null);
+      return accepted;
+    },
+    [selectedBenchmark, submit, threadId],
+  );
+
+  const listedCurrentThread = recentThreads.find(
+    (thread) => thread.threadId === threadId,
+  );
+  const currentThreadMetadata =
+    listedCurrentThread ??
+    (fetchedThreadMetadata?.threadId === threadId
+      ? fetchedThreadMetadata.summary
+      : null);
+  const hasCurrentProject =
+    currentThreadMetadata?.projectId !== null &&
+    currentThreadMetadata?.projectId !== undefined;
 
   return (
-    <div className="app-shell" data-rail-collapsed={isRailCollapsed}>
+    <div
+      className="app-shell"
+      data-rail-collapsed={isRailCollapsed}
+      style={
+        {
+          "--rail-width": `${railSize.value}px`,
+          "--composer-editor-height": `${composerSize.value}px`,
+        } as React.CSSProperties
+      }
+    >
       <ConversationRail
         phase={state.phase}
         currentThreadId={threadId}
+        currentProjectId={currentThreadMetadata?.projectId ?? null}
         timelineItemCount={state.timeline.length}
         threads={recentThreads}
         isThreadListLoading={isThreadListLoading}
         threadListError={threadListError}
+        isLoadingMoreThreads={isThreadListLoadingMore}
+        hasMoreThreads={hasMoreThreads}
         isNewThreadDisabled={false}
         isThreadSwitchDisabled={false}
         collapsed={isRailCollapsed}
         mobileOpen={isMobileNavigationOpen}
+        width={railSize.value}
+        minWidth={RAIL_SIZE_PREFERENCE.minValue}
+        maxWidth={RAIL_SIZE_PREFERENCE.getMaxValue()}
+        onWidthChange={railSize.setValue}
+        onResetWidth={railSize.reset}
         onToggleCollapsed={() => setIsRailCollapsed((current) => !current)}
         onCloseMobile={() => setIsMobileNavigationOpen(false)}
         onCreateNewThread={createNewThread}
@@ -298,17 +485,41 @@ export function ChatPage({
         activeThreadIds={activeThreadIds}
         projectFileTreeRevision={projectFileTreeRevision}
         onRetryThreadList={retryThreadList}
+        onLoadMoreThreads={loadMoreThreads}
         onRenameThread={renameTitle}
         onDeleteThread={deletePersistedThread}
         onReferenceProjectFile={referenceProjectFile}
       />
       <main className="workspace">
-        <ThreadHeader
-          phase={state.phase}
-          threadId={threadId}
-          runId={state.runId}
-          navigationOpen={isMobileNavigationOpen}
-          onOpenNavigation={() => setIsMobileNavigationOpen(true)}
+        <div className="thread-header-region">
+          <ThreadHeader
+            phase={state.phase}
+            threadId={threadId}
+            runId={state.runId}
+            navigationOpen={isMobileNavigationOpen}
+            onOpenNavigation={() => setIsMobileNavigationOpen(true)}
+            onOpenBenchmarks={() => setIsBenchmarkPanelOpen(true)}
+          />
+          <GoalPanel
+            key={`${threadId}:${goal?.revision ?? "none"}`}
+            goal={goal}
+            isLoading={isGoalLoading}
+            isMutating={isGoalMutating}
+            isRunActive={isActive}
+            isEvaluating={goalEvaluationThreadId === threadId}
+            error={goalError}
+            onSet={saveGoal}
+            onStop={stopGoal}
+            onContinue={continueGoal}
+            onClear={clearGoal}
+            onRetry={retryGoal}
+          />
+        </div>
+        <BenchmarkPanel
+          open={isBenchmarkPanelOpen}
+          hasProject={hasCurrentProject}
+          onClose={() => setIsBenchmarkPanelOpen(false)}
+          onUseCase={useBenchmarkCase}
         />
         <div className="chat-stage-region">
           <section
@@ -330,7 +541,8 @@ export function ChatPage({
                   </span>
                   <h2>从一个真实问题开始</h2>
                   <p>
-                    试试“请使用天气工具查询北京当前天气”，页面会按顺序展示模型文字和工具活动。
+                    告诉 Agent
+                    你要实现、排查或理解什么。进入项目会话后，它可以读取代码、编辑文件并运行验证。
                   </p>
                 </div>
               )}
@@ -394,6 +606,11 @@ export function ChatPage({
           key={threadId}
           isActive={isActive}
           isStopping={state.phase === "stopping"}
+          editorHeight={composerSize.value}
+          minEditorHeight={COMPOSER_SIZE_PREFERENCE.minValue}
+          maxEditorHeight={COMPOSER_SIZE_PREFERENCE.getMaxValue()}
+          onEditorHeightChange={composerSize.setValue}
+          onResetEditorHeight={composerSize.reset}
           draftInsertion={
             composerDraftInsertion?.threadId === threadId
               ? composerDraftInsertion
@@ -406,9 +623,17 @@ export function ChatPage({
                 todoList: latestTodoSnapshot.list,
                 todoSourceStepId: latestTodoSnapshot.sourceToolItemId,
               })}
-          onSubmit={submit}
+          onSubmit={submitComposer}
           onCancel={cancel}
         />
+        {selectedBenchmark?.threadId === threadId && (
+          <div className="benchmark-selection" role="status">
+            基准任务：{selectedBenchmark.title}
+            <button type="button" onClick={() => setSelectedBenchmark(null)}>
+              取消标记
+            </button>
+          </div>
+        )}
       </main>
     </div>
   );

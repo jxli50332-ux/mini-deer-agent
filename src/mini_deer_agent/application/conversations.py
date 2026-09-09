@@ -41,6 +41,8 @@ class ConversationRepository(MemoryStore, Protocol):
         user_message: str,
         attachments: tuple[TextAttachment, ...] = (),
         human_input_response: dict[str, object] | None = None,
+        benchmark_case_id: str | None = None,
+        hidden_from_ui: bool = False,
     ) -> None:
         """原子创建 Thread、Run、本轮用户消息、附件与澄清响应。"""
 
@@ -49,8 +51,14 @@ class ConversationRepository(MemoryStore, Protocol):
     ) -> ThreadRecord:
         """创建空闲项目 Thread，已有 Thread 只能按原 Project 幂等读取。"""
 
+    def ensure_thread(self, *, thread_id: str) -> ThreadRecord:
+        """幂等创建普通空闲 Thread，使首次 Run 前的 Goal 也能持久化。"""
+
+    def touch_thread(self, thread_id: str) -> ThreadRecord | None:
+        """更新 Thread 活跃时间并返回提交后的记录。"""
+
     def list_project_threads(
-        self, project_id: str, *, limit: int
+        self, project_id: str, *, limit: int, offset: int = 0
     ) -> tuple[ThreadRecord, ...]:
         """只返回归属于指定 Project 的最近 Thread。"""
 
@@ -72,7 +80,9 @@ class ConversationRepository(MemoryStore, Protocol):
     def get_thread(self, thread_id: str) -> ThreadRecord | None:
         """返回 Thread 元数据；不存在时返回 None。"""
 
-    def list_threads(self, *, limit: int) -> tuple[ThreadRecord, ...]:
+    def list_threads(
+        self, *, limit: int, offset: int = 0, standalone_only: bool = False
+    ) -> tuple[ThreadRecord, ...]:
         """按最近活动时间稳定倒序返回产品 Thread。"""
 
     def update_thread_title(
@@ -109,9 +119,19 @@ class ConversationHistoryService:
         """查询单个 Thread。"""
         return self._repository.get_thread(thread_id)
 
-    def list_threads(self, *, limit: int = 20) -> tuple[ThreadRecord, ...]:
+    def list_threads(
+        self,
+        *,
+        limit: int = 20,
+        offset: int = 0,
+        standalone_only: bool = False,
+    ) -> tuple[ThreadRecord, ...]:
         """查询最近活动的产品 Thread。"""
-        return self._repository.list_threads(limit=limit)
+        return self._repository.list_threads(
+            limit=limit,
+            offset=offset,
+            standalone_only=standalone_only,
+        )
 
     def update_thread_title(
         self,

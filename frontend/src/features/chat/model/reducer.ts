@@ -54,6 +54,7 @@ export type ChatRunAction =
   | {
       readonly type: "run/client-failed";
       readonly error: Omit<ChatRunFailure, "source">;
+      readonly optimisticMessageId?: string;
     }
   | {
       readonly type: "run/status-reconciled";
@@ -329,6 +330,11 @@ function reduceToolResult(
   state: ChatRunState,
   event: ToolResultEvent,
 ): ChatRunState {
+  const settledStatus =
+    event.payload.resultMeta?.status === "retryable_error" ||
+    event.payload.resultMeta?.status === "terminal_error"
+      ? "failed"
+      : "completed";
   const index = state.timeline.findIndex(
     (item) =>
       item.kind === "tool" && item.toolCallId === event.payload.toolCallId,
@@ -348,7 +354,7 @@ function reduceToolResult(
           name: event.payload.name,
           input: "",
           result: event.payload.content,
-          status: "completed",
+          status: settledStatus,
         },
       ],
     };
@@ -387,7 +393,7 @@ function reduceToolResult(
       ...current,
       name: current.name ?? event.payload.name,
       result: event.payload.content,
-      status: "completed",
+      status: settledStatus,
     }),
   };
 }
@@ -475,6 +481,8 @@ function reduceRunEvent(
       return reduceToolCallDelta(state, event);
     case "tool_result":
       return reduceToolResult(state, event);
+    case "goal_status":
+      return { ...state, lastSequence: event.sequence };
     case "run_error":
       return {
         ...state,
@@ -585,7 +593,14 @@ export function chatRunReducer(
       return {
         ...state,
         phase: "failed",
-        timeline: settlePendingTools(state.timeline, "failed"),
+        timeline: settlePendingTools(
+          action.optimisticMessageId === undefined
+            ? state.timeline
+            : state.timeline.filter(
+                (item) => item.id !== action.optimisticMessageId,
+              ),
+          "failed",
+        ),
         error: { source: "client", ...action.error },
       };
     case "run/status-reconciled": {

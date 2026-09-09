@@ -411,7 +411,7 @@ describe("项目登记面板", () => {
     );
     expect(onSelectThread).toHaveBeenLastCalledWith(existingThreadId);
   });
-  it("项目默认显示五条会话，展开后可切换到其余会话", async () => {
+  it("项目展开后直接展示当前已加载的全部会话", async () => {
     const threads = Array.from({ length: 6 }, (_, index) =>
       threadRecord(
         `0000000${index}-1234-4234-9234-123456789012`,
@@ -443,17 +443,208 @@ describe("项目登记面板", () => {
       await screen.findByRole("button", { name: "展开项目 验收项目" }),
     );
     await screen.findByRole("button", { name: "进入项目会话 样例会话1" });
-    expect(
-      screen.queryByRole("button", { name: "进入项目会话 样例会话6" }),
-    ).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "展开显示" }));
     fireEvent.click(
       screen.getByRole("button", { name: "进入项目会话 样例会话6" }),
     );
     expect(onSelectThread).toHaveBeenCalledWith(threads[5]?.thread_id);
-    fireEvent.click(screen.getByRole("button", { name: "收起显示" }));
+  });
+
+  it("项目会话长标题随侧栏收缩省略且不挤占操作区", async () => {
+    const longTitle =
+      "先列出项目根目录，再读取 README.md，解释这个目录中所有模块的职责与依赖关系";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: RequestInfo | URL) =>
+        Promise.resolve(
+          Response.json(
+            (typeof url === "string"
+              ? url
+              : url instanceof URL
+                ? url.href
+                : url.url
+            ).includes("/threads")
+              ? [threadRecord(existingThreadId, longTitle)]
+              : { items: [record], next_offset: null },
+          ),
+        ),
+      ),
+    );
+    render(<WorkspaceLauncher compact={false} />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "展开项目 验收项目" }),
+    );
+
+    const threadButton = await screen.findByRole("button", {
+      name: `进入项目会话 ${longTitle}`,
+    });
+    const title = threadButton.querySelector("strong");
+    const actions = screen
+      .getByRole("button", { name: `项目会话操作 ${longTitle}` })
+      .closest(".project-thread__menu");
+
     expect(
-      screen.queryByRole("button", { name: "进入项目会话 样例会话6" }),
+      threadButton.parentElement?.querySelector(".sidebar-tooltip"),
+    ).toHaveTextContent(longTitle);
+    expect(getComputedStyle(threadButton).minWidth).toBe("0px");
+    expect(getComputedStyle(title as HTMLElement).textOverflow).toBe(
+      "ellipsis",
+    );
+    expect(getComputedStyle(title as HTMLElement).minWidth).toBe("0px");
+    expect(getComputedStyle(actions as HTMLDivElement).flexShrink).toBe("0");
+    expect(
+      screen.getByRole("button", { name: "在项目 验收项目 中新建会话" }),
+    ).toBeVisible();
+  });
+
+  it("项目会话支持改名与二次确认删除", async () => {
+    const onRenameThread = vi.fn(() => Promise.resolve());
+    const onDeleteThread = vi.fn(() => Promise.resolve());
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: RequestInfo | URL) => {
+        const target =
+          typeof url === "string"
+            ? url
+            : url instanceof URL
+              ? url.href
+              : url.url;
+        return Promise.resolve(
+          Response.json(
+            target.includes("/threads")
+              ? [threadRecord(existingThreadId, "已有项目会话")]
+              : { items: [record], next_offset: null },
+          ),
+        );
+      }),
+    );
+    render(
+      <WorkspaceLauncher
+        compact={false}
+        onRenameThread={onRenameThread}
+        onDeleteThread={onDeleteThread}
+      />,
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "展开项目 验收项目" }),
+    );
+    await screen.findByRole("button", {
+      name: "进入项目会话 已有项目会话",
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "项目会话操作 已有项目会话",
+      }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "重命名项目会话 已有项目会话",
+      }),
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: "项目会话标题" }), {
+      target: { value: "新的项目会话" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() =>
+      expect(onRenameThread).toHaveBeenCalledWith(
+        existingThreadId,
+        "新的项目会话",
+      ),
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "项目会话操作 新的项目会话",
+      }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "删除项目会话 新的项目会话" }),
+    );
+    expect(screen.getByText(/此操作不可撤销/)).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "确认" }));
+    await waitFor(() =>
+      expect(onDeleteThread).toHaveBeenCalledWith(existingThreadId),
+    );
+    expect(
+      screen.queryByRole("button", { name: "删除项目会话 新的项目会话" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("只展开一个项目并在重挂载后恢复最后展开项", async () => {
+    const fetcher = vi.fn((url: RequestInfo | URL) => {
+      const target =
+        typeof url === "string" ? url : url instanceof URL ? url.href : url.url;
+      return Promise.resolve(
+        Response.json(
+          target.includes("/threads")
+            ? [threadRecord(existingThreadId, "恢复的项目会话")]
+            : { items: [record], next_offset: null },
+        ),
+      );
+    });
+    vi.stubGlobal("fetch", fetcher);
+    const first = render(<WorkspaceLauncher compact={false} />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "展开项目 验收项目" }),
+    );
+    expect(
+      await screen.findByRole("button", {
+        name: "进入项目会话 恢复的项目会话",
+      }),
+    ).toBeVisible();
+    expect(
+      localStorage.getItem("mini-deer-agent.navigation.expanded-project.v1"),
+    ).toBe(record.project_id);
+    first.unmount();
+
+    render(<WorkspaceLauncher compact={false} />);
+    expect(
+      await screen.findByRole("button", { name: "收起项目 验收项目" }),
+    ).toHaveAttribute("aria-expanded", "true");
+    expect(
+      await screen.findByRole("button", {
+        name: "进入项目会话 恢复的项目会话",
+      }),
+    ).toBeVisible();
+  });
+
+  it("项目可置顶并持久保持排序", async () => {
+    const second = {
+      ...record,
+      project_id: "22334455-1234-4234-9234-123456789012",
+      name: "第二项目",
+      root_path: "D:/projects/second",
+      updated_at: "2026-09-02T00:00:00Z",
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: RequestInfo | URL) =>
+        Promise.resolve(
+          Response.json(
+            (typeof url === "string"
+              ? url
+              : url instanceof URL
+                ? url.href
+                : url.url
+            ).includes("/threads")
+              ? []
+              : { items: [record, second], next_offset: null },
+          ),
+        ),
+      ),
+    );
+    render(<WorkspaceLauncher compact={false} />);
+    const pin = await screen.findByRole("button", {
+      name: "置顶项目 第二项目",
+    });
+    fireEvent.click(pin);
+    expect(pin).toHaveAttribute("aria-pressed", "true");
+    const projectRows = document.querySelectorAll(
+      ".project-sidebar__projects > li",
+    );
+    expect(projectRows[0]).toHaveTextContent("第二项目");
+    expect(
+      localStorage.getItem("mini-deer-agent.navigation.pinned-projects.v1"),
+    ).toContain(second.project_id);
   });
 });

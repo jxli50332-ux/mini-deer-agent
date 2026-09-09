@@ -209,7 +209,7 @@ describe("项目 API 客户端", () => {
       expect.objectContaining({ threadId, projectId: record.project_id }),
     ]);
     expect(fetcher).toHaveBeenCalledWith(
-      `/api/v1/projects/${record.project_id}/threads?limit=100`,
+      `/api/v1/projects/${record.project_id}/threads?limit=50&offset=0`,
       expect.objectContaining({ method: "GET", cache: "no-store" }),
     );
 

@@ -85,6 +85,7 @@ def test_factory_builds_official_openai_model(
     assert captured["model"] == "test-model"
     assert captured["api_key"] == settings.api_key
     assert captured["use_responses_api"] is True
+    assert captured["stream_usage"] is True
     assert "base_url" not in captured
 
 
@@ -113,6 +114,7 @@ def test_factory_builds_openai_compatible_model(
     assert captured["api_key"] == settings.api_key
     assert captured["base_url"] == "https://example.invalid/v1"
     assert captured["use_responses_api"] is False
+    assert captured["stream_usage"] is True
 
 
 def test_invoke_once_rejects_blank_message() -> None:

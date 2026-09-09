@@ -11,6 +11,8 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from mini_deer_agent.application import (
     ConversationHistoryService,
+    BenchmarkService,
+    BenchmarkStore,
     ConversationRepository,
     RunExecutionManager,
     RunEventHistoryService,
@@ -18,6 +20,9 @@ from mini_deer_agent.application import (
     RunStreamService,
     ThreadCheckpointStore,
     ThreadLifecycleService,
+    GoalStateService,
+    GoalCompletionEvaluator,
+    GoalEvaluationService,
 )
 from mini_deer_agent.application.workspaces import (
     ProjectFileAccessResolver,
@@ -26,13 +31,24 @@ from mini_deer_agent.application.workspaces import (
     ProjectThreadRepository,
     ProjectThreadService,
 )
+from mini_deer_agent.agents.middleware import RunBudgetPolicy
 from mini_deer_agent.core import Settings
 from mini_deer_agent.mcp import McpRuntime, initialize_mcp_runtime
+from mini_deer_agent.llms import create_chat_model
 from mini_deer_agent.persistence import (
     open_async_sqlite_checkpointer,
     open_async_sqlite_conversation_repository,
 )
-from mini_deer_agent.server.routers import health, mcp, projects, runs, threads
+from mini_deer_agent.server.routers import (
+    benchmarks,
+    health,
+    mcp,
+    projects,
+    runs,
+    skills,
+    threads,
+)
+from mini_deer_agent.skills import UserSkillManager
 from mini_deer_agent.tools import get_reserved_agent_tool_names
 from mini_deer_agent.workspace.paths import ProjectRootPolicy
 from mini_deer_agent.workspace.picker import NativeDirectoryPicker
@@ -109,6 +125,29 @@ def create_lifespan(
                 # 路由只能经 dependencies 模块取得服务，不能自行构建模型或数据库连接。
                 app.state.settings = settings
                 app.state.mcp_runtime = mcp_runtime
+                app.state.user_skill_manager = UserSkillManager(
+                    settings.user_skills_directory
+                )
+                app.state.goal_state_service = GoalStateService(
+                    conversation_repository,
+                    checkpointer,
+                )
+                evaluator_settings = settings.model_copy(
+                    update={
+                        "model_name": (
+                            settings.goal_evaluator_model_name
+                            or settings.model_name
+                        )
+                    }
+                )
+                app.state.goal_evaluation_service = GoalEvaluationService(
+                    conversation_repository,
+                    app.state.goal_state_service,
+                    GoalCompletionEvaluator(
+                        lambda: create_chat_model(evaluator_settings),
+                        timeout_seconds=settings.goal_evaluation_timeout_seconds,
+                    ),
+                )
                 # 登记权限是独立管理配置；未配置时保持关闭，不影响普通聊天。
                 app.state.project_service = None
                 app.state.project_thread_service = None
@@ -120,6 +159,7 @@ def create_lifespan(
                         blocked_roots=(
                             settings.application_database_path.resolve().parent,
                             settings.checkpoint_database_path.resolve().parent,
+                            settings.tool_output_directory.resolve(),
                         ),
                     )
                     app.state.project_service = ProjectService(
@@ -143,16 +183,35 @@ def create_lifespan(
                         checkpointer,
                         memory_store=conversation_repository,
                         mcp_tools=mcp_runtime.tools,
+                        mcp_tool_routing_keywords=mcp_runtime.tool_routing_keywords,
                         file_access_resolver=ProjectFileAccessResolver(
                             conversation_repository,
                             app.state.project_service,
                             workspace_policy,
                         ),
+                        skill_catalog_factory=app.state.user_skill_manager.catalog,
+                        run_budget_policy=RunBudgetPolicy(
+                            soft_token_limit=settings.run_token_soft_limit,
+                            hard_token_limit=settings.run_token_hard_limit,
+                            soft_turn_limit=settings.run_model_turn_soft_limit,
+                            hard_turn_limit=settings.run_model_turn_hard_limit,
+                        ),
                     )
                 )
-                run_execution_manager = run_execution_manager_factory(
-                    run_stream_service,
-                    conversation_repository,
+                run_execution_manager = (
+                    run_execution_manager_factory(
+                        run_stream_service,
+                        conversation_repository,
+                        goal_evaluation_service=(
+                            app.state.goal_evaluation_service
+                        ),
+                        run_timeout_seconds=settings.run_timeout_seconds,
+                    )
+                    if run_execution_manager_factory is RunExecutionManager
+                    else run_execution_manager_factory(
+                        run_stream_service,
+                        conversation_repository,
+                    )
                 )
                 app.state.run_stream_service = run_stream_service
                 app.state.run_execution_manager = run_execution_manager
@@ -160,6 +219,9 @@ def create_lifespan(
                     conversation_history_service_factory(
                         conversation_repository
                     )
+                )
+                app.state.benchmark_service = BenchmarkService(
+                    cast(BenchmarkStore, conversation_repository)
                 )
                 app.state.thread_lifecycle_service = ThreadLifecycleService(
                     conversation_repository,
@@ -181,8 +243,12 @@ def create_lifespan(
                     del app.state.run_event_history_service
                     del app.state.thread_lifecycle_service
                     del app.state.conversation_history_service
+                    del app.state.benchmark_service
                     del app.state.run_execution_manager
                     del app.state.run_stream_service
+                    del app.state.goal_state_service
+                    del app.state.goal_evaluation_service
+                    del app.state.user_skill_manager
                     del app.state.mcp_runtime
                     del app.state.settings
 
@@ -230,7 +296,9 @@ def create_app(
 
     # 正式路由和兼容路由集中在工厂注册，避免模块导入时分散修改全局 app。
     application.include_router(health.router)
+    application.include_router(benchmarks.router)
     application.include_router(mcp.router)
+    application.include_router(skills.router)
     application.include_router(projects.router)
     application.include_router(threads.router)
     application.include_router(runs.router)

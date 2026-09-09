@@ -202,10 +202,13 @@ def list_project_threads(
     project_id: UUID,
     service: ProjectThreadServiceDependency,
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    offset: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
 ) -> list[ThreadResponse]:
     """只列出指定 Project 的 Thread，普通聊天和其他项目不会混入。"""
     try:
-        threads = service.list(project_id=str(project_id), limit=limit)
+        threads = service.list(
+            project_id=str(project_id), limit=limit, offset=offset
+        )
     except ProjectError as exc:
         raise _project_error(exc) from None
     return [

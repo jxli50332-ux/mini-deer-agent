@@ -5,6 +5,7 @@ import {
   type ChangeEvent,
   type FormEvent,
   type KeyboardEvent,
+  type PointerEvent,
 } from "react";
 
 import {
@@ -19,6 +20,11 @@ interface ComposerProps {
   readonly isActive: boolean;
   readonly isStopping?: boolean;
   readonly disabled?: boolean;
+  readonly editorHeight?: number;
+  readonly minEditorHeight?: number;
+  readonly maxEditorHeight?: number;
+  readonly onEditorHeightChange?: (height: number) => void;
+  readonly onResetEditorHeight?: () => void;
   readonly todoList?: TodoList | null;
   readonly todoSourceStepId?: string;
   readonly draftInsertion?: {
@@ -37,6 +43,11 @@ export function Composer({
   isActive,
   isStopping = false,
   disabled = false,
+  editorHeight = 88,
+  minEditorHeight = 64,
+  maxEditorHeight = 420,
+  onEditorHeightChange = () => undefined,
+  onResetEditorHeight = () => undefined,
   todoList = null,
   todoSourceStepId,
   draftInsertion = null,
@@ -47,6 +58,8 @@ export function Composer({
   const [draft, setDraft] = useState("");
   const textarea = useRef<HTMLTextAreaElement>(null);
   const lastAppliedInsertionId = useRef<number | null>(null);
+  const resizeStart = useRef<{ y: number; height: number } | null>(null);
+  const [isResizing, setIsResizing] = useState(false);
   const [attachments, setAttachments] = useState<
     readonly PreparedTextAttachment[]
   >([]);
@@ -122,6 +135,38 @@ export function Composer({
     }
   };
 
+  const startResize = (event: PointerEvent<HTMLDivElement>) => {
+    resizeStart.current = { y: event.clientY, height: editorHeight };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setIsResizing(true);
+  };
+
+  const resize = (event: PointerEvent<HTMLDivElement>) => {
+    if (resizeStart.current === null) return;
+    onEditorHeightChange(
+      resizeStart.current.height - (event.clientY - resizeStart.current.y),
+    );
+  };
+
+  const finishResize = (event: PointerEvent<HTMLDivElement>) => {
+    resizeStart.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    setIsResizing(false);
+  };
+
+  const resizeWithKeyboard = (event: KeyboardEvent<HTMLDivElement>) => {
+    const step = event.shiftKey ? 32 : 8;
+    if (event.key === "ArrowUp") onEditorHeightChange(editorHeight + step);
+    else if (event.key === "ArrowDown")
+      onEditorHeightChange(editorHeight - step);
+    else if (event.key === "Home") onEditorHeightChange(minEditorHeight);
+    else if (event.key === "End") onEditorHeightChange(maxEditorHeight);
+    else return;
+    event.preventDefault();
+  };
+
   return (
     <footer className="composer-region">
       {todoList !== null && todoList.items.length > 0 && (
@@ -134,6 +179,7 @@ export function Composer({
       )}
       <form
         className="composer"
+        data-resizing={isResizing}
         aria-label="发送消息"
         aria-busy={isActive}
         onSubmit={handleSubmit}
@@ -188,6 +234,22 @@ export function Composer({
             {attachmentError}
           </p>
         )}
+        <div
+          className="composer__resize-handle"
+          role="separator"
+          aria-label="调整输入框高度"
+          aria-orientation="horizontal"
+          aria-valuemin={minEditorHeight}
+          aria-valuemax={maxEditorHeight}
+          aria-valuenow={editorHeight}
+          tabIndex={0}
+          onDoubleClick={onResetEditorHeight}
+          onKeyDown={resizeWithKeyboard}
+          onPointerDown={startResize}
+          onPointerMove={resize}
+          onPointerUp={finishResize}
+          onPointerCancel={finishResize}
+        />
         <div className="composer__input-row">
           <textarea
             ref={textarea}

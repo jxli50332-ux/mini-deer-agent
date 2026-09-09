@@ -23,6 +23,8 @@ from mini_deer_agent.application.memory import (
 from mini_deer_agent.application.run_events import RunEventSequenceError
 from mini_deer_agent.domain import (
     ConversationHistoryPage,
+    BenchmarkAttempt,
+    BenchmarkScore,
     MessageHistoryItem,
     MAX_MEMORY_CONTENT_LENGTH,
     MAX_MEMORY_QUERY_LENGTH,
@@ -45,7 +47,7 @@ from mini_deer_agent.persistence.workspaces import (
 )
 
 
-_LATEST_MIGRATION_VERSION = 11
+_LATEST_MIGRATION_VERSION = 14
 
 _SCHEMA_STATEMENTS = (
     """
@@ -285,7 +287,72 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
         "DROP TABLE projects_v10",
         PROJECT_SCHEMA_STATEMENTS[1],
     ),
+    12: (
+        "ALTER TABLE runs ADD COLUMN benchmark_case_id TEXT",
+        "ALTER TABLE runs ADD COLUMN benchmark_task_completed INTEGER CHECK (benchmark_task_completed IN (0, 1))",
+        "ALTER TABLE runs ADD COLUMN benchmark_score INTEGER CHECK (benchmark_score BETWEEN 1 AND 5)",
+        "ALTER TABLE runs ADD COLUMN benchmark_notes TEXT",
+        "ALTER TABLE runs ADD COLUMN benchmark_scored_at TEXT",
+        """
+        CREATE INDEX idx_runs_benchmark_recent
+        ON runs(benchmark_case_id, created_at DESC)
+        WHERE benchmark_case_id IS NOT NULL
+        """,
+    ),
+    13: (
+        "ALTER TABLE runs ADD COLUMN input_tokens INTEGER CHECK (input_tokens >= 0)",
+        "ALTER TABLE runs ADD COLUMN output_tokens INTEGER CHECK (output_tokens >= 0)",
+        "ALTER TABLE runs ADD COLUMN total_tokens INTEGER CHECK (total_tokens >= 0)",
+        "ALTER TABLE runs ADD COLUMN model_calls INTEGER CHECK (model_calls >= 0)",
+    ),
+    14: (
+        # Goal 评估阶段需要作为 Run 流的一部分可靠重放；SQLite 的 CHECK
+        # 不能原地扩展，因此与 v8 一样重建事件表并保留既有数据。
+        """
+        CREATE TABLE run_events_v14 (
+            run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+            thread_id TEXT NOT NULL REFERENCES threads(thread_id) ON DELETE CASCADE,
+            sequence INTEGER NOT NULL CHECK (sequence >= 1),
+            version TEXT NOT NULL,
+            event TEXT NOT NULL CHECK (
+                event IN (
+                    'run_started', 'reasoning_delta', 'ai_delta',
+                    'tool_call_delta', 'tool_result', 'goal_status',
+                    'run_error', 'run_interrupted', 'run_completed'
+                )
+            ),
+            message_id TEXT,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (run_id, sequence)
+        )
+        """,
+        """
+        INSERT INTO run_events_v14 (
+            run_id, thread_id, sequence, version, event,
+            message_id, payload_json, created_at
+        )
+        SELECT
+            run_id, thread_id, sequence, version, event,
+            message_id, payload_json, created_at
+        FROM run_events
+        """,
+        "DROP TABLE run_events",
+        "ALTER TABLE run_events_v14 RENAME TO run_events",
+        """
+        CREATE INDEX IF NOT EXISTS idx_run_events_thread_run_sequence
+        ON run_events(thread_id, run_id, sequence)
+        """,
+    ),
 }
+
+
+def _event_counter(payload: dict[str, Any], field: str) -> int | None:
+    """只接受非负整数；旧事件保持未知，以便基准回退到事件推导。"""
+    value = payload.get(field)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
 
 
 def _utc_now() -> str:
@@ -374,13 +441,133 @@ class SqliteConversationRepository:
                 )
 
             recovered_at = _utc_now()
+            abandoned_runs = self._connection.execute(
+                """
+                SELECT runs.run_id, runs.thread_id,
+                       COALESCE(MAX(run_events.sequence), 0)
+                FROM runs
+                LEFT JOIN run_events ON run_events.run_id = runs.run_id
+                WHERE runs.status IN ('pending', 'running')
+                GROUP BY runs.run_id, runs.thread_id
+                """
+            ).fetchall()
+            for run_id, thread_id, last_sequence in abandoned_runs:
+                self._connection.execute(
+                    """
+                    INSERT INTO run_events(
+                        run_id, thread_id, sequence, version, event,
+                        message_id, payload_json, created_at
+                    ) VALUES (?, ?, ?, '1', 'run_interrupted', NULL, ?, ?)
+                    """,
+                    (
+                        str(run_id),
+                        str(thread_id),
+                        int(last_sequence) + 1,
+                        '{"reason":"server_restarted"}',
+                        recovered_at,
+                    ),
+                )
             self._connection.execute(
                 """
                 UPDATE runs
-                SET status = 'interrupted', updated_at = ?, finished_at = ?, error_code = 'server_restarted'
+                SET status = 'interrupted', updated_at = ?, finished_at = ?,
+                    finish_reason = 'server_restarted', error_code = 'server_restarted'
                 WHERE status IN ('pending', 'running')
                 """,
                 (recovered_at, recovered_at),
+            )
+            missing_terminal_events = self._connection.execute(
+                """
+                SELECT runs.run_id, runs.thread_id, runs.status,
+                       runs.finish_reason, runs.error_code,
+                       runs.input_tokens, runs.output_tokens,
+                       runs.total_tokens, runs.model_calls,
+                       COALESCE(MAX(run_events.sequence), 0)
+                FROM runs
+                LEFT JOIN run_events ON run_events.run_id = runs.run_id
+                WHERE runs.status IN ('completed', 'failed', 'interrupted')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM run_events AS terminal
+                      WHERE terminal.run_id = runs.run_id
+                        AND terminal.event IN (
+                            'run_completed', 'run_error', 'run_interrupted'
+                        )
+                  )
+                GROUP BY runs.run_id, runs.thread_id, runs.status,
+                         runs.finish_reason, runs.error_code,
+                         runs.input_tokens, runs.output_tokens,
+                         runs.total_tokens, runs.model_calls
+                """
+            ).fetchall()
+            for row in missing_terminal_events:
+                (
+                    run_id,
+                    thread_id,
+                    run_status,
+                    finish_reason,
+                    error_code,
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    model_calls,
+                    last_sequence,
+                ) = row
+                if run_status == "completed":
+                    event_name = "run_completed"
+                    payload = {
+                        "finish_reason": finish_reason or "stop",
+                        "input_tokens": int(input_tokens or 0),
+                        "output_tokens": int(output_tokens or 0),
+                        "total_tokens": int(total_tokens or 0),
+                        "model_calls": int(model_calls or 0),
+                    }
+                elif run_status == "failed":
+                    event_name = "run_error"
+                    payload = {
+                        "code": error_code or "run_failed",
+                        "message": "Agent execution failed",
+                        "retryable": True,
+                    }
+                else:
+                    event_name = "run_interrupted"
+                    payload = {
+                        "reason": finish_reason or error_code or "interrupted"
+                    }
+                self._connection.execute(
+                    """
+                    INSERT INTO run_events(
+                        run_id, thread_id, sequence, version, event,
+                        message_id, payload_json, created_at
+                    ) VALUES (?, ?, ?, '1', ?, NULL, ?, ?)
+                    """,
+                    (
+                        str(run_id),
+                        str(thread_id),
+                        int(last_sequence) + 1,
+                        event_name,
+                        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                        recovered_at,
+                    ),
+                )
+            self._connection.execute(
+                """
+                UPDATE tool_executions
+                SET status = 'cancelled'
+                WHERE status = 'pending'
+                  AND run_id IN (
+                      SELECT run_id FROM runs WHERE status = 'interrupted'
+                  )
+                """
+            )
+            self._connection.execute(
+                """
+                UPDATE tool_executions
+                SET status = 'failed'
+                WHERE status = 'pending'
+                  AND run_id IN (
+                      SELECT run_id FROM runs WHERE status IN ('completed', 'failed')
+                  )
+                """
             )
             self._connection.execute(
                 """
@@ -608,6 +795,8 @@ class SqliteConversationRepository:
         user_message: str,
         attachments: tuple[TextAttachment, ...] = (),
         human_input_response: dict[str, object] | None = None,
+        benchmark_case_id: str | None = None,
+        hidden_from_ui: bool = False,
     ) -> None:
         """原子写入 Run、用户消息、附件和澄清元数据，拒绝并发活动 Run。"""
         now = _utc_now()
@@ -629,10 +818,11 @@ class SqliteConversationRepository:
                 cursor.execute(
                     """
                     INSERT INTO runs(
-                        run_id, thread_id, user_message_id, status, created_at, updated_at
-                    ) VALUES (?, ?, ?, 'pending', ?, ?)
+                        run_id, thread_id, user_message_id, status, created_at,
+                        updated_at, benchmark_case_id
+                    ) VALUES (?, ?, ?, 'pending', ?, ?, ?)
                     """,
-                    (run_id, thread_id, user_message_id, now, now),
+                    (run_id, thread_id, user_message_id, now, now, benchmark_case_id),
                 )
                 sequence = self._allocate_sequence(cursor, thread_id)
                 cursor.execute(
@@ -662,7 +852,9 @@ class SqliteConversationRepository:
                     (
                         user_message_id,
                         user_message,
-                        1 if human_input_response is not None else 0,
+                        1
+                        if hidden_from_ui or human_input_response is not None
+                        else 0,
                         response_json,
                     ),
                 )
@@ -690,6 +882,98 @@ class SqliteConversationRepository:
             raise ActiveRunConflictError(
                 "Thread already has an active run or duplicate message identity"
             ) from exc
+
+    @staticmethod
+    def _benchmark_attempt_from_row(row: sqlite3.Row) -> BenchmarkAttempt:
+        """把带基准字段的 Run 行映射为稳定领域记录。"""
+        return BenchmarkAttempt(
+            case_id=str(row["benchmark_case_id"]),
+            run_id=str(row["run_id"]),
+            thread_id=str(row["thread_id"]),
+            status=str(row["status"]),
+            created_at=str(row["created_at"]),
+            started_at=cast(str | None, row["started_at"]),
+            finished_at=cast(str | None, row["finished_at"]),
+            finish_reason=cast(str | None, row["finish_reason"]),
+            error_code=cast(str | None, row["error_code"]),
+            input_tokens=cast(int | None, row["input_tokens"]),
+            output_tokens=cast(int | None, row["output_tokens"]),
+            total_tokens=cast(int | None, row["total_tokens"]),
+            model_calls=cast(int | None, row["model_calls"]),
+            task_completed=(
+                None
+                if row["benchmark_task_completed"] is None
+                else bool(row["benchmark_task_completed"])
+            ),
+            score=cast(int | None, row["benchmark_score"]),
+            notes=cast(str | None, row["benchmark_notes"]),
+            scored_at=cast(str | None, row["benchmark_scored_at"]),
+        )
+
+    def list_benchmark_attempts(self, *, limit: int) -> tuple[BenchmarkAttempt, ...]:
+        """按创建时间倒序列出固定案例 Run。"""
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT run_id, thread_id, status, created_at, started_at,
+                       finished_at, finish_reason, error_code, input_tokens,
+                       output_tokens, total_tokens, model_calls, benchmark_case_id,
+                       benchmark_task_completed, benchmark_score, benchmark_notes,
+                       benchmark_scored_at
+                FROM runs
+                WHERE benchmark_case_id IS NOT NULL
+                ORDER BY created_at DESC, run_id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return tuple(self._benchmark_attempt_from_row(row) for row in rows)
+
+    def get_benchmark_attempt(self, run_id: str) -> BenchmarkAttempt | None:
+        """按 Run ID 读取基准关联；普通 Run 返回 None。"""
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT run_id, thread_id, status, created_at, started_at,
+                       finished_at, finish_reason, error_code, input_tokens,
+                       output_tokens, total_tokens, model_calls, benchmark_case_id,
+                       benchmark_task_completed, benchmark_score, benchmark_notes,
+                       benchmark_scored_at
+                FROM runs
+                WHERE run_id = ? AND benchmark_case_id IS NOT NULL
+                """,
+                (run_id,),
+            ).fetchone()
+        return None if row is None else self._benchmark_attempt_from_row(row)
+
+    def update_benchmark_score(
+        self,
+        run_id: str,
+        *,
+        task_completed: bool,
+        score: int,
+        notes: str | None,
+    ) -> BenchmarkScore | None:
+        """只允许为已关联固定案例的 Run 写入人工评分。"""
+        scored_at = _utc_now()
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE runs
+                SET benchmark_task_completed = ?, benchmark_score = ?,
+                    benchmark_notes = ?, benchmark_scored_at = ?
+                WHERE run_id = ? AND benchmark_case_id IS NOT NULL
+                """,
+                (1 if task_completed else 0, score, notes, scored_at, run_id),
+            )
+        if cursor.rowcount != 1:
+            return None
+        return BenchmarkScore(
+            task_completed=task_completed,
+            score=score,
+            notes=notes,
+            scored_at=scored_at,
+        )
 
     def _require_run(
         self,
@@ -908,28 +1192,50 @@ class SqliteConversationRepository:
                 )
                 name = event.payload.get("name")
                 result = str(event.payload.get("content") or "")
+                result_meta = event.payload.get("result_meta")
+                result_status = (
+                    str(result_meta.get("status"))
+                    if isinstance(result_meta, dict)
+                    else "success"
+                )
+                execution_status = (
+                    "failed"
+                    if result_status in {"retryable_error", "terminal_error"}
+                    else "completed"
+                )
                 if created:
                     cursor.execute(
                         """
                         INSERT INTO tool_executions(
                             item_id, run_id, tool_call_id, name, input, result, status
-                        ) VALUES (?, ?, ?, ?, '', ?, 'completed')
+                        ) VALUES (?, ?, ?, ?, '', ?, ?)
                         """,
-                        (item_id, event.run_id, tool_call_id, name, result),
+                        (
+                            item_id,
+                            event.run_id,
+                            tool_call_id,
+                            name,
+                            result,
+                            execution_status,
+                        ),
                     )
                 else:
                     cursor.execute(
                         """
                         UPDATE tool_executions
-                        SET name = COALESCE(name, ?), result = ?, status = 'completed'
+                        SET name = COALESCE(name, ?), result = ?, status = ?
                         WHERE item_id = ?
                         """,
-                        (name, result, item_id),
+                        (name, result, execution_status, item_id),
                     )
                 cursor.execute(
                     "UPDATE timeline_items SET updated_at = ? WHERE item_id = ?",
                     (now, item_id),
                 )
+                return True
+
+            if event.event == "goal_status":
+                # 控制面事件只参与可靠重放，不投影成对话时间线或 Run 终态。
                 return True
 
             if event.event == "run_error":
@@ -978,11 +1284,26 @@ class SqliteConversationRepository:
             if event.event == "run_completed":
                 cursor.execute(
                     """
-                    UPDATE runs
-                    SET status = 'completed', updated_at = ?, finished_at = ?, finish_reason = ?
+                    UPDATE runs SET
+                        status = 'completed', updated_at = ?, finished_at = ?,
+                        finish_reason = ?, input_tokens = ?, output_tokens = ?,
+                        total_tokens = ?, model_calls = ?
                     WHERE run_id = ?
                     """,
-                    (now, now, str(event.payload.get("finish_reason") or "stop"), event.run_id),
+                    (
+                        now,
+                        now,
+                        str(event.payload.get("finish_reason") or "stop"),
+                        _event_counter(event.payload, "input_tokens"),
+                        _event_counter(event.payload, "output_tokens"),
+                        _event_counter(event.payload, "total_tokens"),
+                        _event_counter(event.payload, "model_calls"),
+                        event.run_id,
+                    ),
+                )
+                cursor.execute(
+                    "UPDATE tool_executions SET status = 'failed' WHERE run_id = ? AND status = 'pending'",
+                    (event.run_id,),
                 )
                 cursor.execute(
                     "UPDATE threads SET status = 'idle', updated_at = ? WHERE thread_id = ?",
@@ -1047,13 +1368,39 @@ class SqliteConversationRepository:
             updated = self._connection.execute(
                 """
                 UPDATE runs
-                SET status = 'interrupted', updated_at = ?, finished_at = ?, error_code = ?
+                SET status = 'interrupted', updated_at = ?, finished_at = ?,
+                    finish_reason = ?, error_code = ?
                 WHERE run_id = ? AND thread_id = ? AND status IN ('pending', 'running')
                 """,
-                (now, now, error_code, run_id, thread_id),
+                (now, now, error_code, error_code, run_id, thread_id),
             )
             if updated.rowcount == 0:
                 return
+            last_sequence = int(
+                self._connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM run_events WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()[0]
+            )
+            self._connection.execute(
+                """
+                INSERT INTO run_events(
+                    run_id, thread_id, sequence, version, event,
+                    message_id, payload_json, created_at
+                ) VALUES (?, ?, ?, '1', 'run_interrupted', NULL, ?, ?)
+                """,
+                (
+                    run_id,
+                    thread_id,
+                    last_sequence + 1,
+                    json.dumps(
+                        {"reason": error_code},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    now,
+                ),
+            )
             self._connection.execute(
                 "UPDATE tool_executions SET status = 'cancelled' WHERE run_id = ? AND status = 'pending'",
                 (run_id,),
@@ -1069,7 +1416,8 @@ class SqliteConversationRepository:
             row = self._connection.execute(
                 """
                 SELECT run_id, thread_id, status, user_message_id, created_at,
-                       started_at, finished_at, finish_reason, error_code
+                       started_at, finished_at, finish_reason, error_code,
+                       input_tokens, output_tokens, total_tokens, model_calls
                 FROM runs
                 WHERE run_id = ?
                 """,
@@ -1087,6 +1435,10 @@ class SqliteConversationRepository:
             finished_at=cast(str | None, row["finished_at"]),
             finish_reason=cast(str | None, row["finish_reason"]),
             error_code=cast(str | None, row["error_code"]),
+            input_tokens=cast(int | None, row["input_tokens"]),
+            output_tokens=cast(int | None, row["output_tokens"]),
+            total_tokens=cast(int | None, row["total_tokens"]),
+            model_calls=cast(int | None, row["model_calls"]),
         )
 
     def create_project_thread(
@@ -1120,8 +1472,45 @@ class SqliteConversationRepository:
                 )
         return self._thread_from_row(row)
 
+    def ensure_thread(self, *, thread_id: str) -> ThreadRecord:
+        """幂等创建普通 Thread；已有项目归属和标题均保持不变。"""
+        now = _utc_now()
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO threads(
+                    thread_id, title, status, next_sequence,
+                    created_at, updated_at, project_id
+                ) VALUES (?, '新对话', 'idle', 1, ?, ?, NULL)
+                ON CONFLICT(thread_id) DO NOTHING
+                """,
+                (thread_id, now, now),
+            )
+            row = self._connection.execute(
+                """
+                SELECT thread_id, title, status, created_at, updated_at, project_id
+                FROM threads WHERE thread_id = ?
+                """,
+                (thread_id,),
+            ).fetchone()
+        if row is None:  # pragma: no cover - 同一事务内的防御性不变量
+            raise RuntimeError("Thread insert did not produce a readable record")
+        return self._thread_from_row(row)
+
+    def touch_thread(self, thread_id: str) -> ThreadRecord | None:
+        """记录 Goal 控制操作的活动时间，不改变 Thread 运行状态。"""
+        now = _utc_now()
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE threads SET updated_at = ? WHERE thread_id = ?",
+                (now, thread_id),
+            )
+        if cursor.rowcount == 0:
+            return None
+        return self.get_thread(thread_id)
+
     def list_project_threads(
-        self, project_id: str, *, limit: int
+        self, project_id: str, *, limit: int, offset: int = 0
     ) -> tuple[ThreadRecord, ...]:
         """使用 Project 最近活动索引返回严格归属的 Thread。"""
         with self._lock:
@@ -1131,9 +1520,9 @@ class SqliteConversationRepository:
                 FROM threads
                 WHERE project_id = ?
                 ORDER BY updated_at DESC, thread_id DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
-                (project_id, limit),
+                (project_id, limit, offset),
             ).fetchall()
         return tuple(self._thread_from_row(row) for row in rows)
 
@@ -1163,17 +1552,20 @@ class SqliteConversationRepository:
             return None
         return self._thread_from_row(row)
 
-    def list_threads(self, *, limit: int) -> tuple[ThreadRecord, ...]:
+    def list_threads(
+        self, *, limit: int, offset: int = 0, standalone_only: bool = False
+    ) -> tuple[ThreadRecord, ...]:
         """使用最近活动索引稳定倒序查询产品 Thread。"""
         with self._lock:
             rows = self._connection.execute(
-                """
+                f"""
                 SELECT thread_id, title, status, created_at, updated_at, project_id
                 FROM threads
+                {"WHERE project_id IS NULL" if standalone_only else ""}
                 ORDER BY updated_at DESC, thread_id DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
-                (limit,),
+                (limit, offset),
             ).fetchall()
         return tuple(
             self._thread_from_row(row)
@@ -1221,7 +1613,8 @@ class SqliteConversationRepository:
             rows = self._connection.execute(
                 """
                 SELECT run_id, thread_id, status, user_message_id, created_at,
-                       started_at, finished_at, finish_reason, error_code
+                       started_at, finished_at, finish_reason, error_code,
+                       input_tokens, output_tokens, total_tokens, model_calls
                 FROM runs
                 WHERE thread_id = ?
                 ORDER BY created_at DESC, run_id DESC
@@ -1240,6 +1633,10 @@ class SqliteConversationRepository:
                 finished_at=cast(str | None, row["finished_at"]),
                 finish_reason=cast(str | None, row["finish_reason"]),
                 error_code=cast(str | None, row["error_code"]),
+                input_tokens=cast(int | None, row["input_tokens"]),
+                output_tokens=cast(int | None, row["output_tokens"]),
+                total_tokens=cast(int | None, row["total_tokens"]),
+                model_calls=cast(int | None, row["model_calls"]),
             )
             for row in rows
         )

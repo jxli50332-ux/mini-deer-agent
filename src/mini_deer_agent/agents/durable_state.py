@@ -7,7 +7,9 @@ from typing import Literal, NotRequired, TypedDict
 
 DELEGATION_LEDGER_MAX_ENTRIES = 50
 SKILL_CONTEXT_MAX_ENTRIES = 8
-_TERMINAL_DELEGATION_STATUSES = frozenset({"completed", "failed"})
+_TERMINAL_DELEGATION_STATUSES = frozenset(
+    {"completed", "failed", "cancelled", "timed_out"}
+)
 
 
 class DelegationEntry(TypedDict):
@@ -17,10 +19,25 @@ class DelegationEntry(TypedDict):
     turn_id: str
     description: str
     subagent_type: str
-    status: Literal["in_progress", "completed", "failed"]
+    status: Literal[
+        "pending",
+        "running",
+        "completed",
+        "failed",
+        "cancelled",
+        "timed_out",
+    ]
     result_brief: NotRequired[str]
     result_sha256: NotRequired[str]
     error_code: NotRequired[str]
+    stop_reason: NotRequired[str]
+    started_at: NotRequired[str]
+    finished_at: NotRequired[str]
+    duration_ms: NotRequired[int]
+    input_tokens: NotRequired[int]
+    output_tokens: NotRequired[int]
+    total_tokens: NotRequired[int]
+    model_calls: NotRequired[int]
 
 
 class SkillContextEntry(TypedDict):
@@ -45,6 +62,47 @@ class TodoSnapshot(TypedDict):
 
     turn_id: str
     items: list[TodoStateItem]
+
+
+class PromotedToolState(TypedDict):
+    """当前目录版本下已经显式发现并获准绑定的工具名称。"""
+
+    catalog_hash: str
+    names: list[str]
+
+
+class GoalEvaluationState(TypedDict):
+    """一次独立 Goal 完成评估的结构化结果。"""
+
+    satisfied: bool
+    blocker: Literal[
+        "none",
+        "missing_evidence",
+        "needs_user_input",
+        "run_failed",
+        "external_wait",
+        "goal_not_met_yet",
+    ]
+    reason: str
+    evidence_summary: str
+    evaluated_at: str
+
+
+class GoalState(TypedDict):
+    """持久化在线程 checkpoint 中的 Goal mode 控制状态。"""
+
+    version: Literal[1]
+    revision: str
+    objective: str
+    continuation_count: int
+    max_continuations: int
+    no_progress_count: int
+    last_evaluation: GoalEvaluationState | None
+    status: Literal["active", "paused", "stopped", "completed"]
+    stop_reason: str | None
+    context_anchor_message_id: NotRequired[str | None]
+    created_at: str
+    updated_at: str
 
 
 def merge_delegations(

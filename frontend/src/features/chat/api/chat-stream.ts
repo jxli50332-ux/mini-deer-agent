@@ -23,6 +23,8 @@ export interface ChatStreamRequest {
   readonly message: string;
   readonly attachments?: readonly TextAttachmentPayload[];
   readonly humanInputResponse?: HumanInputResponse;
+  readonly benchmarkCaseId?: string;
+  readonly goalResumeRevision?: string;
   readonly signal?: AbortSignal;
   readonly onRunId?: (runId: string) => void;
 }
@@ -49,6 +51,10 @@ export interface ChatRunDetail {
   readonly finishedAt: string | null;
   readonly finishReason: string | null;
   readonly errorCode: string | null;
+  readonly inputTokens?: number | null;
+  readonly outputTokens?: number | null;
+  readonly totalTokens?: number | null;
+  readonly modelCalls?: number | null;
 }
 
 export type ChatRunReconciler = (
@@ -134,6 +140,8 @@ function validateRequest(request: ChatStreamRequest): {
   readonly message: string;
   readonly attachments: readonly TextAttachmentPayload[];
   readonly humanInputResponse: HumanInputResponse | null;
+  readonly benchmarkCaseId: string | null;
+  readonly goalResumeRevision: string | null;
 } {
   const threadId = request.threadId.trim().toLowerCase();
   if (!UUID_PATTERN.test(threadId)) {
@@ -161,6 +169,14 @@ function validateRequest(request: ChatStreamRequest): {
       { retryable: false },
     );
   }
+  const benchmarkCaseId = request.benchmarkCaseId?.trim() ?? null;
+  if (benchmarkCaseId !== null && !/^[a-z0-9-]{1,64}$/.test(benchmarkCaseId)) {
+    throw new ChatStreamClientError(
+      "invalid_request",
+      "benchmarkCaseId 格式无效",
+      { retryable: false },
+    );
+  }
   let attachments;
   try {
     attachments = validateTextAttachmentPayloads(request.attachments ?? []).map(
@@ -184,7 +200,36 @@ function validateRequest(request: ChatStreamRequest): {
       { retryable: false },
     );
   }
-  return { threadId, messageId, message, attachments, humanInputResponse };
+  const goalResumeRevision =
+    request.goalResumeRevision?.trim().toLowerCase() ?? null;
+  if (goalResumeRevision !== null && !UUID_PATTERN.test(goalResumeRevision)) {
+    throw new ChatStreamClientError(
+      "invalid_request",
+      "goalResumeRevision 必须是有效 UUID",
+      { retryable: false },
+    );
+  }
+  if (
+    goalResumeRevision !== null &&
+    (attachments.length > 0 ||
+      humanInputResponse !== null ||
+      benchmarkCaseId !== null)
+  ) {
+    throw new ChatStreamClientError(
+      "invalid_request",
+      "恢复 Goal 时不能同时提交附件、澄清回答或基准任务",
+      { retryable: false },
+    );
+  }
+  return {
+    threadId,
+    messageId,
+    message,
+    attachments,
+    humanInputResponse,
+    benchmarkCaseId,
+    goalResumeRevision,
+  };
 }
 
 function validateRunAddress(request: ChatRunCancelRequest): {
@@ -230,6 +275,20 @@ function nullableString(record: UnknownRecord, field: string): string | null {
     invalidRunResponse(`${field} 必须是字符串或 null`);
   }
   return value;
+}
+
+function optionalNullableInteger(
+  record: UnknownRecord,
+  field: string,
+): number | null {
+  const value = record[field];
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (!Number.isInteger(value) || (value as number) < 0) {
+    invalidRunResponse(`${field} 必须是非负整数或 null`);
+  }
+  return value as number;
 }
 
 function timestampField(
@@ -302,6 +361,18 @@ export function parseChatRunDetail(
     finishedAt: timestampField(value, "finished_at", true),
     finishReason: nullableString(value, "finish_reason"),
     errorCode: nullableString(value, "error_code"),
+    ...(value.input_tokens === undefined
+      ? {}
+      : { inputTokens: optionalNullableInteger(value, "input_tokens") }),
+    ...(value.output_tokens === undefined
+      ? {}
+      : { outputTokens: optionalNullableInteger(value, "output_tokens") }),
+    ...(value.total_tokens === undefined
+      ? {}
+      : { totalTokens: optionalNullableInteger(value, "total_tokens") }),
+    ...(value.model_calls === undefined
+      ? {}
+      : { modelCalls: optionalNullableInteger(value, "model_calls") }),
   };
 }
 
@@ -642,9 +713,13 @@ export async function* streamChatRun(
     options.inactivityTimeoutMilliseconds,
   );
   const fetcher = options.fetcher ?? globalThis.fetch;
-  const endpoint = `/api/v1/threads/${encodeURIComponent(
+  const threadEndpoint = `/api/v1/threads/${encodeURIComponent(
     validated.threadId,
-  )}/runs/stream`;
+  )}`;
+  const endpoint =
+    validated.goalResumeRevision === null
+      ? `${threadEndpoint}/runs/stream`
+      : `${threadEndpoint}/goal/resume`;
 
   let response: Response;
   try {
@@ -654,16 +729,26 @@ export async function* streamChatRun(
         Accept: "text/event-stream",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        message_id: validated.messageId,
-        message: validated.message,
-        ...(validated.attachments.length > 0
-          ? { attachments: validated.attachments }
-          : {}),
-        ...(validated.humanInputResponse === null
-          ? {}
-          : { human_input_response: validated.humanInputResponse }),
-      }),
+      body: JSON.stringify(
+        validated.goalResumeRevision === null
+          ? {
+              message_id: validated.messageId,
+              message: validated.message,
+              ...(validated.attachments.length > 0
+                ? { attachments: validated.attachments }
+                : {}),
+              ...(validated.humanInputResponse === null
+                ? {}
+                : { human_input_response: validated.humanInputResponse }),
+              ...(validated.benchmarkCaseId === null
+                ? {}
+                : { benchmark_case_id: validated.benchmarkCaseId }),
+            }
+          : {
+              message_id: validated.messageId,
+              revision: validated.goalResumeRevision,
+            },
+      ),
       credentials: "same-origin",
       cache: "no-store",
       ...(request.signal === undefined ? {} : { signal: request.signal }),

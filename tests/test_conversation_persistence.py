@@ -622,12 +622,14 @@ def test_repository_lists_recent_threads_with_stable_order_and_limit(
 
     with open_sqlite_conversation_repository(database_path) as repository:
         recent = repository.list_threads(limit=2)
+        second_page = repository.list_threads(limit=1, offset=1)
 
     assert [thread.thread_id for thread in recent] == [
         thread_ids[2],
         thread_ids[1],
     ]
     assert [thread.title for thread in recent] == [None, None]
+    assert [thread.thread_id for thread in second_page] == [thread_ids[1]]
 
     with sqlite3.connect(database_path) as connection:
         migration_versions = connection.execute(
@@ -652,9 +654,12 @@ def test_repository_lists_recent_threads_with_stable_order_and_limit(
         (7,),
         (8,),
         (9,),
-        (10,),
-        (11,),
-    ]
+            (10,),
+            (11,),
+                (12,),
+                (13,),
+                (14,),
+            ]
     assert any("idx_threads_recent" in str(row) for row in query_plan)
 
 
@@ -693,6 +698,30 @@ def test_thread_title_is_generated_once_and_manual_rename_is_persistent(
         restored = repository.get_thread(THREAD_ID)
         assert restored is not None
         assert restored.title == "北京出行计划"
+
+
+def test_goal_resume_run_persists_control_message_as_hidden(tmp_path: Path) -> None:
+    with open_sqlite_conversation_repository(
+        tmp_path / "hidden-goal-resume.sqlite"
+    ) as repository:
+        repository.create_run(
+            thread_id=THREAD_ID,
+            run_id=RUN_ID,
+            user_message_id=MESSAGE_ID,
+            user_message="[Goal continuation] 继续当前目标",
+            hidden_from_ui=True,
+        )
+
+        history = repository.list_history(
+            THREAD_ID,
+            limit=10,
+            before_sequence=None,
+        )
+
+    assert len(history.items) == 1
+    message = history.items[0]
+    assert isinstance(message, MessageHistoryItem)
+    assert message.hidden_from_ui is True
 
 
 def test_repository_rejects_parallel_run_and_recovers_after_restart(
@@ -736,6 +765,16 @@ def test_repository_rejects_parallel_run_and_recovers_after_restart(
         recovered_run = repository.list_runs(THREAD_ID, limit=1)[0]
         assert recovered_run.status == "interrupted"
         assert recovered_run.error_code == "server_restarted"
+        assert recovered_run.finish_reason == "server_restarted"
+        recovered_events = repository.list_run_events(
+            THREAD_ID,
+            recovered_run.run_id,
+            after_sequence=0,
+            limit=20,
+        )
+        assert recovered_events is not None
+        assert recovered_events[-1].event == "run_interrupted"
+        assert recovered_events[-1].payload == {"reason": "server_restarted"}
         thread = repository.get_thread(THREAD_ID)
         assert thread is not None
         assert thread.status == "idle"
@@ -778,6 +817,140 @@ def test_first_terminal_event_wins_cancel_completion_race(tmp_path: Path) -> Non
         assert record is not None
         assert record.status == "interrupted"
         assert record.finish_reason == "user_cancelled"
+
+
+def test_completed_and_restarted_runs_settle_pending_tools(tmp_path: Path) -> None:
+    """任何 Run 终态都不能在历史里留下永久 pending 的工具卡。"""
+    database_path = tmp_path / "settle-pending-tools.sqlite"
+    with open_sqlite_conversation_repository(database_path) as repository:
+        repository.create_run(
+            thread_id=THREAD_ID,
+            run_id=RUN_ID,
+            user_message_id=MESSAGE_ID,
+            user_message="启动工具后完成",
+        )
+        assert repository.apply_run_event(event("run_started", 1, payload={}))
+        assert repository.apply_run_event(
+            event(
+                "tool_call_delta",
+                2,
+                message_id=ASSISTANT_ID,
+                payload={
+                    "tool_call_id": "pending-on-complete",
+                    "name": "reader",
+                    "arguments_delta": "{}",
+                    "index": 0,
+                },
+            )
+        )
+        assert repository.apply_run_event(
+            event("run_completed", 3, payload={"finish_reason": "stop"})
+        )
+
+        second_run_id = "67676767-6767-4767-8767-676767676767"
+        repository.create_run(
+            thread_id=THREAD_ID,
+            run_id=second_run_id,
+            user_message_id="68686868-6868-4868-8868-686868686868",
+            user_message="启动工具后崩溃",
+        )
+        assert repository.apply_run_event(
+            RunEvent(
+                event="run_started",
+                run_id=second_run_id,
+                thread_id=THREAD_ID,
+                sequence=1,
+                message_id=None,
+                payload={},
+            )
+        )
+        assert repository.apply_run_event(
+            RunEvent(
+                event="tool_call_delta",
+                run_id=second_run_id,
+                thread_id=THREAD_ID,
+                sequence=2,
+                message_id=ASSISTANT_ID,
+                payload={
+                    "tool_call_id": "pending-on-restart",
+                    "name": "reader",
+                    "arguments_delta": "{}",
+                    "index": 0,
+                },
+            )
+        )
+
+    with open_sqlite_conversation_repository(database_path):
+        pass
+    with sqlite3.connect(database_path) as connection:
+        statuses = dict(
+            connection.execute(
+                "SELECT tool_call_id, status FROM tool_executions"
+            ).fetchall()
+        )
+    assert statuses == {
+        "pending-on-complete": "failed",
+        "pending-on-restart": "cancelled",
+    }
+
+
+def test_parent_cancel_persists_pending_task_as_cancelled_after_reopen(
+    tmp_path: Path,
+) -> None:
+    """父 Run 取消后，刷新历史必须看到 task 已取消而不是永久 pending。"""
+    database_path = tmp_path / "cancelled-task.sqlite"
+    with open_sqlite_conversation_repository(database_path) as repository:
+        repository.create_run(
+            thread_id=THREAD_ID,
+            run_id=RUN_ID,
+            user_message_id=MESSAGE_ID,
+            user_message="启动并取消委派",
+        )
+        assert repository.apply_run_event(
+            event(
+                "run_started",
+                1,
+                payload={"created_at": "2026-09-07T01:00:00+00:00"},
+            )
+        )
+        assert repository.apply_run_event(
+            event(
+                "tool_call_delta",
+                2,
+                message_id=ASSISTANT_ID,
+                payload={
+                    "tool_call_id": "call-cancelled-task",
+                    "name": "task",
+                    "arguments_delta": (
+                        '{"description":"慢任务","prompt":"等待",'
+                        '"subagent_type":"research"}'
+                    ),
+                    "index": 0,
+                },
+            )
+        )
+        assert repository.apply_run_event(
+            event(
+                "run_interrupted",
+                3,
+                payload={"reason": "user_cancelled"},
+            )
+        )
+
+    with open_sqlite_conversation_repository(database_path) as repository:
+        history = repository.list_history(
+            THREAD_ID,
+            limit=10,
+            before_sequence=None,
+        )
+        run = repository.get_run(RUN_ID)
+
+    task = next(item for item in history.items if item.kind == "tool")
+    assert task.name == "task"
+    assert task.status == "cancelled"
+    assert run is not None
+    assert run.status == "interrupted"
+    assert run.finish_reason == "user_cancelled"
 
 
 class StaticMessageGraph:

@@ -37,7 +37,9 @@ def validate_skill_tool_policies(
         unknown_names = tuple(
             name for name in skill.allowed_tools if name not in registered_names
         )
-        if unknown_names:
+        # 内置技能是随应用发布的可信资产，引用不存在工具属于发布错误；
+        # 用户技能按当前 Run 能力做最小交集，普通 Thread 不因项目专用工具缺席而失败。
+        if unknown_names and skill.source == "builtin":
             rendered = ", ".join(unknown_names)
             raise SkillCatalogError(
                 f"Skill {skill.name!r} declares unknown allowed tool(s): {rendered}"

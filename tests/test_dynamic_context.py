@@ -73,7 +73,7 @@ def _task_call(call_id: str) -> dict[str, Any]:
         "args": {
             "description": "核对日期",
             "prompt": "说明当前日期。",
-            "subagent_type": "general-purpose",
+            "subagent_type": "research",
         },
         "id": call_id,
         "type": "tool_call",

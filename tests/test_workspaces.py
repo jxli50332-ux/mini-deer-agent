@@ -572,6 +572,12 @@ def test_http_project_threads_are_isolated_idempotent_and_persistent(
         assert [
             item["thread_id"] for item in client.get(urls[1], headers=HEADERS).json()
         ] == [thread_ids[1]]
+        assert client.get(
+            f"{urls[0]}?limit=1&offset=1", headers=HEADERS
+        ).json() == []
+        assert client.get(
+            "/api/v1/threads?scope=standalone", headers=HEADERS
+        ).json() == []
         conflict = client.post(
             urls[1], headers=HEADERS, json={"thread_id": thread_ids[0]}
         )

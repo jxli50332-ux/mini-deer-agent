@@ -3,21 +3,29 @@
 import asyncio
 import logging
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from uuid import uuid4
 
 from mini_deer_agent.application.conversations import ConversationRepository
 from mini_deer_agent.application.run_stream import RunStreamService
+from mini_deer_agent.application.goals import GoalEvaluationService
 from mini_deer_agent.domain import TextAttachment
+from mini_deer_agent.domain import require_benchmark_case
 from mini_deer_agent.streaming.events import RunEvent
 
 
 logger = logging.getLogger(__name__)
 _QUEUE_CAPACITY = 256
 _DEFAULT_CANCEL_GRACE_SECONDS = 5.0
+_DEFAULT_RUN_TIMEOUT_SECONDS = 900.0
 _TERMINAL_EVENTS = {"run_completed", "run_error", "run_interrupted"}
+_GOAL_CONTROL_ABORT_REASONS = {
+    "goal_cleared",
+    "goal_replaced",
+    "goal_stopped",
+}
 
 
 class CancelOutcome(StrEnum):
@@ -57,6 +65,8 @@ class _ActiveRun:
     abort_event: asyncio.Event = field(default_factory=asyncio.Event)
     cancel_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     task: asyncio.Task[None] | None = None
+    timeout_task: asyncio.Task[None] | None = None
+    timeout_triggered: bool = False
     last_sequence: int = 0
     abort_reason: str = "user_cancelled"
     terminal: bool = False
@@ -71,15 +81,21 @@ class RunExecutionManager:
         conversation_repository: ConversationRepository,
         *,
         cancel_grace_seconds: float = _DEFAULT_CANCEL_GRACE_SECONDS,
+        run_timeout_seconds: float = _DEFAULT_RUN_TIMEOUT_SECONDS,
+        goal_evaluation_service: GoalEvaluationService | None = None,
     ) -> None:
         """保存执行源和产品仓储；Task 句柄永远不会写入数据库。"""
         if cancel_grace_seconds <= 0:
             raise ValueError("cancel_grace_seconds must be positive")
+        if run_timeout_seconds <= 0:
+            raise ValueError("run_timeout_seconds must be positive")
         self._stream_service = stream_service
         self._conversation_repository = conversation_repository
         self._cancel_grace_seconds = cancel_grace_seconds
+        self._run_timeout_seconds = run_timeout_seconds
         self._active_runs: dict[str, _ActiveRun] = {}
         self._shutting_down = False
+        self._goal_evaluation_service = goal_evaluation_service
 
     async def start_run(
         self,
@@ -88,20 +104,29 @@ class RunExecutionManager:
         user_message_id: str,
         attachments: tuple[TextAttachment, ...] = (),
         human_input_response: dict[str, object] | None = None,
+        benchmark_case_id: str | None = None,
+        internal_continuation: bool = False,
     ) -> StartedRun:
         """先持久化 Run，再无等待窗口地附加后台执行 Task。"""
         if self._shutting_down:
             raise RuntimeError("Run execution manager is shutting down")
 
         run_id = str(uuid4())
-        await asyncio.to_thread(
-            self._conversation_repository.create_run,
+        create_run_kwargs: dict[str, object] = dict(
             thread_id=thread_id,
             run_id=run_id,
             user_message_id=user_message_id,
             user_message=message,
             attachments=attachments,
             human_input_response=human_input_response,
+            hidden_from_ui=internal_continuation,
+        )
+        if benchmark_case_id is not None:
+            require_benchmark_case(benchmark_case_id)
+            create_run_kwargs["benchmark_case_id"] = benchmark_case_id
+        await asyncio.to_thread(
+            self._conversation_repository.create_run,
+            **create_run_kwargs,
         )
 
         started_event = RunEvent(
@@ -140,8 +165,13 @@ class RunExecutionManager:
                     message,
                     attachments,
                     human_input_response,
+                    internal_continuation,
                 ),
                 name=f"mini-deer-run-{run_id}",
+            )
+            active.timeout_task = asyncio.create_task(
+                self._timeout_active_run(active),
+                name=f"mini-deer-run-timeout-{run_id}",
             )
         except BaseException:
             self._active_runs.pop(run_id, None)
@@ -166,6 +196,7 @@ class RunExecutionManager:
         message: str,
         attachments: tuple[TextAttachment, ...],
         human_input_response: dict[str, object] | None,
+        initial_internal_continuation: bool = False,
     ) -> None:
         """驱动异步 LangGraph，把事件先持久化再发布给 SSE 订阅者。"""
         logger.info(
@@ -173,31 +204,177 @@ class RunExecutionManager:
             active.run_id,
             active.thread_id,
         )
+        terminal_event: str | None = None
+        goal_evaluated = False
+        goal_revision: str | None = None
         try:
-            stream = (
-                self._stream_service.astream_run_events(
-                    message,
+            goal_revision = (
+                await self._goal_evaluation_service.resume_for_user_run(
                     active.thread_id,
-                    active.run_id,
-                    attachments,
+                    is_human_input_response=human_input_response is not None,
                 )
-                if human_input_response is None
-                else self._stream_service.astream_run_events(
-                    message,
-                    active.thread_id,
-                    active.run_id,
-                    attachments,
-                    human_input_response,
-                )
+                if self._goal_evaluation_service is not None
+                else None
             )
-            async for event in stream:
-                if event.event == "run_started" and event.sequence == 1:
-                    # start_run 已在返回响应前持久化并排队，投影器的同一事件不重复发送。
-                    continue
-                if active.abort_event.is_set():
-                    raise asyncio.CancelledError
-                if not await self._persist_and_publish(active, event):
+            goal_budget_tracker = (
+                self._stream_service.create_run_budget_tracker(active.run_id)
+                if goal_revision is not None
+                else None
+            )
+            if goal_revision is not None and (
+                initial_internal_continuation or human_input_response is not None
+            ):
+                # 显式恢复和澄清恢复会在创建产品 Run 前改变 Goal；从第一帧
+                # 主动通知前端，避免栏位在轮询到来前仍显示旧的暂停/停止态。
+                resumed_event = RunEvent(
+                    event="goal_status",
+                    run_id=active.run_id,
+                    thread_id=active.thread_id,
+                    sequence=active.last_sequence + 1,
+                    message_id=None,
+                    payload={"phase": "updated"},
+                )
+                if not await self._persist_and_publish(active, resumed_event):
                     return
+            round_message = message
+            round_attachments = attachments
+            round_human_response = human_input_response
+            internal_continuation = initial_internal_continuation
+            while True:
+                if goal_budget_tracker is not None:
+                    stream = self._stream_service.astream_run_events(
+                        round_message,
+                        active.thread_id,
+                        active.run_id,
+                        round_attachments,
+                        round_human_response,
+                        run_budget_tracker=goal_budget_tracker,
+                        internal_continuation=internal_continuation,
+                    )
+                elif round_human_response is None:
+                    stream = self._stream_service.astream_run_events(
+                        round_message,
+                        active.thread_id,
+                        active.run_id,
+                        round_attachments,
+                    )
+                else:
+                    stream = self._stream_service.astream_run_events(
+                        round_message,
+                        active.thread_id,
+                        active.run_id,
+                        round_attachments,
+                        round_human_response,
+                    )
+                held_terminal: RunEvent | None = None
+                async for source_event in stream:
+                    if source_event.event == "run_started":
+                        # 每轮投影都会生成本地 started；产品 Run 只保留首次已持久化事件。
+                        continue
+                    if active.abort_event.is_set():
+                        raise asyncio.CancelledError
+                    event = replace(
+                        source_event,
+                        sequence=active.last_sequence + 1,
+                    )
+                    if event.event in _TERMINAL_EVENTS and goal_revision is not None:
+                        held_terminal = event
+                        continue
+                    if not await self._persist_and_publish(active, event):
+                        return
+                    if event.event in _TERMINAL_EVENTS:
+                        terminal_event = event.event
+
+                if held_terminal is None:
+                    break
+                try:
+                    evaluating_event = RunEvent(
+                        event="goal_status",
+                        run_id=active.run_id,
+                        thread_id=active.thread_id,
+                        sequence=active.last_sequence + 1,
+                        message_id=None,
+                        payload={"phase": "evaluating"},
+                    )
+                    if not await self._persist_and_publish(active, evaluating_event):
+                        return
+                    evaluation = await self._goal_evaluation_service.evaluate_run(
+                        thread_id=active.thread_id,
+                        run_id=active.run_id,
+                        terminal_event=held_terminal.event,
+                        expected_revision=goal_revision,
+                    )
+                    goal_evaluated = True
+                    if evaluation is not None and held_terminal.event == "run_completed":
+                        finish_reason = held_terminal.payload.get("finish_reason")
+                        decision = (
+                            await self._goal_evaluation_service.prepare_continuation(
+                                thread_id=active.thread_id,
+                                evaluation=evaluation,
+                                expected_revision=goal_revision,
+                                budget_stop_reason=(
+                                    finish_reason
+                                    if isinstance(finish_reason, str)
+                                    else None
+                                ),
+                            )
+                        )
+                        if decision.continue_run and decision.message is not None:
+                            updated_event = RunEvent(
+                                event="goal_status",
+                                run_id=active.run_id,
+                                thread_id=active.thread_id,
+                                sequence=active.last_sequence + 1,
+                                message_id=None,
+                                payload={"phase": "updated"},
+                            )
+                            if not await self._persist_and_publish(active, updated_event):
+                                return
+                            round_message = decision.message
+                            round_attachments = ()
+                            round_human_response = None
+                            internal_continuation = True
+                            goal_evaluated = False
+                            continue
+                    updated_event = RunEvent(
+                        event="goal_status",
+                        run_id=active.run_id,
+                        thread_id=active.thread_id,
+                        sequence=active.last_sequence + 1,
+                        message_id=None,
+                        payload={"phase": "updated"},
+                    )
+                    if not await self._persist_and_publish(active, updated_event):
+                        return
+                except Exception as exc:
+                    # Goal 是附加控制层；评估器或 checkpoint 故障不能吞掉已经成功的
+                    # 产品 Run 终态，否则 Thread 会永久停留在 busy。
+                    goal_evaluated = True
+                    logger.error(
+                        "Goal evaluation failed before Run completion: error_type=%s",
+                        type(exc).__name__,
+                        extra={"run_id": active.run_id},
+                    )
+                    failed_event = RunEvent(
+                        event="goal_status",
+                        run_id=active.run_id,
+                        thread_id=active.thread_id,
+                        sequence=active.last_sequence + 1,
+                        message_id=None,
+                        payload={"phase": "evaluation_failed"},
+                    )
+                    if not await self._persist_and_publish(active, failed_event):
+                        return
+                held_terminal = replace(
+                    held_terminal,
+                    sequence=active.last_sequence + 1,
+                )
+                if not await self._persist_and_publish(active, held_terminal):
+                    return
+                terminal_event = held_terminal.event
+                break
+            if terminal_event is None:
+                raise RuntimeError("Run stream ended without a terminal event")
             logger.info("Run 执行完成：run_id=%s", active.run_id)
         except asyncio.CancelledError:
             logger.info(
@@ -205,8 +382,20 @@ class RunExecutionManager:
                 active.run_id,
                 active.abort_reason,
             )
+            if (
+                not active.terminal
+                and not goal_evaluated
+                and goal_revision is not None
+                and active.abort_reason not in _GOAL_CONTROL_ABORT_REASONS
+            ):
+                goal_evaluated = await self._evaluate_goal_before_terminal(
+                    active,
+                    goal_revision=goal_revision,
+                    terminal_event="run_interrupted",
+                )
             if not active.terminal:
                 await self._finish_interrupted(active)
+            terminal_event = "run_interrupted"
         except Exception as exc:
             # 只记录异常类型，避免模型、工具或数据库异常正文泄露敏感信息。
             logger.error(
@@ -214,19 +403,140 @@ class RunExecutionManager:
                 type(exc).__name__,
                 extra={"run_id": active.run_id},
             )
-            await asyncio.shield(
-                asyncio.to_thread(
-                    self._conversation_repository.interrupt_run,
-                    thread_id=active.thread_id,
-                    run_id=active.run_id,
-                    error_code="run_execution_manager_failed",
+            if (
+                not active.terminal
+                and not goal_evaluated
+                and goal_revision is not None
+            ):
+                goal_evaluated = await self._evaluate_goal_before_terminal(
+                    active,
+                    goal_revision=goal_revision,
+                    terminal_event="run_error",
                 )
-            )
+            if not active.terminal:
+                error_event = RunEvent(
+                    event="run_error",
+                    run_id=active.run_id,
+                    thread_id=active.thread_id,
+                    sequence=active.last_sequence + 1,
+                    message_id=None,
+                    payload={
+                        "code": "run_execution_manager_failed",
+                        "message": "Agent execution failed",
+                        "retryable": True,
+                    },
+                )
+                try:
+                    await self._persist_and_publish(active, error_event)
+                except Exception:
+                    await asyncio.shield(
+                        asyncio.to_thread(
+                            self._conversation_repository.interrupt_run,
+                            thread_id=active.thread_id,
+                            run_id=active.run_id,
+                            error_code="run_execution_manager_failed",
+                        )
+                    )
+            terminal_event = "run_error"
         finally:
+            if (
+                self._goal_evaluation_service is not None
+                and terminal_event is not None
+                and not goal_evaluated
+                and active.abort_reason not in _GOAL_CONTROL_ABORT_REASONS
+            ):
+                try:
+                    await self._goal_evaluation_service.evaluate_run(
+                        thread_id=active.thread_id,
+                        run_id=active.run_id,
+                        terminal_event=terminal_event,
+                        expected_revision=goal_revision,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Goal evaluation failed after Run terminal: error_type=%s",
+                        type(exc).__name__,
+                        extra={"run_id": active.run_id},
+                    )
             active.terminal = True
             await active.events.put(_END_OF_RUN)
+            if (
+                active.timeout_task is not None
+                and not active.timeout_triggered
+                and active.timeout_task is not asyncio.current_task()
+            ):
+                active.timeout_task.cancel()
             if self._active_runs.get(active.run_id) is active:
                 self._active_runs.pop(active.run_id, None)
+
+    async def _evaluate_goal_before_terminal(
+        self,
+        active: _ActiveRun,
+        *,
+        goal_revision: str,
+        terminal_event: str,
+    ) -> bool:
+        """在管理器自行产生终态时先写 Goal，避免终态刷新读取到旧状态。"""
+        if self._goal_evaluation_service is None:
+            return False
+        try:
+            evaluating_event = RunEvent(
+                event="goal_status",
+                run_id=active.run_id,
+                thread_id=active.thread_id,
+                sequence=active.last_sequence + 1,
+                message_id=None,
+                payload={"phase": "evaluating"},
+            )
+            if not await self._persist_and_publish(active, evaluating_event):
+                return True
+            await self._goal_evaluation_service.evaluate_run(
+                thread_id=active.thread_id,
+                run_id=active.run_id,
+                terminal_event=terminal_event,
+                expected_revision=goal_revision,
+            )
+            updated_event = RunEvent(
+                event="goal_status",
+                run_id=active.run_id,
+                thread_id=active.thread_id,
+                sequence=active.last_sequence + 1,
+                message_id=None,
+                payload={"phase": "updated"},
+            )
+            await self._persist_and_publish(active, updated_event)
+        except Exception as exc:
+            logger.error(
+                "Goal evaluation failed before manager terminal: error_type=%s",
+                type(exc).__name__,
+                extra={"run_id": active.run_id},
+            )
+            try:
+                failed_event = RunEvent(
+                    event="goal_status",
+                    run_id=active.run_id,
+                    thread_id=active.thread_id,
+                    sequence=active.last_sequence + 1,
+                    message_id=None,
+                    payload={"phase": "evaluation_failed"},
+                )
+                await self._persist_and_publish(active, failed_event)
+            except Exception:
+                pass
+        return True
+
+    async def _timeout_active_run(self, active: _ActiveRun) -> None:
+        """给整个产品 Run（含隐藏续跑）设置最终截止时间。"""
+        try:
+            await asyncio.sleep(self._run_timeout_seconds)
+            active.timeout_triggered = True
+            await self.cancel_run(
+                active.thread_id,
+                active.run_id,
+                reason="run_timeout",
+            )
+        except asyncio.CancelledError:
+            return
 
     async def _persist_and_publish(
         self,
@@ -269,20 +579,14 @@ class RunExecutionManager:
             message_id=None,
             payload={"reason": active.abort_reason},
         )
-        await asyncio.shield(
+        applied = await asyncio.shield(
             asyncio.to_thread(
                 self._conversation_repository.apply_run_event,
                 event,
             )
         )
-        persisted = await asyncio.shield(
-            asyncio.to_thread(
-                self._conversation_repository.get_run,
-                active.run_id,
-            )
-        )
-        # 若自然完成抢先落库，就不能再向客户端伪造 interrupted 终态。
-        if persisted is None or persisted.status != "interrupted":
+        # 第一个终态写入者独占公开终态；并发取消不能重复发送相同 sequence。
+        if not applied:
             return
         active.last_sequence = event.sequence
         active.terminal = True
@@ -397,6 +701,25 @@ class RunExecutionManager:
             if final_record is not None and final_record.status == "interrupted":
                 return CancelOutcome.cancelled
             return CancelOutcome.not_cancellable
+
+    async def cancel_active_run(
+        self,
+        thread_id: str,
+        *,
+        reason: str,
+    ) -> CancelOutcome:
+        """按 Thread 取消本进程唯一活动 Run，供 Goal/Thread 控制面复用。"""
+        active = next(
+            (
+                candidate
+                for candidate in self._active_runs.values()
+                if candidate.thread_id == thread_id and not candidate.terminal
+            ),
+            None,
+        )
+        if active is None:
+            return CancelOutcome.not_active
+        return await self.cancel_run(thread_id, active.run_id, reason=reason)
 
     async def _subscribe(self, active: _ActiveRun) -> AsyncIterator[RunEvent]:
         """订阅一个 Run；浏览器断开时复用同一取消状态机。"""
