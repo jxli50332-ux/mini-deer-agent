@@ -43,6 +43,19 @@ def _normalize_agent_name(value: str) -> str:
     return html.escape(normalized, quote=False)
 
 
+def _render_current_model_identity(value: str | None) -> str:
+    """把当前 Run 的可信模型标识安全投影到身份说明。"""
+    if value is None:
+        return "当前 Run 没有提供具体模型标识。"
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError("current_model_name must not be blank")
+    if len(normalized) > 200:
+        raise ValueError("current_model_name is too long")
+    rendered = html.escape(json.dumps(normalized, ensure_ascii=False), quote=False)
+    return f"当前 Run 使用的模型标识是 {rendered}。"
+
+
 def _normalize_tool_names(values: tuple[str, ...]) -> tuple[str, ...]:
     """返回稳定排序且去重的工具名称，拒绝不能安全展示的标识符。"""
     normalized_names: set[str] = set()
@@ -391,6 +404,9 @@ class DefaultAgentPromptBuilder:
         skills = _normalize_skill_summaries(context.available_skills)
         content = DEFAULT_SYSTEM_PROMPT_TEMPLATE.format(
             agent_name=agent_name,
+            current_model_identity=_render_current_model_identity(
+                context.current_model_name
+            ),
             tool_catalog=_render_tool_catalog(tool_names),
             deferred_tool_catalog=_render_deferred_tool_catalog(
                 context.deferred_tools

@@ -238,7 +238,9 @@ class SkillManagementService:
 
     def require_agent_creation_enabled(self) -> None:
         if not self.agent_settings().creation_enabled:
-            raise SkillCatalogError("Agent Skill creation is disabled in settings")
+            raise SkillCatalogError(
+                "Automatic Agent Skill installation is disabled in settings"
+            )
 
     def _draft_path(self, draft_id: str) -> Path:
         try:
@@ -309,13 +311,53 @@ class SkillManagementService:
         return record
 
     def list_drafts(self) -> tuple[SkillDraftRecord, ...]:
-        """列出人工与 Agent 草稿，损坏草稿失败关闭而不是静默丢失。"""
+        """列出待确认草稿，并清理由旧版本遗留的已安装副本。"""
         records: list[SkillDraftRecord] = []
         with self._lock:
             for path in sorted(self._drafts_root.iterdir(), key=lambda item: item.name):
                 if path.is_dir() and not path.is_symlink():
                     records.append(self._read_draft(path.name))
-        return tuple(sorted(records, key=lambda item: item.updated_at, reverse=True))
+        pending: list[SkillDraftRecord] = []
+        for record in records:
+            if self._draft_matches_installed_content(record):
+                self._discard_draft_if_revision(
+                    record.draft_id,
+                    expected_revision=record.revision,
+                )
+            else:
+                pending.append(record)
+        return tuple(sorted(pending, key=lambda item: item.updated_at, reverse=True))
+
+    def _draft_matches_installed_content(self, record: SkillDraftRecord) -> bool:
+        """识别旧版本遗留的、内容已经完整安装的已解决草稿。"""
+        package = self.manager.root / record.payload.name
+        if not package.is_dir() or package.is_symlink():
+            return False
+        try:
+            installed = load_skill_package(package, source="user")
+            checked = self.check_draft(record.draft_id)
+        except (OSError, SkillCatalogError, UnicodeError):
+            return False
+        return (
+            checked.valid
+            and checked.content_hash is not None
+            and checked.content_hash == self._package_hash(package, installed)
+        )
+
+    def _discard_draft_if_revision(
+        self,
+        draft_id: str,
+        *,
+        expected_revision: int,
+    ) -> None:
+        """只移除已安装的原版本；并发产生的新版本继续作为待确认草稿。"""
+        with self._lock:
+            try:
+                current = self._read_draft(draft_id)
+            except SkillCatalogError:
+                return
+            if current.revision == expected_revision:
+                shutil.rmtree(self._draft_path(draft_id))
 
     def update_draft(
         self,
@@ -774,7 +816,12 @@ class SkillManagementService:
             )
         finally:
             shutil.rmtree(work)
-        return self.get_detail(skill.name)
+        detail = self.get_detail(skill.name)
+        self._discard_draft_if_revision(
+            draft_id,
+            expected_revision=record.revision,
+        )
+        return detail
 
     def _archive_package(self, content: bytes) -> tuple[Path, BuiltInSkill]:
         if not content or len(content) > MAX_ARCHIVE_BYTES:

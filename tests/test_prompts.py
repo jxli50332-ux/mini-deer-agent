@@ -11,20 +11,34 @@ from mini_deer_agent.agents.prompts import (
 from mini_deer_agent.skills import SkillSummary
 
 
-def test_default_prompt_defines_product_identity_without_model_name() -> None:
-    """系统提示只定义产品身份，不能注入或猜测底层模型名称。"""
+def test_default_prompt_uses_a_natural_identity_without_guessing_model() -> None:
+    """缺少运行时模型信息时，应保持自然身份且不猜测供应商。"""
     built = DefaultAgentPromptBuilder().build(
         AgentPromptContext(
             available_tool_names=("web_search", "get_weather", "get_weather"),
         )
     )
 
-    assert built.version == "mini-deer-agent/system/v47"
+    assert built.version == "mini-deer-agent/system/v48"
     assert "你是 Mini Deer Agent" in built.system_message.text
+    assert "友好、可靠的通用 AI Agent" in built.system_message.text
+    assert "当前 Run 没有提供具体模型标识" in built.system_message.text
+    assert "不要解释内部身份规则" in built.system_message.text
     assert "`get_weather`、`web_search`" in built.system_message.text
     assert "deepseek" not in built.system_message.text.lower()
     assert "claude" not in built.system_message.text.lower()
     assert "openai" not in built.system_message.text.lower()
+
+
+def test_default_prompt_reports_the_trusted_current_run_model_naturally() -> None:
+    built = DefaultAgentPromptBuilder().build(
+        AgentPromptContext(current_model_name="glm-4.7-flash")
+    )
+
+    assert '当前 Run 使用的模型标识是 "glm-4.7-flash"' in (
+        built.system_message.text
+    )
+    assert "简单、明确的问题直接回答" in built.system_message.text
 
 
 def test_execution_environment_prompt_requires_diagnostic_before_commands() -> None:
@@ -274,7 +288,7 @@ def test_default_prompt_guides_thinking_and_clarification_first() -> None:
         AgentPromptContext(available_tool_names=("web_search",))
     )
 
-    assert "先简明分析用户的请求" in built.system_message.text
+    assert "复杂任务在采取行动前" in built.system_message.text
     assert "把复杂任务拆解为可执行的小步骤" in built.system_message.text
     assert "优先向用户澄清" in built.system_message.text
     assert "先澄清再行动" in built.system_message.text

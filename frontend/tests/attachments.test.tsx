@@ -4,6 +4,29 @@ import { describe, expect, it, vi } from "vitest";
 import { Composer } from "@/features/chat/ui/Composer";
 
 describe("文本附件输入", () => {
+  it("在输入区展示并切换可用模型", () => {
+    const onModelChange = vi.fn();
+    render(
+      <Composer
+        isActive={false}
+        modelOptions={[
+          { name: "default", displayName: "默认模型", available: true },
+          { name: "glm", displayName: "GLM Flash", available: true },
+        ]}
+        selectedModel="default"
+        onModelChange={onModelChange}
+        onSubmit={() => Promise.resolve(true)}
+        onCancel={() => Promise.resolve(true)}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("当前模型"), {
+      target: { value: "glm" },
+    });
+
+    expect(onModelChange).toHaveBeenCalledWith("glm");
+  });
+
   it("外部文件引用追加到现有草稿并把焦点移回输入框", () => {
     const onDraftInsertionApplied = vi.fn();
     const { rerender } = render(

@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from mini_deer_agent.llms import (
     ModelConfigurationService,
+    ModelProfileConflictError,
     ModelProfileError,
     ModelSelectionConflictError,
 )
@@ -14,6 +15,8 @@ from mini_deer_agent.server.dependencies import get_model_configuration_service
 from mini_deer_agent.server.schemas.models import (
     ModelListResponse,
     ModelProbeResponse,
+    ModelProfileCreateRequest,
+    ModelProfileCreateResponse,
     ModelProfileResponse,
     ModelSelectionResponse,
     ModelSelectionUpdateRequest,
@@ -38,9 +41,47 @@ def list_models(
         ModelConfigurationService, Depends(get_model_configuration_service)
     ],
 ) -> ModelListResponse:
+    profiles, revision = service.profiles_snapshot()
     return ModelListResponse(
-        models=[ModelProfileResponse(**asdict(item)) for item in service.list_profiles()],
-        profile_revision=service.catalog.revision,
+        models=[ModelProfileResponse(**asdict(item)) for item in profiles],
+        profile_revision=revision,
+    )
+
+
+@models_router.post("", response_model=ModelProfileCreateResponse, status_code=201)
+def create_model_profile(
+    request: ModelProfileCreateRequest,
+    service: Annotated[
+        ModelConfigurationService, Depends(get_model_configuration_service)
+    ],
+) -> ModelProfileCreateResponse:
+    """新增可信模型 Profile；可选密钥只写入本机凭据存储。"""
+    try:
+        profile, revision = service.add_profile(
+            name=request.name,
+            display_name=request.display_name,
+            provider=request.provider,
+            model=request.model,
+            base_url=request.base_url,
+            api_key_env=request.api_key_env,
+            api_key=request.api_key,
+            supports_tools=request.supports_tools,
+            supports_reasoning=request.supports_reasoning,
+            expected_revision=request.profile_revision,
+        )
+    except ModelProfileConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "model_profile_conflict", "message": str(exc)},
+        ) from exc
+    except ModelProfileError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "invalid_model_profile", "message": str(exc)},
+        ) from exc
+    return ModelProfileCreateResponse(
+        model=ModelProfileResponse(**asdict(profile)),
+        profile_revision=revision,
     )
 
 

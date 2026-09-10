@@ -25,6 +25,21 @@ def _default_user_skills_directory() -> Path:
     return Path.home() / ".local" / "share" / "mini-deer-agent" / "skills"
 
 
+def _default_model_credentials_path() -> Path:
+    """把模型密钥保存到本机应用数据目录，避免进入项目和 models.yaml。"""
+    if local_app_data := os.environ.get("LOCALAPPDATA"):
+        return Path(local_app_data) / "MiniDeerAgent" / "model-credentials.json"
+    if xdg_data_home := os.environ.get("XDG_DATA_HOME"):
+        return Path(xdg_data_home) / "mini-deer-agent" / "model-credentials.json"
+    return (
+        Path.home()
+        / ".local"
+        / "share"
+        / "mini-deer-agent"
+        / "model-credentials.json"
+    )
+
+
 class Settings(BaseSettings):
     """定义创建聊天模型所需的配置，并统一处理环境变量前缀。"""
 
@@ -61,6 +76,10 @@ class Settings(BaseSettings):
     user_skills_directory: Path = Field(default_factory=_default_user_skills_directory)
     # 可信多模型清单只保存非敏感配置；API Key 由各 Profile 声明的环境变量提供。
     models_config_path: Path = Path("models.yaml")
+    # 设置页新增模型时，API Key 单独保存且永不通过读取 API 返回。
+    model_credentials_path: Path = Field(
+        default_factory=_default_model_credentials_path
+    )
     # 可指定更小的非工具模型做 Goal 完成判断；省略时复用主模型配置。
     goal_evaluator_model_name: str | None = None
     goal_evaluation_timeout_seconds: float = Field(default=60.0, gt=0)

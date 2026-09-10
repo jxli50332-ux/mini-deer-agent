@@ -12,6 +12,7 @@ from mini_deer_agent.core import Settings
 from mini_deer_agent.llms import (
     ModelConfigurationService,
     ModelProfileCatalog,
+    ModelProfileConflictError,
     ModelProfileError,
     ModelSelectionConflictError,
 )
@@ -24,6 +25,7 @@ def _settings(tmp_path: Path, config: Path) -> Settings:
         model_name=None,
         api_key=None,
         models_config_path=config,
+        model_credentials_path=tmp_path / "model-credentials.json",
         application_database_path=tmp_path / "application.sqlite",
     )
 
@@ -175,3 +177,132 @@ def test_model_http_list_selection_update_and_conflict(
             },
         )
         assert stale.status_code == 409
+
+
+def test_add_profile_persists_config_and_write_only_credential(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("TEST_LOCAL_KEY", "local-secret")
+    settings = _settings(tmp_path, _config(tmp_path))
+    service = ModelConfigurationService(
+        settings,
+        model_factory=lambda _: FakeListChatModel(responses=["OK"]),
+    )
+    before = service.profile_revision
+
+    added, revision = service.add_profile(
+        name="team-model",
+        display_name="Team Model",
+        provider="openai-compatible",
+        model="team-v1",
+        base_url="https://models.example.test/v1",
+        api_key_env=None,
+        api_key=SecretStr("write-only-secret"),
+        supports_tools=True,
+        supports_reasoning=False,
+        expected_revision=before,
+    )
+
+    assert added.name == "team-model"
+    assert added.api_key_env == "MINI_DEER_MODEL_TEAM_MODEL_API_KEY"
+    assert added.api_key_configured is True
+    assert revision != before
+    assert "team-model" in settings.models_config_path.read_text(encoding="utf-8")
+    assert "write-only-secret" not in settings.models_config_path.read_text(
+        encoding="utf-8"
+    )
+    assert "write-only-secret" in settings.model_credentials_path.read_text(
+        encoding="utf-8"
+    )
+    reloaded = ModelConfigurationService(
+        settings,
+        model_factory=lambda _: FakeListChatModel(responses=["OK"]),
+    )
+    assert reloaded.create_model("team-model") is not None
+    with pytest.raises(ModelSelectionConflictError):
+        service.update_selection("team-model", None, expected_revision=-1)
+    with pytest.raises(ModelProfileConflictError, match="revision conflict"):
+        service.add_profile(
+            name="stale-model",
+            display_name="Stale",
+            provider="openai",
+            model="stale",
+            base_url=None,
+            api_key_env="STALE_KEY",
+            api_key=None,
+            supports_tools=True,
+            supports_reasoning=False,
+            expected_revision=before,
+        )
+
+
+def test_model_http_can_add_profile_without_returning_secret(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("TEST_LOCAL_KEY", "local-secret")
+    service = ModelConfigurationService(_settings(tmp_path, _config(tmp_path)))
+    app = FastAPI()
+    app.state.model_configuration_service = service
+    app.include_router(models.models_router)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/models",
+            json={
+                "name": "added-model",
+                "display_name": "Added Model",
+                "provider": "openai",
+                "model": "gpt-added",
+                "api_key": "browser-secret",
+                "supports_tools": True,
+                "supports_reasoning": True,
+                "profile_revision": service.profile_revision,
+            },
+        )
+        stale = client.post(
+            "/api/v1/models",
+            json={
+                "name": "other-model",
+                "display_name": "Other Model",
+                "provider": "openai",
+                "model": "gpt-other",
+                "profile_revision": "0" * 64,
+            },
+        )
+
+    assert response.status_code == 201
+    assert response.json()["model"]["name"] == "added-model"
+    assert response.json()["model"]["api_key_configured"] is True
+    assert "browser-secret" not in response.text
+    assert stale.status_code == 409
+
+
+def test_first_added_profile_replaces_unconfigured_placeholder_without_restart(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path, tmp_path / "missing-models.yaml")
+    service = ModelConfigurationService(
+        settings,
+        model_factory=lambda _: FakeListChatModel(responses=["OK"]),
+    )
+    assert service.selection().primary_model == "environment-default"
+
+    service.add_profile(
+        name="first-model",
+        display_name="First Model",
+        provider="openai",
+        model="gpt-first",
+        base_url=None,
+        api_key_env=None,
+        api_key=SecretStr("first-secret"),
+        supports_tools=True,
+        supports_reasoning=True,
+        expected_revision=service.profile_revision,
+    )
+
+    assert service.selection().primary_model == "first-model"
+    assert service.create_primary_snapshot().profile_name == "first-model"

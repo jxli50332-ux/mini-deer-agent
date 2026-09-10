@@ -48,6 +48,13 @@ import type {
 import { useThreadGoal } from "@/features/goals/model/use-thread-goal";
 import { GoalPanel } from "@/features/goals/ui/GoalPanel";
 import { useResizablePreference } from "@/shared/model/use-resizable-preference";
+import {
+  loadModelSettings,
+  MODEL_SETTINGS_CHANGED_EVENT,
+  saveModelSelection,
+  type ModelProfile,
+  type ModelSelection,
+} from "@/features/models/api/models";
 
 const RAIL_SIZE_PREFERENCE = {
   storageKey: "mini-deer-agent.layout.rail-width.v1",
@@ -84,6 +91,8 @@ interface ChatPageProps {
   readonly goalSetter?: GoalSetter;
   readonly goalStopper?: GoalStopper;
   readonly goalClearer?: GoalClearer;
+  readonly modelSettingsLoader?: typeof loadModelSettings;
+  readonly modelSelectionSaver?: typeof saveModelSelection;
 }
 
 interface ComposerDraftInsertion {
@@ -112,6 +121,8 @@ export function ChatPage({
   goalSetter,
   goalStopper,
   goalClearer,
+  modelSettingsLoader = loadModelSettings,
+  modelSelectionSaver = saveModelSelection,
 }: ChatPageProps) {
   // Repository 在组件生命周期内保持稳定，避免 render 时反复读取浏览器存储。
   const [threadRepository] = useState(
@@ -136,9 +147,61 @@ export function ChatPage({
   const structureChangedRunIds = useRef(new Set<string>());
   const [composerDraftInsertion, setComposerDraftInsertion] =
     useState<ComposerDraftInsertion | null>(null);
+  const [modelProfiles, setModelProfiles] = useState<readonly ModelProfile[]>(
+    [],
+  );
+  const [modelSelection, setModelSelection] = useState<ModelSelection | null>(
+    null,
+  );
+  const [isModelLoading, setIsModelLoading] = useState(true);
+  const [isModelSwitching, setIsModelSwitching] = useState(false);
+  const [modelError, setModelError] = useState<string | null>(null);
   const railSize = useResizablePreference(RAIL_SIZE_PREFERENCE);
   const composerSize = useResizablePreference(COMPOSER_SIZE_PREFERENCE);
   const nextDraftInsertionId = useRef(0);
+  const loadComposerModels = useCallback(async () => {
+    setIsModelLoading(true);
+    try {
+      const result = await modelSettingsLoader();
+      setModelProfiles(result.profiles);
+      setModelSelection(result.selection);
+      setModelError(null);
+    } catch (reason) {
+      setModelError(
+        reason instanceof Error ? reason.message : "无法读取模型配置",
+      );
+    } finally {
+      setIsModelLoading(false);
+    }
+  }, [modelSettingsLoader]);
+  useEffect(() => {
+    queueMicrotask(() => void loadComposerModels());
+    const reload = () => void loadComposerModels();
+    globalThis.addEventListener(MODEL_SETTINGS_CHANGED_EVENT, reload);
+    return () =>
+      globalThis.removeEventListener(MODEL_SETTINGS_CHANGED_EVENT, reload);
+  }, [loadComposerModels]);
+  const switchComposerModel = useCallback(
+    async (name: string) => {
+      if (modelSelection === null || name === modelSelection.primaryModel)
+        return;
+      setIsModelSwitching(true);
+      setModelError(null);
+      try {
+        setModelSelection(
+          await modelSelectionSaver({ ...modelSelection, primaryModel: name }),
+        );
+      } catch (reason) {
+        const failure =
+          reason instanceof Error ? reason.message : "无法切换模型";
+        await loadComposerModels();
+        setModelError(failure);
+      } finally {
+        setIsModelSwitching(false);
+      }
+    },
+    [loadComposerModels, modelSelection, modelSelectionSaver],
+  );
   const {
     goal,
     isLoading: isGoalLoading,
@@ -658,6 +721,16 @@ export function ChatPage({
               : null
           }
           onDraftInsertionApplied={clearAppliedDraftInsertion}
+          modelOptions={modelProfiles.map((profile) => ({
+            name: profile.name,
+            displayName: profile.displayName,
+            available: profile.supportsTools && profile.apiKeyConfigured,
+          }))}
+          selectedModel={modelSelection?.primaryModel ?? null}
+          isModelLoading={isModelLoading}
+          isModelSwitching={isModelSwitching}
+          modelError={modelError}
+          onModelChange={switchComposerModel}
           {...(latestTodoSnapshot === null
             ? {}
             : {

@@ -229,6 +229,7 @@ def test_skill_management_http_draft_check_install_and_detail(tmp_path: Path) ->
         )
         assert installed.status_code == 200
         assert client.get("/api/v1/skills/concise-answer").json()["editable"] is True
+        assert client.get("/api/v1/skills/drafts").json()["drafts"] == []
         stale = client.patch(
             "/api/v1/skills/concise-answer",
             json={"enabled": False, "revision": 0},
@@ -286,7 +287,34 @@ def test_http_archive_import_requires_draft_confirmation(tmp_path: Path) -> None
             },
         )
         assert installed.status_code == 200
+        assert service.list_drafts() == ()
         assert service.list_history("archived-skill")[0].action == "import"
+
+
+def test_listing_drafts_cleans_installed_legacy_duplicate_but_keeps_changes(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    installed = service.create_draft(_payload())
+    service.install_draft(
+        installed.draft_id,
+        expected_revision=installed.revision,
+    )
+
+    legacy_duplicate = service.create_draft(_payload(), author="agent")
+    changed = service.create_draft(
+        SkillDraftPayload(
+            "concise-answer",
+            "尚未确认的新描述。",
+            "最多回答两句话。",
+        ),
+        author="agent",
+    )
+
+    assert service.list_drafts() == (changed,)
+    assert not (
+        service.manager.root / ".drafts" / legacy_duplicate.draft_id
+    ).exists()
 
 
 def test_agent_skill_manage_can_only_prepare_confirmation_bound_draft(
@@ -375,6 +403,7 @@ def test_automatic_install_authorization_is_new_name_thread_and_use_bound(
     )
     assert installed["status"] == "installed"
     assert installed["name"] == "agent-draft"
+    assert service.list_drafts() == ()
     assert service.get_detail("agent-draft").enabled is True
     assert "thread=thread-auto run=run-auto" in service.list_history(
         "agent-draft"
@@ -533,7 +562,9 @@ def test_automatic_install_authorization_binds_only_explicit_token_to_run(
         )
 
 
-def test_agent_skill_creation_setting_is_persisted_and_enforced(tmp_path: Path) -> None:
+def test_disabled_automatic_install_keeps_manual_confirmation_available(
+    tmp_path: Path,
+) -> None:
     service = _service(tmp_path)
     disabled = service.update_agent_settings(
         creation_enabled=False,
@@ -545,14 +576,24 @@ def test_agent_skill_creation_setting_is_persisted_and_enforced(tmp_path: Path) 
     )
     assert reloaded.agent_settings() == disabled
 
-    manage = create_skill_manage_tool(service)
-    with pytest.raises(SkillCatalogError, match="disabled"):
+    manage = create_skill_manage_tool(service, automatic_install_enabled=False)
+    created = __import__("json").loads(
         manage.invoke({
             "action": "create_draft",
             "name": "disabled-draft",
-            "description": "should not be created",
+            "description": "manual confirmation remains available",
             "instructions": "Do it.",
         })
+    )
+    requested = __import__("json").loads(
+        manage.invoke({
+            "action": "request_install",
+            "draft_id": created["draft_id"],
+        })
+    )
+    assert requested["status"] == "confirmation_required"
+    assert service.manager.list() == ()
+
     with pytest.raises(SkillCatalogError, match="disabled"):
         service.authorize_automatic_install(
             thread_id="thread-disabled",

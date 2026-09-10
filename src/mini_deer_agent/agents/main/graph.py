@@ -1746,8 +1746,13 @@ def build_agent_graph(
         *sandbox_tools,
         *discovery_tools,
         *(
-            (create_skill_manage_tool(skill_management_service),)
-            if active_skill_creation and skill_management_service is not None
+            (
+                create_skill_manage_tool(
+                    skill_management_service,
+                    automatic_install_enabled=active_skill_creation,
+                ),
+            )
+            if skill_management_service is not None
             else ()
         ),
         *((create_skill_market_search_tool(skill_marketplace_service),) if skill_marketplace_service is not None else ()),

@@ -15,7 +15,7 @@ from langchain_core.tools import BaseTool
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph.state import CompiledStateGraph
 
-from mini_deer_agent.agents import build_agent_graph
+from mini_deer_agent.agents import AgentPromptContext, build_agent_graph
 from mini_deer_agent.agents.middleware import RunBudgetPolicy, RunBudgetTracker
 from mini_deer_agent.application.memory import MemoryStore
 from mini_deer_agent.domain import TextAttachment
@@ -133,6 +133,15 @@ def build_default_agent_graph(
     # 默认路径在真正开始请求时才创建模型，健康检查不依赖模型密钥是否已经配置。
     return build_agent_graph(
         model=model_snapshot.model if model_snapshot is not None else None,
+        prompt_context=AgentPromptContext(
+            current_model_name=(
+                model_snapshot.profile.model
+                if model_snapshot is not None and model_snapshot.profile is not None
+                else model_snapshot.profile_name
+                if model_snapshot is not None
+                else None
+            )
+        ),
         checkpointer=checkpointer,
         memory_store=memory_store,
         mcp_tools=mcp_tools,

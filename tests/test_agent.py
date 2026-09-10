@@ -38,6 +38,8 @@ from mini_deer_agent.skills import (
     BuiltInSkill,
     BuiltInSkillCatalog,
     SkillCatalogError,
+    SkillManagementService,
+    UserSkillManager,
 )
 from mini_deer_agent.streaming import astream_agent_messages
 from mini_deer_agent.streaming.projector import aproject_run_events
@@ -275,6 +277,27 @@ def test_compiled_graph_automatically_activates_skill_before_final_answer() -> N
         "message": "技能已为当前 Run 激活。",
     }
     assert "### 一句话结论" not in tool_result.text
+
+
+def test_manual_skill_draft_tool_is_bound_when_automatic_install_is_disabled(
+    tmp_path: Path,
+) -> None:
+    """关闭自动安装后，Agent 仍应能创建等待用户确认的 Skill 草稿。"""
+    builtin_root = tmp_path / "builtin"
+    builtin_root.mkdir()
+    service = SkillManagementService(
+        UserSkillManager(tmp_path / "managed", builtin_root=builtin_root)
+    )
+    service.update_agent_settings(creation_enabled=False, expected_revision=0)
+    model = ToolAwareFakeModel(responses=[AIMessage(content="草稿已提交确认。")])
+
+    build_agent_graph(
+        model,
+        skill_management_service=service,
+        skill_creation_enabled=False,
+    ).invoke({"messages": [HumanMessage(content="帮我写一个会议纪要 Skill。")]})
+
+    assert "skill_manage" in model.bound_tool_names
 
 
 def test_passive_run_cannot_execute_specialized_weather_tool(

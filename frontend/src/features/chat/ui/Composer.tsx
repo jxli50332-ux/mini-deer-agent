@@ -32,6 +32,16 @@ interface ComposerProps {
     readonly text: string;
   } | null;
   readonly onDraftInsertionApplied?: (id: number) => void;
+  readonly modelOptions?: readonly {
+    readonly name: string;
+    readonly displayName: string;
+    readonly available: boolean;
+  }[];
+  readonly selectedModel?: string | null;
+  readonly isModelLoading?: boolean;
+  readonly isModelSwitching?: boolean;
+  readonly modelError?: string | null;
+  readonly onModelChange?: (name: string) => void | Promise<void>;
   readonly onSubmit: (
     message: string,
     attachments: readonly PreparedTextAttachment[],
@@ -52,6 +62,12 @@ export function Composer({
   todoSourceStepId,
   draftInsertion = null,
   onDraftInsertionApplied = () => undefined,
+  modelOptions = [],
+  selectedModel = null,
+  isModelLoading = false,
+  isModelSwitching = false,
+  modelError = null,
+  onModelChange = () => undefined,
   onSubmit,
   onCancel,
 }: ComposerProps) {
@@ -69,6 +85,7 @@ export function Composer({
   const canSubmit =
     !disabled &&
     !isActive &&
+    !isModelSwitching &&
     !isPreparingAttachments &&
     normalizedDraft.length > 0;
 
@@ -185,26 +202,62 @@ export function Composer({
         onSubmit={handleSubmit}
       >
         <label htmlFor="chat-message">向 Agent 提问</label>
-        <div className="composer__attachments">
-          <input
-            id="chat-attachments"
-            className="visually-hidden"
-            type="file"
-            multiple
-            accept=".txt,.md,.json,.csv,.py,.js,.jsx,.ts,.tsx,.html,.htm,.css,.scss,.yaml,.yml,.xml,.toml,.sh,.sql,.go,.java,.c,.h,.cpp,.hpp,.rs"
-            aria-label="添加文本附件"
-            disabled={disabled || isActive || isPreparingAttachments}
-            onChange={(event) => void handleAttachmentSelection(event)}
-          />
-          <label
-            className="composer__attachment-button"
-            htmlFor="chat-attachments"
-            aria-disabled={disabled || isActive || isPreparingAttachments}
-          >
-            {isPreparingAttachments ? "正在读取…" : "+ 文本附件"}
+        <div className="composer__toolbar">
+          <label className="composer__model-picker">
+            <span>模型</span>
+            <select
+              aria-label="当前模型"
+              value={selectedModel ?? ""}
+              disabled={
+                disabled ||
+                isActive ||
+                isModelLoading ||
+                isModelSwitching ||
+                modelOptions.length === 0
+              }
+              onChange={(event) => void onModelChange(event.target.value)}
+            >
+              {selectedModel === null && (
+                <option value="">
+                  {isModelLoading ? "读取中…" : "模型不可用"}
+                </option>
+              )}
+              {modelOptions.map((item) => (
+                <option
+                  key={item.name}
+                  value={item.name}
+                  disabled={!item.available}
+                >
+                  {item.displayName}
+                  {item.available ? "" : "（不可用）"}
+                </option>
+              ))}
+            </select>
           </label>
-          <span>支持代码、配置等文本文件；最多 3 个</span>
+          <div className="composer__attachments">
+            <input
+              id="chat-attachments"
+              className="visually-hidden"
+              type="file"
+              multiple
+              accept=".txt,.md,.json,.csv,.py,.js,.jsx,.ts,.tsx,.html,.htm,.css,.scss,.yaml,.yml,.xml,.toml,.sh,.sql,.go,.java,.c,.h,.cpp,.hpp,.rs"
+              aria-label="添加文本附件"
+              disabled={disabled || isActive || isPreparingAttachments}
+              onChange={(event) => void handleAttachmentSelection(event)}
+            />
+            <label
+              className="composer__attachment-button"
+              htmlFor="chat-attachments"
+              aria-disabled={disabled || isActive || isPreparingAttachments}
+            >
+              {isPreparingAttachments ? "正在读取…" : "+ 文本附件"}
+            </label>
+            <span>支持代码、配置等文本文件；最多 3 个</span>
+          </div>
         </div>
+        {modelError !== null && (
+          <p className="composer__model-error">{modelError}</p>
+        )}
         {attachments.length > 0 && (
           <ul className="composer__attachment-list" aria-label="待发送附件">
             {attachments.map((attachment, index) => (

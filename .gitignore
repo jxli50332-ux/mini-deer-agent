@@ -6,6 +6,7 @@ __pycache__/
 *.egg-info/
 .env
 models.yaml
+model-credentials.json
 data/
 *.sqlite
 *.sqlite-shm

@@ -82,6 +82,31 @@ function errorText(reason: unknown, fallback: string): string {
   return reason instanceof Error ? reason.message : fallback;
 }
 
+function installedSummary(detail: SkillDetail): SkillSummary {
+  return {
+    name: detail.name,
+    description: detail.description,
+    source: detail.source,
+    enabled: detail.enabled,
+    editable: detail.editable,
+    allowedTools: detail.allowedTools,
+    resourcePaths: detail.resources.map((item) => item.path),
+    resourceCount: detail.resources.length,
+    modifiedAt: new Date().toISOString(),
+    checkStatus: "valid",
+  };
+}
+
+function upsertSkill(
+  skills: readonly SkillSummary[],
+  detail: SkillDetail,
+): readonly SkillSummary[] {
+  return [
+    ...skills.filter((item) => item.name !== detail.name),
+    installedSummary(detail),
+  ].sort((left, right) => left.name.localeCompare(right.name));
+}
+
 export function SettingsDialog({
   open,
   onClose,
@@ -119,30 +144,47 @@ export function SettingsDialog({
   );
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
+  const loadSequenceRef = useRef(0);
 
-  const load = useCallback((controller = new AbortController()) => {
-    setLoading(true);
-    setError(null);
-    void Promise.all([listSkills(controller.signal), listRecoverableSkills()])
-      .then(([result, deleted]) => {
-        setSkills(result.skills);
+  const load = useCallback(
+    async (signal?: AbortSignal, justInstalled?: SkillDetail) => {
+      const sequence = loadSequenceRef.current + 1;
+      loadSequenceRef.current = sequence;
+      setLoading(true);
+      setError(null);
+      try {
+        const [result, deleted] = await Promise.all([
+          listSkills(signal),
+          listRecoverableSkills(),
+        ]);
+        if (signal?.aborted || loadSequenceRef.current !== sequence) return;
+        setSkills(
+          justInstalled === undefined
+            ? result.skills
+            : upsertSkill(result.skills, justInstalled),
+        );
         setRevision(result.revision);
         setRecoverable(deleted);
-      })
-      .catch((reason: unknown) => {
+      } catch (reason) {
         if (reason instanceof DOMException && reason.name === "AbortError")
           return;
-        setError(errorText(reason, "无法读取 Skill 清单"));
-      })
-      .finally(() => setLoading(false));
-    return controller;
-  }, []);
+        if (loadSequenceRef.current === sequence) {
+          setError(errorText(reason, "无法读取 Skill 清单"));
+        }
+      } finally {
+        if (!signal?.aborted && loadSequenceRef.current === sequence) {
+          setLoading(false);
+        }
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
     if (!open) return;
     const controller = new AbortController();
     queueMicrotask(() => {
-      if (!controller.signal.aborted) load(controller);
+      if (!controller.signal.aborted) void load(controller.signal);
     });
     closeButtonRef.current?.focus();
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -286,12 +328,18 @@ export function SettingsDialog({
     setBusyName(draft.name);
     setError(null);
     try {
-      await installSkillDraft(draft, revision);
+      const installed = await installSkillDraft(draft, revision);
+      setSkills((current) => upsertSkill(current, installed));
+      setDrafts((current) =>
+        current.filter((item) => item.draftId !== draft.draftId),
+      );
+      setRevision(installed.revision);
       setNotice(`已保存 Skill“${draft.name}”，将在下一次 Run 生效。`);
+      setSkillArea("installed");
       setView("list");
       setDraft(null);
       setCheck(null);
-      load();
+      await load(undefined, installed);
     } catch (reason) {
       setError(errorText(reason, "无法保存 Skill"));
     } finally {
@@ -307,10 +355,11 @@ export function SettingsDialog({
       setNotice(
         `${skill.name} 已${skill.enabled ? "停用" : "启用"}，下一次 Run 生效。`,
       );
-      load();
+      await load();
     } catch (reason) {
-      setError(errorText(reason, "无法更新 Skill 状态"));
-      load();
+      const failure = errorText(reason, "无法更新 Skill 状态");
+      await load();
+      setError(failure);
     } finally {
       setBusyName(null);
     }
@@ -330,7 +379,7 @@ export function SettingsDialog({
       setNotice(`已删除 Skill“${selectedName}”。`);
       setView("list");
       setSelectedName(null);
-      load();
+      await load();
     } catch (reason) {
       setError(errorText(reason, "无法删除 Skill"));
     } finally {
@@ -346,7 +395,7 @@ export function SettingsDialog({
       await rollbackSkill(selectedName, item.historyId, revision);
       setNotice(`已恢复 ${selectedName} 的所选版本，下一次 Run 生效。`);
       await openDetail(selectedName);
-      load();
+      await load();
     } catch (reason) {
       setError(errorText(reason, "无法回滚 Skill"));
     } finally {
@@ -360,10 +409,11 @@ export function SettingsDialog({
     try {
       await rollbackSkill(item.name, item.historyId, revision);
       setNotice(`已恢复 ${item.name}，将在下一次 Run 生效。`);
-      load();
+      await load();
     } catch (reason) {
-      setError(errorText(reason, "无法恢复已删除 Skill"));
-      load();
+      const failure = errorText(reason, "无法恢复已删除 Skill");
+      await load();
+      setError(failure);
     } finally {
       setBusyName(null);
     }
@@ -481,7 +531,11 @@ export function SettingsDialog({
                     type="button"
                     role="tab"
                     aria-selected={skillArea === "installed"}
-                    onClick={() => setSkillArea("installed")}
+                    onClick={() => {
+                      setSkillArea("installed");
+                      setView("list");
+                      void load();
+                    }}
                   >
                     已安装
                   </button>
@@ -519,7 +573,7 @@ export function SettingsDialog({
                           checked={agentSettings.creationEnabled}
                           onChange={() => void toggleAgentCreation()}
                         />
-                        允许 Agent 创建 Skill 草稿
+                        允许 Agent 自动安装全新 Skill
                       </label>
                     )}
                     <form
@@ -572,7 +626,12 @@ export function SettingsDialog({
                         >
                           <option value="balanced">平衡模式</option>
                           <option value="guided">逐步引导</option>
-                          <option value="automatic">自动完成草稿</option>
+                          <option
+                            value="automatic"
+                            disabled={agentSettings?.creationEnabled === false}
+                          >
+                            自动完成并安装
+                          </option>
                         </select>
                       </label>
                       {creationMode === "automatic" && (
@@ -606,7 +665,8 @@ export function SettingsDialog({
                         type="submit"
                         disabled={
                           loading ||
-                          agentSettings?.creationEnabled === false ||
+                          (creationMode === "automatic" &&
+                            agentSettings?.creationEnabled === false) ||
                           onStartSkillCreation === undefined ||
                           !creationRequirement.trim() ||
                           (creationMode === "automatic" && !creationName.trim())

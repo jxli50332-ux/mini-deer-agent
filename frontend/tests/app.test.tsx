@@ -16,6 +16,7 @@ import {
 import type { ChatRunEvent } from "@/features/chat/model/events";
 import type { ChatStreamRunner } from "@/features/chat/model/use-chat-run";
 import { ChatPage } from "@/features/chat/ui/ChatPage";
+import type { ModelSelection } from "@/features/models/api/models";
 import type { ThreadGoal } from "@/features/goals/api/thread-goal";
 import type { ThreadHistoryPageLoader } from "@/features/threads/api/thread-history";
 import type {
@@ -145,6 +146,87 @@ describe("Mini Deer Agent 实时聊天页", () => {
     expect(
       screen.getByText("模型密钥不会进入浏览器", { exact: false }),
     ).toBeInTheDocument();
+  });
+
+  it("在输入区切换主模型并等保存完成后再允许发送", async () => {
+    let selectionSaved = false;
+    const modelSettingsLoader = vi.fn(() =>
+      Promise.resolve({
+        profiles: [
+          {
+            name: "environment-default",
+            displayName: "环境默认",
+            provider: "openai-compatible",
+            model: "default-model",
+            baseUrl: null,
+            apiKeyEnv: "DEFAULT_API_KEY",
+            apiKeyConfigured: true,
+            supportsTools: true,
+            supportsReasoning: false,
+            source: "environment" as const,
+          },
+          {
+            name: "glm-flash",
+            displayName: "GLM Flash",
+            provider: "openai-compatible",
+            model: "glm-4.7-flash",
+            baseUrl: "https://open.bigmodel.cn/api/paas/v4/",
+            apiKeyEnv: "GLM_API_KEY",
+            apiKeyConfigured: true,
+            supportsTools: true,
+            supportsReasoning: true,
+            source: "file" as const,
+          },
+        ],
+        selection: {
+          primaryModel: "environment-default",
+          goalModel: null,
+          revision: 0,
+        },
+        profileRevision: "a".repeat(64),
+      }),
+    );
+    const modelSelectionSaver = vi.fn((selection: ModelSelection) => {
+      selectionSaved = true;
+      return Promise.resolve({ ...selection, revision: 1 });
+    });
+    const runner = vi.fn<ChatStreamRunner>(async function* () {
+      await Promise.resolve();
+      expect(selectionSaved).toBe(true);
+      yield {
+        ...baseEvent(1),
+        event: "run_started",
+        messageId: null,
+        payload: { createdAt: "2026-09-10T06:00:00Z" },
+      } satisfies ChatRunEvent;
+      yield {
+        ...baseEvent(2),
+        event: "run_completed",
+        messageId: null,
+        payload: { finishReason: "stop" },
+      } satisfies ChatRunEvent;
+    });
+    render(
+      <ChatPage
+        streamRunner={runner}
+        currentThreadRepository={fixedThreadRepository()}
+        createMessageId={() => MESSAGE_ID}
+        modelSettingsLoader={modelSettingsLoader}
+        modelSelectionSaver={modelSelectionSaver}
+      />,
+    );
+
+    const picker = await screen.findByLabelText("当前模型");
+    expect(picker).toHaveValue("environment-default");
+    fireEvent.change(picker, { target: { value: "glm-flash" } });
+    await waitFor(() => expect(modelSelectionSaver).toHaveBeenCalledOnce());
+    expect(picker).toHaveValue("glm-flash");
+
+    fireEvent.change(screen.getByRole("textbox", { name: "向 Agent 提问" }), {
+      target: { value: "使用新模型回答" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(runner).toHaveBeenCalledOnce());
   });
 
   it("把输入、工具活动和模型增量连接到真实页面组件", async () => {

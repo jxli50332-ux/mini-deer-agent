@@ -1,8 +1,19 @@
 """模型 Profile、连接检查与默认选择的非敏感 HTTP 契约。"""
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, StringConstraints
+
+
+type ModelProfileName = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$",
+    ),
+]
 
 
 class ModelProfileResponse(BaseModel):
@@ -20,6 +31,42 @@ class ModelProfileResponse(BaseModel):
 
 class ModelListResponse(BaseModel):
     models: list[ModelProfileResponse]
+    profile_revision: str
+
+
+class ModelProfileCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: ModelProfileName
+    display_name: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)
+    ]
+    provider: Literal["openai", "openai-compatible"]
+    model: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)
+    ]
+    base_url: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2048)
+    ] | None = None
+    api_key_env: Annotated[
+        str,
+        StringConstraints(
+            strip_whitespace=True,
+            min_length=1,
+            max_length=128,
+            pattern=r"^[A-Za-z_][A-Za-z0-9_]*$",
+        ),
+    ] | None = None
+    api_key: SecretStr | None = Field(default=None, min_length=1, max_length=4096)
+    supports_tools: bool = True
+    supports_reasoning: bool = False
+    profile_revision: Annotated[
+        str, StringConstraints(pattern=r"^[a-f0-9]{64}$")
+    ]
+
+
+class ModelProfileCreateResponse(BaseModel):
+    model: ModelProfileResponse
     profile_revision: str
 
 

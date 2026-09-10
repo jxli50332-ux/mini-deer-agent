@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sqlite3
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
@@ -32,6 +33,10 @@ class ModelProfileError(RuntimeError):
 
 class ModelSelectionConflictError(ModelProfileError):
     """表示设置页面携带的选择 revision 已过期。"""
+
+
+class ModelProfileConflictError(ModelProfileError):
+    """表示设置页面携带的模型目录 revision 已过期。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,6 +263,75 @@ class ModelProfileCatalog:
         )
 
 
+class LocalModelCredentialStore:
+    """在项目目录之外保存只写不回显的模型 API Key。"""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path.expanduser().resolve()
+        self._lock = RLock()
+
+    def get(self, name: str) -> SecretStr | None:
+        with self._lock:
+            values = self._read()
+        value = values.get(name, "").strip()
+        return SecretStr(value) if value else None
+
+    def set(self, name: str, value: SecretStr) -> None:
+        secret = value.get_secret_value().strip()
+        if not secret:
+            raise ModelProfileError("API key must not be blank")
+        with self._lock:
+            values = self._read()
+            values[name] = secret
+            self._write(values)
+
+    def _read(self) -> dict[str, str]:
+        if not self._path.exists():
+            return {}
+        try:
+            document = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ModelProfileError("Cannot read local model credentials") from exc
+        if not isinstance(document, dict) or document.get("version") != 1:
+            raise ModelProfileError("Local model credentials use an invalid format")
+        keys = document.get("keys")
+        if not isinstance(keys, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in keys.items()
+        ):
+            raise ModelProfileError("Local model credentials use an invalid format")
+        return cast(dict[str, str], keys)
+
+    def _write(self, values: dict[str, str]) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self._path.parent,
+                prefix=f".{self._path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as stream:
+                temporary = Path(stream.name)
+                json.dump(
+                    {"version": 1, "keys": values},
+                    stream,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.chmod(0o600)
+            os.replace(temporary, self._path)
+        except OSError as exc:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+            raise ModelProfileError("Cannot save local model credentials") from exc
+
+
 class SqliteModelSelectionStore:
     """在 application.sqlite 中以 CAS revision 保存应用级模型选择。"""
 
@@ -332,6 +406,10 @@ class ModelConfigurationService:
 
     def __init__(self, settings: Settings, *, model_factory=create_chat_model) -> None:
         self.settings = settings
+        self._lock = RLock()
+        self._credentials = LocalModelCredentialStore(
+            settings.model_credentials_path
+        )
         self.catalog = ModelProfileCatalog.load(settings.models_config_path, settings)
         environment_ready = any(
             p.name == "environment-default" and environment_model(settings)
@@ -369,20 +447,169 @@ class ModelConfigurationService:
             )
 
     def list_profiles(self) -> tuple[ModelProfileView, ...]:
-        return tuple(
-            ModelProfileView(
-                name=p.name,
-                display_name=p.display_name,
-                provider=p.provider,
-                model=p.model,
-                base_url=p.base_url,
-                api_key_env=p.api_key_env,
-                api_key_configured=self._api_key(p) is not None,
-                supports_tools=p.supports_tools,
-                supports_reasoning=p.supports_reasoning,
-                source=p.source,
+        return self.profiles_snapshot()[0]
+
+    def profiles_snapshot(self) -> tuple[tuple[ModelProfileView, ...], str]:
+        """在同一个目录快照上生成列表和 revision。"""
+        with self._lock:
+            catalog = self.catalog
+            profiles = tuple(self._view(profile) for profile in catalog.profiles)
+            return profiles, catalog.revision
+
+    @property
+    def profile_revision(self) -> str:
+        return self.catalog.revision
+
+    def add_profile(
+        self,
+        *,
+        name: str,
+        display_name: str,
+        provider: str,
+        model: str,
+        base_url: str | None,
+        api_key_env: str | None,
+        api_key: SecretStr | None,
+        supports_tools: bool,
+        supports_reasoning: bool,
+        expected_revision: str,
+    ) -> tuple[ModelProfileView, str]:
+        """校验并原子追加文件 Profile，随后热更新当前进程目录。"""
+        normalized_name = name.strip()
+        resolved_api_key_env = (api_key_env or "").strip() or (
+            "MINI_DEER_MODEL_"
+            + re.sub(r"[^A-Za-z0-9]", "_", normalized_name).upper()
+            + "_API_KEY"
+        )
+        profile = ModelProfileCatalog._parse_profile(
+            {
+                "name": normalized_name,
+                "display_name": display_name,
+                "provider": provider,
+                "model": model,
+                "api_key_env": resolved_api_key_env,
+                "base_url": base_url,
+                "supports_tools": supports_tools,
+                "supports_reasoning": supports_reasoning,
+            }
+        )
+        with self._lock:
+            current = ModelProfileCatalog.load(
+                self.settings.models_config_path,
+                self.settings,
             )
-            for p in self.catalog.profiles
+            self.catalog = current
+            if current.revision != expected_revision:
+                raise ModelProfileConflictError(
+                    "Model profile revision conflict; refresh settings and retry"
+                )
+            if any(item.name == profile.name for item in current.profiles):
+                raise ModelProfileError(
+                    f"Model profile already exists: {profile.name}"
+                )
+            file_profiles = [
+                item for item in current.profiles if item.source == "file"
+            ]
+            environment_profiles = [
+                item
+                for item in current.profiles
+                if item.source == "environment" and item.model != "not-configured"
+            ]
+            candidate_profiles = (*environment_profiles, *file_profiles, profile)
+            if not any(item.supports_tools for item in candidate_profiles):
+                raise ModelProfileError(
+                    "At least one configured model profile must support tools"
+                )
+            if api_key is not None:
+                self._credentials.set(profile.api_key_env, api_key)
+            self._write_file_profiles((*file_profiles, profile))
+            updated = ModelProfileCatalog.load(
+                self.settings.models_config_path,
+                self.settings,
+            )
+            self.catalog = updated
+            self._repair_selection_after_catalog_change(updated)
+            return self._view(profile), updated.revision
+
+    def _view(self, profile: ModelProfile) -> ModelProfileView:
+        return ModelProfileView(
+            name=profile.name,
+            display_name=profile.display_name,
+            provider=profile.provider,
+            model=profile.model,
+            base_url=profile.base_url,
+            api_key_env=profile.api_key_env,
+            api_key_configured=self._api_key(profile) is not None,
+            supports_tools=profile.supports_tools,
+            supports_reasoning=profile.supports_reasoning,
+            source=profile.source,
+        )
+
+    def _write_file_profiles(self, profiles: tuple[ModelProfile, ...]) -> None:
+        path = self.settings.models_config_path.expanduser().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        document = {
+            "version": 1,
+            "models": [
+                {
+                    "name": profile.name,
+                    "display_name": profile.display_name,
+                    "provider": profile.provider,
+                    "model": profile.model,
+                    **(
+                        {"base_url": profile.base_url}
+                        if profile.base_url is not None
+                        else {}
+                    ),
+                    "api_key_env": profile.api_key_env,
+                    "supports_tools": profile.supports_tools,
+                    "supports_reasoning": profile.supports_reasoning,
+                }
+                for profile in profiles
+            ],
+        }
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as stream:
+                temporary = Path(stream.name)
+                yaml.safe_dump(
+                    document,
+                    stream,
+                    allow_unicode=True,
+                    sort_keys=False,
+                )
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        except OSError as exc:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+            raise ModelProfileError(f"Cannot save models config: {path}") from exc
+
+    def _repair_selection_after_catalog_change(
+        self,
+        catalog: ModelProfileCatalog,
+    ) -> None:
+        selection = self.store.get()
+        known = {profile.name: profile for profile in catalog.profiles}
+        primary = known.get(selection.primary_model)
+        goal_is_known = selection.goal_model is None or selection.goal_model in known
+        if primary is not None and primary.supports_tools and goal_is_known:
+            return
+        replacement = next(
+            profile.name for profile in catalog.profiles if profile.supports_tools
+        )
+        self.store.update(
+            replacement if primary is None or not primary.supports_tools else primary.name,
+            selection.goal_model if goal_is_known else None,
+            expected_revision=selection.revision,
         )
 
     def selection(self) -> ModelSelection:
@@ -420,7 +647,9 @@ class ModelConfigurationService:
             value = self.settings.api_key.get_secret_value().strip()
         else:
             value = os.environ.get(profile.api_key_env, "").strip()
-        return SecretStr(value) if value else None
+        if value:
+            return SecretStr(value)
+        return self._credentials.get(profile.api_key_env)
 
     def create_model(self, profile_name: str) -> BaseChatModel:
         profile = self.catalog.get(profile_name)
@@ -447,14 +676,15 @@ class ModelConfigurationService:
 
     def create_primary_snapshot(self) -> ModelSnapshot:
         value = self.selection()
-        profile = self.catalog.get(value.primary_model)
+        catalog = self.catalog
+        profile = catalog.get(value.primary_model)
         if not profile.supports_tools:
             raise ModelProfileError(
                 f"Primary model profile does not support tools: {value.primary_model}"
             )
         return ModelSnapshot(
             value.primary_model,
-            self.catalog.revision,
+            catalog.revision,
             value.revision,
             self.create_model(value.primary_model),
             profile,
@@ -488,10 +718,11 @@ class ModelConfigurationService:
         """解析本次独立 Goal 评估实际使用的 Profile。"""
         value = self.selection()
         profile_name = value.goal_model or value.primary_model
-        profile = self.catalog.get(profile_name)
+        catalog = self.catalog
+        profile = catalog.get(profile_name)
         return ModelSnapshot(
             profile_name,
-            self.catalog.revision,
+            catalog.revision,
             value.revision,
             self._create_model_from_profile(profile),
             profile,
@@ -529,8 +760,8 @@ def environment_model(settings: Settings) -> bool:
 
 
 __all__ = [
-    "ModelConfigurationService", "ModelProbeResult", "ModelProfile",
+    "LocalModelCredentialStore", "ModelConfigurationService", "ModelProbeResult", "ModelProfile",
     "ModelProfileCatalog", "ModelProfileError", "ModelProfileView",
-    "ModelSelection", "ModelSelectionConflictError", "ModelSnapshot",
+    "ModelProfileConflictError", "ModelSelection", "ModelSelectionConflictError", "ModelSnapshot",
     "SqliteModelSelectionStore",
 ]

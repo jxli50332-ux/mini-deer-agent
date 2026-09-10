@@ -9,7 +9,17 @@ from langchain_core.tools import BaseTool, tool
 from mini_deer_agent.skills.management import SkillDraftPayload, SkillManagementService
 
 
-def create_skill_manage_tool(service: SkillManagementService) -> BaseTool:
+def create_skill_manage_tool(
+    service: SkillManagementService,
+    *,
+    automatic_install_enabled: bool | None = None,
+) -> BaseTool:
+    automatic_install_allowed = (
+        service.agent_settings().creation_enabled
+        if automatic_install_enabled is None
+        else automatic_install_enabled
+    )
+
     def resource_pairs(
         resources: list[dict[str, str]] | None,
     ) -> tuple[tuple[str, str], ...]:
@@ -68,8 +78,7 @@ def create_skill_manage_tool(service: SkillManagementService) -> BaseTool:
         resources: list[dict[str, str]] | None = None,
         authorization_token: str | None = None,
     ) -> str:
-        """创建、更新或检查用户 Skill 草稿；仅一次性自动授权可直接安装新 Skill。"""
-        service.require_agent_creation_enabled()
+        """仅在用户要求创作 Skill 时创建、更新和校验草稿；无一次性授权则只能请求人工确认安装。"""
         if action == "create_draft":
             if not name or not description or not instructions:
                 raise ValueError("create_draft requires name, description and instructions")
@@ -79,6 +88,8 @@ def create_skill_manage_tool(service: SkillManagementService) -> BaseTool:
                 name=name,
             )
             if automatic_token is not None:
+                if not automatic_install_allowed:
+                    raise ValueError("Automatic Skill installation is disabled")
                 thread_id, run_id = run_context(config)
                 service.bind_automatic_authorization(
                     automatic_token,
@@ -134,6 +145,8 @@ def create_skill_manage_tool(service: SkillManagementService) -> BaseTool:
             name=record.payload.name,
             draft_id=draft_id,
         )
+        if automatic_token is not None and not automatic_install_allowed:
+            raise ValueError("Automatic Skill installation is disabled")
         if action == "validate_draft":
             if automatic_token is not None and result.valid and result.content_hash:
                 thread_id, run_id = run_context(config)

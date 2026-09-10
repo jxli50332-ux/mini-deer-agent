@@ -14,6 +14,7 @@ class AgentPromptContext:
     """保存构建系统提示所需的可信产品上下文。"""
 
     agent_name: str = "Mini Deer Agent"
+    current_model_name: str | None = None
     available_tool_names: tuple[str, ...] = ()
     available_skills: tuple[SkillSummary, ...] = ()
     deferred_tools: tuple[DeferredToolSummary, ...] = ()
