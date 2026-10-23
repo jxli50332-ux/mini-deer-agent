@@ -8,9 +8,10 @@ from uuid import UUID
 from mini_deer_agent.domain import (
     MAX_TEXT_ATTACHMENT_COUNT,
     MAX_TEXT_ATTACHMENT_FILENAME_LENGTH,
-    TextAttachment,
-    validate_text_attachment_batch,
+    Attachment,
+    validate_attachment_batch,
 )
+from mini_deer_agent.domain.image_attachments import MAX_IMAGE_DATA_URL_LENGTH
 
 
 # 请求正文设置明确上限，防止在进入模型前接收无界字符串。
@@ -48,12 +49,12 @@ type AttachmentFilename = Annotated[
 
 
 class TextAttachmentRequest(BaseModel):
-    """接收浏览器已经读取的 UTF-8 文本文件，不信任客户端媒体类型与大小。"""
+    """兼容既有附件字段，正文接收文本或图片 data URL；类型与体积由领域层复核。"""
 
     model_config = ConfigDict(extra="forbid")
 
     filename: AttachmentFilename
-    content: str = Field(min_length=1, max_length=32_768)
+    content: str = Field(min_length=1, max_length=MAX_IMAGE_DATA_URL_LENGTH)
 
 
 class HumanInputTextResponseRequest(BaseModel):
@@ -116,9 +117,9 @@ class RunStreamRequest(BaseModel):
     ] | None = None
     skill_install_authorization_token: SkillInstallAuthorizationToken | None = None
 
-    def to_domain_attachments(self) -> tuple[TextAttachment, ...]:
-        """由服务端重新推导附件类型和 UTF-8 字节数。"""
-        return validate_text_attachment_batch(
+    def to_domain_attachments(self) -> tuple[Attachment, ...]:
+        """由服务端复核实际图片格式或文本类型，并计算原始字节数。"""
+        return validate_attachment_batch(
             [(item.filename, item.content) for item in self.attachments]
         )
 

@@ -99,11 +99,17 @@ class SummaryContextProjection:
 
 def _default_token_counter(messages: Sequence[BaseMessage]) -> int:
     """使用偏保守的多语言字符比近似计算上下文 token。"""
-    return count_tokens_approximately(
+    text_tokens = count_tokens_approximately(
         messages,
         chars_per_token=_APPROXIMATE_CHARS_PER_TOKEN,
         use_usage_metadata_scaling=True,
     )
+    # checkpoint 的视觉附件存于元数据，文本计数器看不到；按图预留预算触发既有压缩。
+    image_count = sum(
+        len(images) for message in messages
+        if isinstance(images := message.additional_kwargs.get("image_attachments"), list)
+    )
+    return text_tokens + image_count * 1536
 
 
 def _bound_text(text: str, cap: int) -> str:
@@ -126,6 +132,13 @@ def _message_record(message: BaseMessage) -> dict[str, Any]:
         "role": message.type,
         "content": message.content,
     }
+    # 摘要仅记录图片来源；不把原始 Base64 作为文本发送给摘要模型，也不虚构图像内容。
+    image_attachments = message.additional_kwargs.get("image_attachments")
+    if isinstance(image_attachments, list):
+        record["image_attachments"] = [
+            {key: image[key] for key in ("filename", "media_type", "size_bytes") if key in image}
+            for image in image_attachments if isinstance(image, dict)
+        ]
     if message.name:
         record["name"] = message.name
     if isinstance(message, AIMessage) and message.tool_calls:

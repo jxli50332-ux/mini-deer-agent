@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ProjectFileTree, type DirectoryLoader } from "./ProjectFileTree";
 import type { FilePage } from "@/entities/project/model/file";
+import { useOfficeDocuments } from "@/features/office/model/context";
 
 export type FileLoader = (
   projectId: string,
@@ -36,6 +37,7 @@ export function ProjectFiles({
   readonly onReferenceFile?: (path: string) => void;
 }) {
   const [path, setPath] = useState<string | null>(null);
+  const office = useOfficeDocuments();
   return (
     <>
       <ProjectFileTree
@@ -44,7 +46,10 @@ export function ProjectFiles({
         name={rootName}
         initiallyOpen={initiallyOpen}
         refreshRevision={refreshRevision}
-        onOpenFile={setPath}
+        onOpenFile={(selectedPath) => {
+          if (office !== null) office.openTextFile(selectedPath, projectId);
+          else setPath(selectedPath);
+        }}
       />
       {path !== null && (
         <FilePreview

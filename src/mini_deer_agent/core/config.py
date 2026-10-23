@@ -64,10 +64,10 @@ class Settings(BaseSettings):
     workspace_allowed_roots: tuple[Path, ...] = ()
     # 摘要只压缩 Agent checkpoint；产品历史仍由 application SQLite 完整保存。
     context_summary_enabled: bool = True
-    context_summary_trigger_tokens: int = Field(default=50000, ge=1)
-    context_summary_trigger_messages: int = Field(default=40, ge=2)
+    context_summary_trigger_tokens: int = Field(default=150000, ge=1)
+    context_summary_trigger_messages: int = Field(default=100, ge=2)
     context_summary_keep_messages: int = Field(default=10, ge=1)
-    context_summary_input_tokens: int = Field(default=25000, ge=1)
+    context_summary_input_tokens: int = Field(default=75000, ge=1)
     # MCP 配置属于可信的本地运维输入；文件不存在表示当前未启用 MCP。
     mcp_config_path: Path = Path("mcp_servers.json")
     # 每个服务器独立受限，避免一个挂起的外部进程阻止应用启动。

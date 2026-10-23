@@ -11,7 +11,7 @@ from uuid import uuid4
 from mini_deer_agent.application.conversations import ConversationRepository
 from mini_deer_agent.application.run_stream import RunContextSnapshot, RunStreamService
 from mini_deer_agent.application.goals import GoalEvaluationService
-from mini_deer_agent.domain import TextAttachment
+from mini_deer_agent.domain import Attachment
 from mini_deer_agent.domain import require_benchmark_case
 from mini_deer_agent.streaming.events import RunEvent
 
@@ -105,7 +105,7 @@ class RunExecutionManager:
         message: str,
         thread_id: str,
         user_message_id: str,
-        attachments: tuple[TextAttachment, ...] = (),
+        attachments: tuple[Attachment, ...] = (),
         human_input_response: dict[str, object] | None = None,
         benchmark_case_id: str | None = None,
         internal_continuation: bool = False,
@@ -282,7 +282,7 @@ class RunExecutionManager:
         self,
         active: _ActiveRun,
         message: str,
-        attachments: tuple[TextAttachment, ...],
+        attachments: tuple[Attachment, ...],
         human_input_response: dict[str, object] | None,
         initial_internal_continuation: bool = False,
     ) -> None:

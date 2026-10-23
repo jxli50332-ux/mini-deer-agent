@@ -1,6 +1,8 @@
 """公开 Mini Deer Agent 的核心业务领域模型。"""
 
 from mini_deer_agent.domain.attachments import (
+    Attachment,
+    AttachmentMediaType,
     MAX_TEXT_ATTACHMENT_BYTES,
     MAX_TEXT_ATTACHMENT_COUNT,
     MAX_TEXT_ATTACHMENT_FILENAME_LENGTH,
@@ -8,6 +10,7 @@ from mini_deer_agent.domain.attachments import (
     TextAttachment,
     TextAttachmentMediaType,
     validate_text_attachment_batch,
+    validate_attachment_batch,
 )
 
 from mini_deer_agent.domain.conversations import (
@@ -40,6 +43,9 @@ from mini_deer_agent.domain.benchmarks import (
 
 
 __all__ = [
+    "Attachment",
+    "AttachmentMediaType",
+    "validate_attachment_batch",
     "ConversationHistoryPage",
     "BENCHMARK_CASES",
     "BenchmarkAttempt",

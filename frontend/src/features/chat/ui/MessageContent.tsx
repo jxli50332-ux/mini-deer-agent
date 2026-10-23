@@ -5,6 +5,12 @@ import remarkGfm from "remark-gfm";
 import { extractCitationSources } from "@/entities/citation/model/citations";
 import type { MessageRole } from "@/entities/message/model/types";
 import { CopyButton } from "@/shared/ui/CopyButton";
+import {
+  filenameFromDocumentUrl,
+  textFileFromUrl,
+  textFilePageUrl,
+} from "@/features/office/api/documents";
+import { useOfficeDocuments } from "@/features/office/model/context";
 
 import { CitationSources } from "./CitationSources";
 
@@ -27,12 +33,61 @@ function extractText(node: ReactNode): string {
   return "";
 }
 
-function createMarkdownComponents(allowCopy: boolean): Components {
+function createMarkdownComponents(
+  allowCopy: boolean,
+  openDocument?: (filename: string) => void,
+  openTextFile?: (path: string, projectId?: string) => void,
+): Components {
   return {
     a({ node, href, children, ...props }) {
       // react-markdown 的 AST node 只用于渲染决策，不能透传为 DOM 属性。
       void node;
       const isExternal = href !== undefined && /^https?:\/\//i.test(href);
+      const documentName =
+        href === undefined ? null : filenameFromDocumentUrl(href);
+      const textFile = href === undefined ? null : textFileFromUrl(href);
+      if (textFile !== null && openTextFile !== undefined) {
+        return (
+          <a
+            {...props}
+            href={textFilePageUrl(textFile)}
+            onClick={(event) => {
+              if (
+                event.ctrlKey ||
+                event.metaKey ||
+                event.shiftKey ||
+                event.altKey
+              )
+                return;
+              event.preventDefault();
+              openTextFile(textFile.path, textFile.projectId);
+            }}
+          >
+            {children}
+          </a>
+        );
+      }
+      if (documentName !== null && openDocument !== undefined) {
+        return (
+          <a
+            {...props}
+            href={href}
+            onClick={(event) => {
+              if (
+                event.ctrlKey ||
+                event.metaKey ||
+                event.shiftKey ||
+                event.altKey
+              )
+                return;
+              event.preventDefault();
+              openDocument(documentName);
+            }}
+          >
+            {children}
+          </a>
+        );
+      }
       const citationMatch = /^citation:\s*(.+)$/i.exec(
         extractText(children).trim(),
       );
@@ -111,9 +166,15 @@ export function MessageContent({
   content,
   allowCopy = false,
 }: MessageContentProps) {
+  const office = useOfficeDocuments();
   const markdownComponents = useMemo(
-    () => createMarkdownComponents(allowCopy),
-    [allowCopy],
+    () =>
+      createMarkdownComponents(
+        allowCopy,
+        office?.openDocument,
+        office?.openTextFile,
+      ),
+    [allowCopy, office?.openDocument, office?.openTextFile],
   );
   const citationSources = useMemo(
     () => (role === "assistant" ? extractCitationSources(content) : []),

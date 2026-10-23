@@ -31,7 +31,11 @@ from mini_deer_agent.application.workspaces import (
     ProjectThreadRepository,
     ProjectThreadService,
 )
-from mini_deer_agent.agents.middleware import RunBudgetPolicy
+from mini_deer_agent.agents.middleware import (
+    RunBudgetPolicy,
+    RunOutputStore,
+    ToolOutputBudgetPolicy,
+)
 from mini_deer_agent.core import Settings
 from mini_deer_agent.mcp import McpRuntime, initialize_mcp_runtime
 from mini_deer_agent.llms import ModelConfigurationService
@@ -40,10 +44,12 @@ from mini_deer_agent.persistence import (
     open_async_sqlite_conversation_repository,
 )
 from mini_deer_agent.server.routers import (
+    attachments,
     benchmarks,
     health,
     mcp,
     models,
+    office,
     projects,
     runs,
     skills,
@@ -211,6 +217,14 @@ def create_lifespan(
                         ),
                         skill_management_service=app.state.skill_management_service,
                         skill_marketplace_service=app.state.skill_marketplace_service,
+                        tool_output_store=RunOutputStore(
+                            settings.tool_output_directory
+                        ),
+                        tool_output_policy=ToolOutputBudgetPolicy(
+                            max_inline_chars=settings.tool_output_max_inline_chars,
+                            sample_chars=settings.tool_output_sample_chars,
+                            read_chunk_chars=settings.tool_output_read_chunk_chars,
+                        ),
                         run_budget_policy=RunBudgetPolicy(
                             soft_token_limit=settings.run_token_soft_limit,
                             hard_token_limit=settings.run_token_hard_limit,
@@ -320,8 +334,10 @@ def create_app(
 
     # 正式路由和兼容路由集中在工厂注册，避免模块导入时分散修改全局 app。
     application.include_router(health.router)
+    application.include_router(attachments.router)
     application.include_router(benchmarks.router)
     application.include_router(mcp.router)
+    application.include_router(office.router)
     application.include_router(skills.router)
     application.include_router(models.models_router)
     application.include_router(models.settings_router)

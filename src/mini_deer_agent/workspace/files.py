@@ -24,10 +24,8 @@ def _signature(value: os.stat_result) -> tuple:
     )
 
 
-def read_project_file(
-    root: Path, path: str, *, start_line: int = 1, limit: int = 200
-) -> dict:
-    """读取至多 2 MiB 快照，按行和字符预算返回一段，并给出续读行号。"""
+def read_project_snapshot(root: Path, path: str) -> tuple[dict, bytes]:
+    """读取受目录、文件身份和大小约束的原始快照，供源码与文件预览共用。"""
     parts = path.split("/")
     if (
         len(path) > 2048
@@ -35,8 +33,6 @@ def read_project_file(
         or any(not valid_name(p) or ignored(p) for p in parts)
     ):
         raise ProjectError("project_path_invalid", "文件路径无效或已被忽略。")
-    if not 1 <= start_line <= 1000000 or not 1 <= limit <= 500:
-        raise ProjectError("project_range_invalid", "读取行范围无效。")
     file = root.joinpath(*parts)
     parent = _inspect_directory(file.parent)
     if not parent.path.is_relative_to(root):
@@ -55,13 +51,13 @@ def read_project_file(
             "size_bytes": before.st_size,
             "status": "text",
             "lines": [],
-            "start_line": start_line,
+            "start_line": 1,
             "next_line": None,
             "total_lines": None,
             "revision": None,
         }
         if before.st_size > MAX_BYTES:
-            return {**result, "status": "too_large"}
+            return {**result, "status": "too_large"}, b""
         # POSIX 可用时拒绝最终链接并避免 FIFO 阻塞；跨平台仍校验打开句柄身份。
         flags = (
             os.O_RDONLY
@@ -86,15 +82,36 @@ def read_project_file(
             "project_file_unavailable", "文件不存在或当前无法读取。"
         ) from None
     if len(data) > MAX_BYTES:
-        return {**result, "status": "too_large"}
+        return {**result, "status": "too_large"}, b""
+    return result, data
+
+
+def decode_project_text(data: bytes) -> tuple[str, str]:
+    """只接受 UTF-8 文本；扩展名不能把二进制内容伪装成文本。"""
     if b"\x00" in data:
-        return {**result, "status": "binary"}
+        return "binary", ""
     try:
         text = data.decode("utf-8-sig")
     except UnicodeDecodeError:
-        return {**result, "status": "unsupported_encoding"}
+        return "unsupported_encoding", ""
     if any(ord(c) < 32 and c not in "\t\r\n" for c in text):
-        return {**result, "status": "binary"}
+        return "binary", ""
+    return "text", text
+
+
+def read_project_file(
+    root: Path, path: str, *, start_line: int = 1, limit: int = 200
+) -> dict:
+    """按行和字符预算投影同一只读快照，保留既有工具协议。"""
+    if not 1 <= start_line <= 1000000 or not 1 <= limit <= 500:
+        raise ProjectError("project_range_invalid", "读取行范围无效。")
+    result, data = read_project_snapshot(root, path)
+    result["start_line"] = start_line
+    if result["status"] != "text":
+        return result
+    status, text = decode_project_text(data)
+    if status != "text":
+        return {**result, "status": status}
     # 仅把 CRLF/CR 视为源码换行，避免 Unicode 段落字符改变编辑器行号。
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     lines = text.split("\n") if text else []

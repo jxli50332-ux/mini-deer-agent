@@ -2,15 +2,23 @@
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+import importlib
 from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from mini_deer_agent.api import app
+from mini_deer_agent.agents.middleware import (
+    RunOutputStore,
+    ToolOutputBudgetPolicy,
+)
 from mini_deer_agent.core import Settings
 from mini_deer_agent.mcp import McpRuntime, McpServerStatus
 from mini_deer_agent.server import create_app
+
+
+server_app_module = importlib.import_module("mini_deer_agent.server.app")
 
 
 def test_default_app_can_be_imported() -> None:
@@ -29,7 +37,13 @@ def test_openapi_exposes_only_versioned_public_contract() -> None:
             "/api/v1/benchmarks/attempts/{run_id}/score",
             "/api/v1/benchmarks/regression",
         "/api/v1/health",
+        "/api/v1/attachments/{message_id}/{position}/download",
         "/api/v1/mcp/status",
+        "/api/v1/office/documents",
+        "/api/v1/office/documents/text-preview",
+        "/api/v1/office/documents/text-download",
+        "/api/v1/office/documents/{filename}/preview",
+        "/api/v1/office/documents/{filename}/download",
         "/api/v1/models",
         "/api/v1/models/{name}/probe",
         "/api/v1/projects",
@@ -133,6 +147,7 @@ def test_lifespan_initializes_and_closes_shared_resources_once(
         checkpoint_database_path=database_path,
         application_database_path=tmp_path / "application.sqlite",
         user_skills_directory=tmp_path / "skills",
+        mcp_config_path=tmp_path / "missing-mcp.json",
         _env_file=None,
     )
     application = create_app(
@@ -181,6 +196,72 @@ def test_lifespan_initializes_and_closes_shared_resources_once(
     assert not hasattr(application.state, "run_event_history_service")
     assert not hasattr(application.state, "mcp_runtime")
     assert not hasattr(application.state, "user_skill_manager")
+
+
+def test_default_lifespan_injects_configured_tool_output_storage(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """冻结模型不应使完整工具输出存储静默退化为有界样本。"""
+    captured: dict[str, object] = {}
+
+    class CapturingRunStreamService:
+        def __init__(self, checkpointer: object, **kwargs: object) -> None:
+            captured["checkpointer"] = checkpointer
+            captured.update(kwargs)
+
+    fake_checkpointer = object()
+    fake_repository = object()
+
+    @asynccontextmanager
+    async def open_fake_checkpointer(_path: str) -> AsyncIterator[object]:
+        yield fake_checkpointer
+
+    @asynccontextmanager
+    async def open_fake_repository(_path: str) -> AsyncIterator[object]:
+        yield fake_repository
+
+    async def create_empty_runtime(*_args, **_kwargs) -> McpRuntime:
+        return McpRuntime(
+            configured=False,
+            config_path=tmp_path / "mcp.json",
+            tools=(),
+            servers=(),
+        )
+
+    monkeypatch.setattr(
+        server_app_module,
+        "RunStreamService",
+        CapturingRunStreamService,
+    )
+    output_directory = tmp_path / "private-run-outputs"
+    settings = Settings(
+        checkpoint_database_path=tmp_path / "checkpoint.sqlite",
+        application_database_path=tmp_path / "application.sqlite",
+        user_skills_directory=tmp_path / "skills",
+        tool_output_directory=output_directory,
+        tool_output_max_inline_chars=4_096,
+        tool_output_sample_chars=256,
+        tool_output_read_chunk_chars=2_048,
+        workspace_allowed_roots=(),
+        _env_file=None,
+    )
+    application = create_app(
+        settings_factory=lambda: settings,
+        checkpointer_context_factory=open_fake_checkpointer,
+        conversation_repository_context_factory=open_fake_repository,
+        mcp_runtime_factory=create_empty_runtime,
+    )
+
+    with TestClient(application):
+        store = captured["tool_output_store"]
+        policy = captured["tool_output_policy"]
+        assert isinstance(store, RunOutputStore)
+        assert store.root == output_directory.resolve()
+        assert isinstance(policy, ToolOutputBudgetPolicy)
+        assert policy.max_inline_chars == 4_096
+        assert policy.sample_chars == 256
+        assert policy.read_chunk_chars == 2_048
 
 
 def test_mcp_status_projects_lifespan_runtime_without_secrets(

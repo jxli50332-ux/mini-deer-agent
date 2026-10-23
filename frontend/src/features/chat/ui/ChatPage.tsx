@@ -36,7 +36,7 @@ import {
 } from "@/features/chat/model/human-input";
 import { projectToolResultChangesTree } from "@/features/chat/model/project-changes";
 import type { ChatRunEvent } from "@/features/chat/model/events";
-import type { PreparedTextAttachment } from "@/entities/attachment/model/text-attachments";
+import type { PreparedAttachment } from "@/entities/attachment/model/attachments";
 import type { BenchmarkCase } from "@/features/benchmarks/api/benchmarks";
 import { BenchmarkPanel } from "@/features/benchmarks/ui/BenchmarkPanel";
 import type {
@@ -47,6 +47,7 @@ import type {
 } from "@/features/goals/api/thread-goal";
 import { useThreadGoal } from "@/features/goals/model/use-thread-goal";
 import { GoalPanel } from "@/features/goals/ui/GoalPanel";
+import { OfficeWorkspace } from "@/features/office/ui/OfficeWorkspace";
 import { useResizablePreference } from "@/shared/model/use-resizable-preference";
 import {
   loadModelSettings,
@@ -517,7 +518,7 @@ export function ChatPage({
     [threadId],
   );
   const submitComposer = useCallback(
-    async (message: string, attachments: readonly PreparedTextAttachment[]) => {
+    async (message: string, attachments: readonly PreparedAttachment[]) => {
       const benchmark =
         selectedBenchmark?.threadId === threadId ? selectedBenchmark : null;
       const accepted = await submit(message, attachments, {
@@ -542,213 +543,222 @@ export function ChatPage({
     currentThreadMetadata?.projectId !== undefined;
 
   return (
-    <div
-      className="app-shell"
-      data-rail-collapsed={isRailCollapsed}
-      style={
-        {
-          "--rail-width": `${railSize.value}px`,
-          "--composer-editor-height": `${composerSize.value}px`,
-        } as React.CSSProperties
-      }
+    <OfficeWorkspace
+      threadId={threadId}
+      projectId={currentThreadMetadata?.projectId ?? null}
+      refreshKey={`${threadId}:${state.phase}`}
+      hasOfficeTools={state.timeline.some(
+        (item) => item.kind === "tool" && item.name?.startsWith("word_"),
+      )}
     >
-      <ConversationRail
-        phase={state.phase}
-        currentThreadId={threadId}
-        currentProjectId={currentThreadMetadata?.projectId ?? null}
-        timelineItemCount={state.timeline.length}
-        threads={recentThreads}
-        isThreadListLoading={isThreadListLoading}
-        threadListError={threadListError}
-        isLoadingMoreThreads={isThreadListLoadingMore}
-        hasMoreThreads={hasMoreThreads}
-        isNewThreadDisabled={false}
-        isThreadSwitchDisabled={false}
-        collapsed={isRailCollapsed}
-        mobileOpen={isMobileNavigationOpen}
-        width={railSize.value}
-        minWidth={RAIL_SIZE_PREFERENCE.minValue}
-        maxWidth={RAIL_SIZE_PREFERENCE.getMaxValue()}
-        onWidthChange={railSize.setValue}
-        onResetWidth={railSize.reset}
-        onToggleCollapsed={() => setIsRailCollapsed((current) => !current)}
-        onCloseMobile={() => setIsMobileNavigationOpen(false)}
-        onCreateNewThread={createNewThread}
-        onSelectThread={selectThread}
-        onBeforeCreateProjectThread={discardEmptyProjectThread}
-        onSelectCreatedProjectThread={selectCreatedProjectThread}
-        discardedProjectThreadId={discardedProjectThreadId}
-        projectDraftError={projectDraftError}
-        activeThreadIds={activeThreadIds}
-        projectFileTreeRevision={projectFileTreeRevision}
-        onRetryThreadList={retryThreadList}
-        onLoadMoreThreads={loadMoreThreads}
-        onRenameThread={renameTitle}
-        onDeleteThread={deletePersistedThread}
-        onReferenceProjectFile={referenceProjectFile}
-        onStartSkillCreation={startSkillCreation}
-      />
-      <main className="workspace">
-        <div className="thread-header-region">
-          <ThreadHeader
-            phase={state.phase}
-            threadId={threadId}
-            runId={state.runId}
-            modelProfile={
-              state.modelProfile ??
-              (state.phase === "idle"
-                ? (threadRuns[0]?.modelProfile ?? null)
-                : null)
-            }
-            navigationOpen={isMobileNavigationOpen}
-            onOpenNavigation={() => setIsMobileNavigationOpen(true)}
-            onOpenBenchmarks={() => setIsBenchmarkPanelOpen(true)}
-          />
-          <GoalPanel
-            key={`${threadId}:${goal?.revision ?? "none"}`}
-            goal={goal}
-            isLoading={isGoalLoading}
-            isMutating={isGoalMutating}
-            isRunActive={isActive}
-            isEvaluating={goalEvaluationThreadId === threadId}
-            error={goalError}
-            onSet={saveGoal}
-            onStop={stopGoal}
-            onContinue={continueGoal}
-            onClear={clearGoal}
-            onRetry={retryGoal}
-          />
-        </div>
-        <BenchmarkPanel
-          open={isBenchmarkPanelOpen}
-          hasProject={hasCurrentProject}
-          onClose={() => setIsBenchmarkPanelOpen(false)}
-          onUseCase={useBenchmarkCase}
+      <div
+        className="app-shell"
+        data-rail-collapsed={isRailCollapsed}
+        style={
+          {
+            "--rail-width": `${railSize.value}px`,
+            "--composer-editor-height": `${composerSize.value}px`,
+          } as React.CSSProperties
+        }
+      >
+        <ConversationRail
+          phase={state.phase}
+          currentThreadId={threadId}
+          currentProjectId={currentThreadMetadata?.projectId ?? null}
+          timelineItemCount={state.timeline.length}
+          threads={recentThreads}
+          isThreadListLoading={isThreadListLoading}
+          threadListError={threadListError}
+          isLoadingMoreThreads={isThreadListLoadingMore}
+          hasMoreThreads={hasMoreThreads}
+          isNewThreadDisabled={false}
+          isThreadSwitchDisabled={false}
+          collapsed={isRailCollapsed}
+          mobileOpen={isMobileNavigationOpen}
+          width={railSize.value}
+          minWidth={RAIL_SIZE_PREFERENCE.minValue}
+          maxWidth={RAIL_SIZE_PREFERENCE.getMaxValue()}
+          onWidthChange={railSize.setValue}
+          onResetWidth={railSize.reset}
+          onToggleCollapsed={() => setIsRailCollapsed((current) => !current)}
+          onCloseMobile={() => setIsMobileNavigationOpen(false)}
+          onCreateNewThread={createNewThread}
+          onSelectThread={selectThread}
+          onBeforeCreateProjectThread={discardEmptyProjectThread}
+          onSelectCreatedProjectThread={selectCreatedProjectThread}
+          discardedProjectThreadId={discardedProjectThreadId}
+          projectDraftError={projectDraftError}
+          activeThreadIds={activeThreadIds}
+          projectFileTreeRevision={projectFileTreeRevision}
+          onRetryThreadList={retryThreadList}
+          onLoadMoreThreads={loadMoreThreads}
+          onRenameThread={renameTitle}
+          onDeleteThread={deletePersistedThread}
+          onReferenceProjectFile={referenceProjectFile}
+          onStartSkillCreation={startSkillCreation}
         />
-        <div className="chat-stage-region">
-          <section
-            ref={setConversationViewport}
-            className="chat-stage"
-            aria-label="聊天工作区"
-            onScroll={handleConversationScroll}
-          >
-            <div className="chat-stage__content">
-              {history.isInitialLoading && state.timeline.length === 0 && (
-                <div className="history-state" role="status">
-                  正在恢复当前 Thread 的历史消息……
-                </div>
-              )}
-              {!history.isInitialLoading && state.timeline.length === 0 && (
-                <div className="empty-chat" aria-label="开始新对话">
-                  <span className="empty-chat__mark" aria-hidden="true">
-                    M
-                  </span>
-                  <h2>从一个真实问题开始</h2>
-                  <p>
-                    告诉 Agent
-                    你要实现、排查或理解什么。进入项目会话后，它可以读取代码、编辑文件并运行验证。
-                  </p>
-                </div>
-              )}
-              {history.hasMore && (
-                <div className="history-controls">
-                  <button
-                    type="button"
-                    disabled={history.isLoadingMore}
-                    onClick={() => void history.loadMore()}
-                  >
-                    {history.isLoadingMore ? "正在加载……" : "加载更早消息"}
-                  </button>
-                </div>
-              )}
-              <MessageList
-                items={state.timeline}
-                phase={state.phase}
-                startedAt={state.startedAt}
-                runs={threadRuns}
-                onSubmitHumanInput={submitHumanInput}
-              />
-              {history.error !== null && (
-                <aside className="history-error" role="alert">
-                  <strong>历史消息加载失败</strong>
-                  <span>{history.error}</span>
-                  <button type="button" onClick={history.retry}>
-                    重新加载
-                  </button>
-                </aside>
-              )}
-              {state.error !== null && (
-                <aside className="run-error" role="alert">
-                  <strong>
-                    {state.error.code.startsWith("cancel_")
-                      ? "停止请求失败"
-                      : "本轮运行失败"}
-                  </strong>
-                  <span>{state.error.message}</span>
-                  <small>
-                    {state.error.retryable
-                      ? "可以稍后重新发送。"
-                      : `错误代码：${state.error.code}`}
-                  </small>
-                </aside>
-              )}
-            </div>
-          </section>
-          {hasUnseenContent && (
-            <button
-              type="button"
-              className="jump-to-latest"
-              aria-controls="conversation-message-list"
-              onClick={scrollToLatest}
-            >
-              <span aria-hidden="true">↓</span>
-              回到最新
-            </button>
-          )}
-        </div>
-        <Composer
-          key={threadId}
-          isActive={isActive}
-          isStopping={state.phase === "stopping"}
-          editorHeight={composerSize.value}
-          minEditorHeight={COMPOSER_SIZE_PREFERENCE.minValue}
-          maxEditorHeight={COMPOSER_SIZE_PREFERENCE.getMaxValue()}
-          onEditorHeightChange={composerSize.setValue}
-          onResetEditorHeight={composerSize.reset}
-          draftInsertion={
-            composerDraftInsertion?.threadId === threadId
-              ? composerDraftInsertion
-              : null
-          }
-          onDraftInsertionApplied={clearAppliedDraftInsertion}
-          modelOptions={modelProfiles.map((profile) => ({
-            name: profile.name,
-            displayName: profile.displayName,
-            available: profile.supportsTools && profile.apiKeyConfigured,
-          }))}
-          selectedModel={modelSelection?.primaryModel ?? null}
-          isModelLoading={isModelLoading}
-          isModelSwitching={isModelSwitching}
-          modelError={modelError}
-          onModelChange={switchComposerModel}
-          {...(latestTodoSnapshot === null
-            ? {}
-            : {
-                todoList: latestTodoSnapshot.list,
-                todoSourceStepId: latestTodoSnapshot.sourceToolItemId,
-              })}
-          onSubmit={submitComposer}
-          onCancel={cancel}
-        />
-        {selectedBenchmark?.threadId === threadId && (
-          <div className="benchmark-selection" role="status">
-            基准任务：{selectedBenchmark.title}
-            <button type="button" onClick={() => setSelectedBenchmark(null)}>
-              取消标记
-            </button>
+        <main className="workspace">
+          <div className="thread-header-region">
+            <ThreadHeader
+              phase={state.phase}
+              threadId={threadId}
+              runId={state.runId}
+              modelProfile={
+                state.modelProfile ??
+                (state.phase === "idle"
+                  ? (threadRuns[0]?.modelProfile ?? null)
+                  : null)
+              }
+              navigationOpen={isMobileNavigationOpen}
+              onOpenNavigation={() => setIsMobileNavigationOpen(true)}
+              onOpenBenchmarks={() => setIsBenchmarkPanelOpen(true)}
+            />
+            <GoalPanel
+              key={`${threadId}:${goal?.revision ?? "none"}`}
+              goal={goal}
+              isLoading={isGoalLoading}
+              isMutating={isGoalMutating}
+              isRunActive={isActive}
+              isEvaluating={goalEvaluationThreadId === threadId}
+              error={goalError}
+              onSet={saveGoal}
+              onStop={stopGoal}
+              onContinue={continueGoal}
+              onClear={clearGoal}
+              onRetry={retryGoal}
+            />
           </div>
-        )}
-      </main>
-    </div>
+          <BenchmarkPanel
+            open={isBenchmarkPanelOpen}
+            hasProject={hasCurrentProject}
+            onClose={() => setIsBenchmarkPanelOpen(false)}
+            onUseCase={useBenchmarkCase}
+          />
+          <div className="chat-stage-region">
+            <section
+              ref={setConversationViewport}
+              className="chat-stage"
+              aria-label="聊天工作区"
+              onScroll={handleConversationScroll}
+            >
+              <div className="chat-stage__content">
+                {history.isInitialLoading && state.timeline.length === 0 && (
+                  <div className="history-state" role="status">
+                    正在恢复当前 Thread 的历史消息……
+                  </div>
+                )}
+                {!history.isInitialLoading && state.timeline.length === 0 && (
+                  <div className="empty-chat" aria-label="开始新对话">
+                    <span className="empty-chat__mark" aria-hidden="true">
+                      M
+                    </span>
+                    <h2>从一个真实问题开始</h2>
+                    <p>
+                      告诉 Agent
+                      你要实现、排查或理解什么。进入项目会话后，它可以读取代码、编辑文件并运行验证。
+                    </p>
+                  </div>
+                )}
+                {history.hasMore && (
+                  <div className="history-controls">
+                    <button
+                      type="button"
+                      disabled={history.isLoadingMore}
+                      onClick={() => void history.loadMore()}
+                    >
+                      {history.isLoadingMore ? "正在加载……" : "加载更早消息"}
+                    </button>
+                  </div>
+                )}
+                <MessageList
+                  items={state.timeline}
+                  phase={state.phase}
+                  startedAt={state.startedAt}
+                  runs={threadRuns}
+                  onSubmitHumanInput={submitHumanInput}
+                />
+                {history.error !== null && (
+                  <aside className="history-error" role="alert">
+                    <strong>历史消息加载失败</strong>
+                    <span>{history.error}</span>
+                    <button type="button" onClick={history.retry}>
+                      重新加载
+                    </button>
+                  </aside>
+                )}
+                {state.error !== null && (
+                  <aside className="run-error" role="alert">
+                    <strong>
+                      {state.error.code.startsWith("cancel_")
+                        ? "停止请求失败"
+                        : "本轮运行失败"}
+                    </strong>
+                    <span>{state.error.message}</span>
+                    <small>
+                      {state.error.retryable
+                        ? "可以稍后重新发送。"
+                        : `错误代码：${state.error.code}`}
+                    </small>
+                  </aside>
+                )}
+              </div>
+            </section>
+            {hasUnseenContent && (
+              <button
+                type="button"
+                className="jump-to-latest"
+                aria-controls="conversation-message-list"
+                onClick={scrollToLatest}
+              >
+                <span aria-hidden="true">↓</span>
+                回到最新
+              </button>
+            )}
+          </div>
+          <Composer
+            key={threadId}
+            isActive={isActive}
+            isStopping={state.phase === "stopping"}
+            editorHeight={composerSize.value}
+            minEditorHeight={COMPOSER_SIZE_PREFERENCE.minValue}
+            maxEditorHeight={COMPOSER_SIZE_PREFERENCE.getMaxValue()}
+            onEditorHeightChange={composerSize.setValue}
+            onResetEditorHeight={composerSize.reset}
+            draftInsertion={
+              composerDraftInsertion?.threadId === threadId
+                ? composerDraftInsertion
+                : null
+            }
+            onDraftInsertionApplied={clearAppliedDraftInsertion}
+            modelOptions={modelProfiles.map((profile) => ({
+              name: profile.name,
+              displayName: profile.displayName,
+              available: profile.supportsTools && profile.apiKeyConfigured,
+            }))}
+            selectedModel={modelSelection?.primaryModel ?? null}
+            isModelLoading={isModelLoading}
+            isModelSwitching={isModelSwitching}
+            modelError={modelError}
+            onModelChange={switchComposerModel}
+            {...(latestTodoSnapshot === null
+              ? {}
+              : {
+                  todoList: latestTodoSnapshot.list,
+                  todoSourceStepId: latestTodoSnapshot.sourceToolItemId,
+                })}
+            onSubmit={submitComposer}
+            onCancel={cancel}
+          />
+          {selectedBenchmark?.threadId === threadId && (
+            <div className="benchmark-selection" role="status">
+              基准任务：{selectedBenchmark.title}
+              <button type="button" onClick={() => setSelectedBenchmark(null)}>
+                取消标记
+              </button>
+            </div>
+          )}
+        </main>
+      </div>
+    </OfficeWorkspace>
   );
 }

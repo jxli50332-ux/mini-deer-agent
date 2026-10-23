@@ -1,8 +1,10 @@
 import type { ThreadHistoryItem } from "@/entities/message/model/types";
 import {
-  isSupportedTextAttachmentMediaType,
-  type TextAttachmentContent,
-} from "@/entities/attachment/model/text-attachments";
+  isSupportedAttachmentMediaType,
+  isImageAttachment,
+  validateAttachmentPayloads,
+  type AttachmentContent,
+} from "@/entities/attachment/model/attachments";
 import { parseHumanInputResponse } from "@/features/chat/model/human-input";
 
 const UUID_PATTERN =
@@ -99,9 +101,7 @@ function positiveInteger(record: UnknownRecord, field: string): number {
   return value;
 }
 
-function parseTextAttachments(
-  value: unknown,
-): readonly TextAttachmentContent[] {
+function parseTextAttachments(value: unknown): readonly AttachmentContent[] {
   if (value === undefined) {
     return [];
   }
@@ -115,15 +115,27 @@ function parseTextAttachments(
     const mediaType = item.media_type;
     if (
       typeof mediaType !== "string" ||
-      !isSupportedTextAttachmentMediaType(mediaType)
+      !isSupportedAttachmentMediaType(mediaType)
     ) {
       invalidResponse("附件 media_type 不受支持");
     }
+    const filename = requiredString(item, "filename");
+    const content = requiredString(item, "content");
+    const sizeBytes = positiveInteger(item, "size_bytes");
+    if (isImageAttachment({ mediaType })) {
+      try {
+        const [image] = validateAttachmentPayloads([{ filename, content }]);
+        if (image?.mediaType !== mediaType || image.sizeBytes !== sizeBytes)
+          invalidResponse("图片附件元数据不一致");
+      } catch {
+        invalidResponse("图片附件内容无效");
+      }
+    }
     return {
-      filename: requiredString(item, "filename"),
+      filename,
       mediaType,
-      sizeBytes: positiveInteger(item, "size_bytes"),
-      content: requiredString(item, "content"),
+      sizeBytes,
+      content,
     };
   });
 }

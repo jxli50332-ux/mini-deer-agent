@@ -2,7 +2,7 @@ import type {
   ChatTimelineItem,
   HumanInputResponseMetadata,
 } from "@/entities/message/model/types";
-import type { TextAttachmentContent } from "@/entities/attachment/model/text-attachments";
+import type { AttachmentContent } from "@/entities/attachment/model/attachments";
 import type {
   AiDeltaEvent,
   ChatRunEvent,
@@ -47,7 +47,7 @@ export type ChatRunAction =
       readonly userMessage: {
         readonly id: string;
         readonly content: string;
-        readonly attachments?: readonly TextAttachmentContent[];
+        readonly attachments?: readonly AttachmentContent[];
         readonly hiddenFromUi?: boolean;
         readonly humanInputResponse?: HumanInputResponseMetadata;
       };

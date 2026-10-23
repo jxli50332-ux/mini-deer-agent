@@ -1,7 +1,13 @@
-"""定义可随一轮消息提交的小型 UTF-8 文本附件业务规则。"""
+"""定义随一轮消息提交的 UTF-8 文本与视觉图片附件业务规则。"""
 
 from dataclasses import dataclass
 from typing import Literal
+
+from mini_deer_agent.domain.image_attachments import (
+    ImageAttachmentMediaType,
+    MAX_IMAGE_ATTACHMENTS_TOTAL_BYTES,
+    validate_image_content,
+)
 
 
 MAX_TEXT_ATTACHMENT_COUNT = 3
@@ -71,18 +77,25 @@ TextAttachmentMediaType = Literal[
 ]
 
 
+AttachmentMediaType = TextAttachmentMediaType | ImageAttachmentMediaType
+
+
 @dataclass(frozen=True, slots=True)
-class TextAttachment:
-    """表示已经由服务端验证、可以持久化和交给 Agent 的文本附件。"""
+class Attachment:
+    """已验证的附件；文本保存正文，图片保存标准 data URL，大小始终为原始字节数。"""
 
     filename: str
-    media_type: TextAttachmentMediaType
+    media_type: AttachmentMediaType
     size_bytes: int
     content: str
 
 
-def _validated_attachment(filename: str, content: str) -> TextAttachment:
-    """校验一个文件名与正文，并由可信端计算类型和 UTF-8 字节数。"""
+# 保留旧领域入口，已有调用者和文本附件数据无需迁移。
+TextAttachment = Attachment
+
+
+def _validated_attachment(filename: str, content: str) -> Attachment:
+    """校验文件名及实际内容，由可信端计算类型和原始字节数。"""
     normalized_name = filename.strip()
     if (
         not normalized_name
@@ -97,6 +110,9 @@ def _validated_attachment(filename: str, content: str) -> TextAttachment:
 
     dot_index = normalized_name.rfind(".")
     extension = normalized_name[dot_index:].lower() if dot_index >= 0 else ""
+    if extension in {".png", ".jpg", ".jpeg"}:
+        image_type, size, data_url = validate_image_content(normalized_name, content)
+        return Attachment(normalized_name, image_type, size, data_url)
     media_type = _MEDIA_TYPES_BY_EXTENSION.get(extension)
     if media_type is None:
         raise ValueError("unsupported attachment type")
@@ -108,7 +124,7 @@ def _validated_attachment(filename: str, content: str) -> TextAttachment:
     size_bytes = len(content.encode("utf-8"))
     if size_bytes > MAX_TEXT_ATTACHMENT_BYTES:
         raise ValueError("text attachment is too large")
-    return TextAttachment(
+    return Attachment(
         filename=normalized_name,
         media_type=media_type,
         size_bytes=size_bytes,
@@ -116,16 +132,36 @@ def _validated_attachment(filename: str, content: str) -> TextAttachment:
     )
 
 
-def validate_text_attachment_batch(
+def validate_attachment_batch(
     values: list[tuple[str, str]] | tuple[tuple[str, str], ...],
-) -> tuple[TextAttachment, ...]:
-    """校验一轮消息的附件数量、单文件大小和总大小。"""
+) -> tuple[Attachment, ...]:
+    """混合附件共用数量限制，文本与图片分别应用原始字节预算。"""
     if len(values) > MAX_TEXT_ATTACHMENT_COUNT:
         raise ValueError("too many text attachments")
 
     attachments = tuple(
         _validated_attachment(filename, content) for filename, content in values
     )
-    if sum(item.size_bytes for item in attachments) > MAX_TEXT_ATTACHMENTS_TOTAL_BYTES:
+    text_bytes = sum(
+        item.size_bytes for item in attachments
+        if not item.media_type.startswith("image/")
+    )
+    image_bytes = sum(
+        item.size_bytes for item in attachments
+        if item.media_type.startswith("image/")
+    )
+    if text_bytes > MAX_TEXT_ATTACHMENTS_TOTAL_BYTES:
         raise ValueError("text attachments total size is too large")
+    if image_bytes > MAX_IMAGE_ATTACHMENTS_TOTAL_BYTES:
+        raise ValueError("image attachments total size exceeds 8 MiB")
+    return attachments
+
+
+def validate_text_attachment_batch(
+    values: list[tuple[str, str]] | tuple[tuple[str, str], ...],
+) -> tuple[Attachment, ...]:
+    """兼容既有严格文本入口，不把图片静默传给仅接受文本的旧调用方。"""
+    attachments = validate_attachment_batch(values)
+    if any(item.media_type.startswith("image/") for item in attachments):
+        raise ValueError("unsupported text attachment type")
     return attachments

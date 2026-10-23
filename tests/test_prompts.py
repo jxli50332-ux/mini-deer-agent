@@ -19,7 +19,7 @@ def test_default_prompt_uses_a_natural_identity_without_guessing_model() -> None
         )
     )
 
-    assert built.version == "mini-deer-agent/system/v48"
+    assert built.version == "mini-deer-agent/system/v50"
     assert "你是 Mini Deer Agent" in built.system_message.text
     assert "友好、可靠的通用 AI Agent" in built.system_message.text
     assert "当前 Run 没有提供具体模型标识" in built.system_message.text

@@ -1,5 +1,6 @@
 import type { ChatRunPhase } from "@/features/chat/model/reducer";
 import { StatusIndicator } from "@/shared/ui/StatusIndicator";
+import { OfficeDocumentsButton } from "@/features/office/ui/OfficeDocumentCards";
 
 interface ThreadHeaderProps {
   readonly phase: ChatRunPhase;
@@ -47,6 +48,7 @@ export function ThreadHeader({
         <h1>Mini Deer 对话</h1>
       </div>
       <div className="thread-header__status">
+        <OfficeDocumentsButton />
         <button
           type="button"
           className="benchmark-open-button"

@@ -1,4 +1,4 @@
-import type { TextAttachmentContent } from "@/entities/attachment/model/text-attachments";
+import type { AttachmentContent } from "@/entities/attachment/model/attachments";
 
 export type MessageRole = "assistant" | "user";
 
@@ -26,7 +26,7 @@ export interface MessageTimelineItem {
   readonly content: string;
   /** 思考过程；与最终回答同属一条消息，前端折叠展示。 */
   readonly reasoning?: string;
-  readonly attachments?: readonly TextAttachmentContent[];
+  readonly attachments?: readonly AttachmentContent[];
   /** 卡片提交的回答保留在原始时间线中，但不重复渲染为用户气泡。 */
   readonly hiddenFromUi?: boolean;
   readonly humanInputResponse?: HumanInputResponseMetadata;

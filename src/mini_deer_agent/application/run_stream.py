@@ -16,9 +16,14 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph.state import CompiledStateGraph
 
 from mini_deer_agent.agents import AgentPromptContext, build_agent_graph
-from mini_deer_agent.agents.middleware import RunBudgetPolicy, RunBudgetTracker
+from mini_deer_agent.agents.middleware import (
+    RunBudgetPolicy,
+    RunBudgetTracker,
+    RunOutputStore,
+    ToolOutputBudgetPolicy,
+)
 from mini_deer_agent.application.memory import MemoryStore
-from mini_deer_agent.domain import TextAttachment
+from mini_deer_agent.domain import Attachment
 from mini_deer_agent.skills import BuiltInSkill, BuiltInSkillCatalog, SkillResource
 from mini_deer_agent.streaming import (
     AgentMessageEvent,
@@ -81,7 +86,7 @@ def _catalog_hash(catalog: BuiltInSkillCatalog | None) -> str:
 
 def _human_message(
     message: str,
-    attachments: tuple[TextAttachment, ...],
+    attachments: tuple[Attachment, ...],
     human_input_response: dict[str, object] | None = None,
     internal_continuation: bool = False,
 ) -> HumanMessage:
@@ -95,15 +100,22 @@ def _human_message(
             }
         )
     if attachments:
-        additional_kwargs["text_attachments"] = [
-            {
-                "filename": item.filename,
-                "media_type": item.media_type,
-                "size_bytes": item.size_bytes,
-                "content": item.content,
-            }
-            for item in attachments
-        ]
+        # checkpoint 保存原始问题与分类附件；只有模型调用视图把图片投影为视觉内容块。
+        for key, is_image in (("text_attachments", False), ("image_attachments", True)):
+            selected = [
+                item for item in attachments
+                if item.media_type.startswith("image/") == is_image
+            ]
+            if selected:
+                additional_kwargs[key] = [
+                    {
+                        "filename": item.filename,
+                        "media_type": item.media_type,
+                        "size_bytes": item.size_bytes,
+                        "content": item.content,
+                    }
+                    for item in selected
+                ]
     if human_input_response is not None:
         additional_kwargs["hide_from_ui"] = True
         additional_kwargs["human_input_response"] = dict(human_input_response)
@@ -128,6 +140,8 @@ def build_default_agent_graph(
     skill_management_service: "SkillManagementService | None" = None,
     skill_marketplace_service: "SkillMarketplaceService | None" = None,
     skill_creation_enabled: bool | None = None,
+    tool_output_store: RunOutputStore | None = None,
+    tool_output_policy: ToolOutputBudgetPolicy | None = None,
 ) -> CompiledStateGraph:
     """使用应用持有的 checkpointer 构建默认主 Agent 图。"""
     # 默认路径在真正开始请求时才创建模型，健康检查不依赖模型密钥是否已经配置。
@@ -152,6 +166,8 @@ def build_default_agent_graph(
         skill_management_service=skill_management_service,
         skill_marketplace_service=skill_marketplace_service,
         skill_creation_enabled=skill_creation_enabled,
+        tool_output_store=tool_output_store,
+        tool_output_policy=tool_output_policy,
     )
 
 
@@ -173,6 +189,8 @@ class RunStreamService:
         model_snapshot_restorer: ModelSnapshotRestorer | None = None,
         skill_management_service: "SkillManagementService | None" = None,
         skill_marketplace_service: "SkillMarketplaceService | None" = None,
+        tool_output_store: RunOutputStore | None = None,
+        tool_output_policy: ToolOutputBudgetPolicy | None = None,
     ) -> None:
         """保存 checkpoint 和可替换构图工厂，不负责 HTTP 或 Run 注册。"""
         self._checkpointer = checkpointer
@@ -185,6 +203,8 @@ class RunStreamService:
                 mcp_tool_routing_keywords=mcp_tool_routing_keywords,
                 skill_management_service=skill_management_service,
                 skill_marketplace_service=skill_marketplace_service,
+                tool_output_store=tool_output_store,
+                tool_output_policy=tool_output_policy,
             )
             if graph_factory is build_default_agent_graph
             else graph_factory
@@ -407,7 +427,7 @@ class RunStreamService:
         self,
         message: str,
         thread_id: str,
-        attachments: tuple[TextAttachment, ...] = (),
+        attachments: tuple[Attachment, ...] = (),
     ) -> Iterator[AgentMessageEvent]:
         """恢复指定线程，只提交本轮用户消息，并惰性产生 LangGraph 消息。"""
         # 每轮构建独立 CompiledStateGraph；共享 checkpointer 负责跨轮状态和线程隔离。
@@ -423,7 +443,7 @@ class RunStreamService:
         self,
         message: str,
         thread_id: str,
-        attachments: tuple[TextAttachment, ...] = (),
+        attachments: tuple[Attachment, ...] = (),
         human_input_response: dict[str, object] | None = None,
         run_id: str | None = None,
         run_budget_tracker: RunBudgetTracker | None = None,
@@ -480,7 +500,7 @@ class RunStreamService:
         message: str,
         thread_id: str,
         run_id: str,
-        attachments: tuple[TextAttachment, ...] = (),
+        attachments: tuple[Attachment, ...] = (),
         human_input_response: dict[str, object] | None = None,
         *,
         run_budget_tracker: RunBudgetTracker | None = None,

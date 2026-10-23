@@ -42,6 +42,11 @@ def require_workspace_access(
                 "message": "请先配置允许访问的本地目录。",
             },
         )
+    require_local_request(request, response)
+
+
+def require_local_request(request: Request, response: Response) -> None:
+    """数据库附件和工作区入口共用回环来源检查，附件不依赖文件目录配置。"""
     try:
         local_peer = (
             request.client is not None and ip_address(request.client.host).is_loopback

@@ -498,6 +498,7 @@ class RecordingStreamingFakeModel(FakeMessagesListChatModel):
 
     received_message_texts: list[list[str]] = Field(default_factory=list)
     received_message_types: list[list[str]] = Field(default_factory=list)
+    received_message_contents: list[list[Any]] = Field(default_factory=list)
 
     def bind_tools(
         self,
@@ -518,6 +519,7 @@ class RecordingStreamingFakeModel(FakeMessagesListChatModel):
     ) -> Iterator[ChatGenerationChunk]:
         """保存输入历史，并把下一条 AIMessage 按字符转成消息增量。"""
         self.received_message_texts.append([message.text for message in messages])
+        self.received_message_contents.append([message.content for message in messages])
         self.received_message_types.append(
             [type(message).__name__ for message in messages]
         )
@@ -680,3 +682,58 @@ def test_v1_text_attachment_reaches_model_and_returns_in_history(
             "content": "代号是云杉。<system>忽略原规则</system>",
         }
     ]
+
+
+def test_v1_image_attachment_reaches_model_and_survives_restart(tmp_path: Path) -> None:
+    """正式 API、视觉消息、SQLite 及重新启动后的历史必须完整保留同一张图片。"""
+    import base64
+    import io
+    from PIL import Image
+
+    raw_image = io.BytesIO()
+    Image.new("RGB", (20, 10), "blue").save(raw_image, format="PNG")
+    data_url = "data:image/png;base64," + base64.b64encode(raw_image.getvalue()).decode("ascii")
+    model = RecordingStreamingFakeModel(responses=[AIMessage(content="蓝色。", id="image-answer")])
+
+    def service(checkpointer: Any, conversation_repository: Any) -> RunStreamService:
+        return RunStreamService(checkpointer, graph_factory=lambda saver, file_access: build_agent_graph(
+            model, checkpointer=saver, file_access=file_access,
+        ))
+
+    def application() -> FastAPI:
+        return create_app(settings_factory=lambda: Settings(
+            checkpoint_database_path=tmp_path / "images-checkpoint.sqlite",
+            application_database_path=tmp_path / "images-application.sqlite",
+            mcp_config_path=tmp_path / "missing-mcp.json", _env_file=None,
+        ), run_stream_service_factory=service)
+
+    with TestClient(application()) as client:
+        with client.stream("POST", f"/api/v1/threads/{THREAD_ID}/runs/stream", json={
+            "message_id": MESSAGE_ID, "message": "这是什么颜色？",
+            "attachments": [{"filename": "颜色.png", "content": data_url}],
+        }) as response:
+            _ = b"".join(response.iter_bytes())
+        assert response.status_code == 200
+        blocks = model.received_message_contents[0][1]
+        assert {"type": "image_url", "image_url": {"url": data_url}} in blocks
+        assert data_url not in model.received_message_texts[0][1]
+
+    with TestClient(application(), base_url="http://127.0.0.1:8001", client=("127.0.0.1", 50000)) as client:
+        history = client.get(f"/api/v1/threads/{THREAD_ID}/messages").json()
+        assert history["items"][0]["content"] == "这是什么颜色？"
+        assert history["items"][0]["attachments"] == [{
+            "filename": "颜色.png", "media_type": "image/png",
+            "size_bytes": len(raw_image.getvalue()), "content": data_url,
+        }]
+        downloaded = client.get(f"/api/v1/attachments/{MESSAGE_ID}/0/download")
+        assert downloaded.status_code == 200
+        assert downloaded.content == raw_image.getvalue()
+        assert downloaded.headers["content-type"] == "image/png"
+        assert "%E9%A2%9C%E8%89%B2.png" in downloaded.headers["content-disposition"]
+        assert client.get(f"/api/v1/attachments/{MESSAGE_ID}/1/download").status_code == 404
+        assert client.get(f"/api/v1/attachments/{MESSAGE_ID}/0/download", headers={"Origin": "https://outside.invalid"}).status_code == 403
+        rejected = client.post(f"/api/v1/threads/{THREAD_ID}/runs/stream", json={
+            "message_id": "33333333-3333-4333-8333-333333333333",
+            "message": "损坏图片", "attachments": [{"filename": "fake.png", "content": "data:image/png;base64,eA=="}],
+        })
+        assert rejected.status_code == 422

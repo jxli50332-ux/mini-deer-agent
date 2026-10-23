@@ -5,6 +5,9 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .env
+.env.*
+!.env.example
+mcp_servers.json
 models.yaml
 model-credentials.json
 data/
@@ -16,3 +19,11 @@ frontend/dist/
 frontend/coverage/
 frontend/.env
 frontend/.env.local
+
+# 本地安装缓存、测试临时产物和对话调试导出不进入公开仓库。
+pip-metadata-*/
+pip-unpack-*/
+pytest-of-*/
+tmp/
+docs/debug/
+*.log

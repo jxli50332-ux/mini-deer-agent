@@ -27,10 +27,11 @@ def test_settings_has_non_sensitive_defaults(monkeypatch: pytest.MonkeyPatch) ->
     assert settings.application_database_path == Path("data/application.sqlite")
     assert settings.workspace_allowed_roots == ()
     assert settings.context_summary_enabled is True
-    assert settings.context_summary_trigger_tokens == 50_000
-    assert settings.context_summary_trigger_messages == 40
+    # 默认摘要预算与当前配置保持一致；显式环境覆盖另由下方测试保护。
+    assert settings.context_summary_trigger_tokens == 150_000
+    assert settings.context_summary_trigger_messages == 100
     assert settings.context_summary_keep_messages == 10
-    assert settings.context_summary_input_tokens == 25_000
+    assert settings.context_summary_input_tokens == 75_000
     assert settings.mcp_config_path == Path("mcp_servers.json")
     assert settings.mcp_server_init_timeout_seconds == 10.0
     assert settings.user_skills_directory.name == "skills"

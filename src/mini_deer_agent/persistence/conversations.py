@@ -34,7 +34,7 @@ from mini_deer_agent.domain import (
     MemoryFact,
     RunRecord,
     StoredRunEventRecord,
-    TextAttachment,
+    Attachment,
     ThreadRecord,
     TimelineHistoryItem,
     ToolExecutionHistoryItem,
@@ -810,7 +810,7 @@ class SqliteConversationRepository:
         run_id: str,
         user_message_id: str,
         user_message: str,
-        attachments: tuple[TextAttachment, ...] = (),
+        attachments: tuple[Attachment, ...] = (),
         human_input_response: dict[str, object] | None = None,
         benchmark_case_id: str | None = None,
         hidden_from_ui: bool = False,
@@ -875,6 +875,7 @@ class SqliteConversationRepository:
                         response_json,
                     ),
                 )
+                # 沿用旧表名以兼容已有数据库；media_type 区分正文和标准图片 data URL。
                 for position, attachment in enumerate(attachments):
                     cursor.execute(
                         """
@@ -1740,6 +1741,26 @@ class SqliteConversationRepository:
             for row in rows
         )
 
+    def get_attachment(self, message_id: str, position: int) -> Attachment | None:
+        """只查询可见用户消息中的附件，不依赖分页或最近历史窗口。"""
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT a.filename, a.media_type, a.size_bytes, a.content
+                FROM text_attachments AS a
+                JOIN messages AS m ON m.item_id = a.message_id
+                WHERE a.message_id = ? AND a.position = ?
+                  AND m.role = 'user' AND m.hidden_from_ui = 0
+                """,
+                (message_id, position),
+            ).fetchone()
+        if row is None:
+            return None
+        return Attachment(
+            filename=str(row["filename"]), media_type=str(row["media_type"]),
+            size_bytes=int(row["size_bytes"]), content=str(row["content"]),
+        )
+
     def list_history(
         self,
         thread_id: str,
@@ -1794,7 +1815,7 @@ class SqliteConversationRepository:
             for row in selected_rows
             if row["kind"] == "message"
         ]
-        attachments_by_message: dict[str, list[TextAttachment]] = {}
+        attachments_by_message: dict[str, list[Attachment]] = {}
         if message_ids:
             placeholders = ",".join("?" for _ in message_ids)
             with self._lock:
@@ -1810,7 +1831,7 @@ class SqliteConversationRepository:
             for attachment_row in attachment_rows:
                 message_id = str(attachment_row["message_id"])
                 attachments_by_message.setdefault(message_id, []).append(
-                    TextAttachment(
+                    Attachment(
                         filename=str(attachment_row["filename"]),
                         media_type=str(attachment_row["media_type"]),
                         size_bytes=int(attachment_row["size_bytes"]),

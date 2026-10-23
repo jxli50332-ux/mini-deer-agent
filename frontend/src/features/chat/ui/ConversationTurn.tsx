@@ -12,6 +12,7 @@ import { CotTimeline } from "@/features/chat/ui/CotTimeline";
 import { RunChanges } from "@/features/chat/ui/RunChanges";
 import { MessageContent } from "@/features/chat/ui/MessageContent";
 import { RunTiming } from "@/features/chat/ui/RunTiming";
+import { OfficeDocumentCards } from "@/features/office/ui/OfficeDocumentCards";
 import { HumanInputCard } from "@/features/chat/ui/HumanInputCard";
 import type {
   HumanInputRequest,
@@ -19,7 +20,12 @@ import type {
   HumanInputThreadState,
 } from "@/features/chat/model/human-input";
 import { CopyButton } from "@/shared/ui/CopyButton";
-import { formatAttachmentSize } from "@/entities/attachment/model/text-attachments";
+import {
+  formatAttachmentSize,
+  isImageAttachment,
+  attachmentDownloadUrl,
+} from "@/entities/attachment/model/attachments";
+import "./image-attachments.css";
 
 interface ConversationTurnProps {
   readonly turn: ConversationTurnView;
@@ -78,12 +84,21 @@ function MessageRow({
                 <li key={`${attachment.filename}:${index}`}>
                   <details className="message__attachment">
                     <summary className="message__attachment-summary">
-                      <span
-                        aria-hidden="true"
-                        className="message__attachment-icon"
-                      >
-                        文
-                      </span>
+                      {isImageAttachment(attachment) ? (
+                        <img
+                          className="attachment-image__thumbnail"
+                          src={attachment.content}
+                          alt={`图片 ${attachment.filename}`}
+                          loading="lazy"
+                        />
+                      ) : (
+                        <span
+                          aria-hidden="true"
+                          className="message__attachment-icon"
+                        >
+                          文
+                        </span>
+                      )}
                       <span className="message__attachment-meta">
                         <strong>{attachment.filename}</strong>
                         <small>
@@ -92,9 +107,25 @@ function MessageRow({
                         </small>
                       </span>
                     </summary>
-                    <pre className="message__attachment-content">
-                      {attachment.content}
-                    </pre>
+                    {isImageAttachment(attachment) ? (
+                      <div className="attachment-image__expanded">
+                        <img
+                          src={attachment.content}
+                          alt={attachment.filename}
+                          loading="lazy"
+                        />
+                        <a
+                          href={attachmentDownloadUrl(item.id, index)}
+                          download={attachment.filename}
+                        >
+                          下载原图
+                        </a>
+                      </div>
+                    ) : (
+                      <pre className="message__attachment-content">
+                        {attachment.content}
+                      </pre>
+                    )}
                   </details>
                 </li>
               ))}
@@ -205,6 +236,7 @@ export function ConversationTurn({
       <CotTimeline steps={cotSteps} />
       {finalSteps.map(renderStep)}
       <RunChanges changes={changes} checks={checks} />
+      <OfficeDocumentCards steps={turn.steps} />
       {turn.timing !== undefined && (
         <RunTiming
           timing={turn.timing}

@@ -1,6 +1,7 @@
 """验证应用 Run 身份进入 LangGraph 配置而不暴露给模型参数。"""
 
 import asyncio
+from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
 
@@ -13,11 +14,16 @@ from mini_deer_agent.application.run_stream import (
     RunStreamService,
     build_default_agent_graph,
 )
+from mini_deer_agent.agents.middleware import (
+    RunOutputStore,
+    ToolOutputBudgetPolicy,
+)
 from mini_deer_agent.llms import ModelProfile, ModelSnapshot
 
 
 def test_default_graph_projects_the_frozen_model_id_into_prompt_context(
     monkeypatch,
+    tmp_path: Path,
 ) -> None:
     captured: dict[str, object] = {}
     graph = object()
@@ -40,16 +46,26 @@ def test_default_graph_projects_the_frozen_model_id_into_prompt_context(
             api_key_env="GLM_API_KEY",
         ),
     )
+    output_store = RunOutputStore(tmp_path / "run-outputs")
+    output_policy = ToolOutputBudgetPolicy(
+        max_inline_chars=4_096,
+        sample_chars=256,
+        read_chunk_chars=2_048,
+    )
 
     result = build_default_agent_graph(
         cast(BaseCheckpointSaver, object()),
         model_snapshot=snapshot,
+        tool_output_store=output_store,
+        tool_output_policy=output_policy,
     )
 
     assert result is graph
     assert cast(Any, captured["prompt_context"]).current_model_name == (
         "glm-4.7-flash"
     )
+    assert captured["tool_output_store"] is output_store
+    assert captured["tool_output_policy"] is output_policy
 
 
 def test_async_product_run_projects_run_id_into_tool_runtime_config(

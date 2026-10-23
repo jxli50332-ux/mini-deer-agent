@@ -9,9 +9,9 @@ import {
   SseParseError,
 } from "@/shared/api/sse-parser";
 import {
-  validateTextAttachmentPayloads,
-  type TextAttachmentPayload,
-} from "@/entities/attachment/model/text-attachments";
+  validateAttachmentPayloads,
+  type AttachmentPayload,
+} from "@/entities/attachment/model/attachments";
 import {
   parseHumanInputResponse,
   type HumanInputResponse,
@@ -21,7 +21,7 @@ export interface ChatStreamRequest {
   readonly threadId: string;
   readonly messageId: string;
   readonly message: string;
-  readonly attachments?: readonly TextAttachmentPayload[];
+  readonly attachments?: readonly AttachmentPayload[];
   readonly humanInputResponse?: HumanInputResponse;
   readonly benchmarkCaseId?: string;
   readonly goalResumeRevision?: string;
@@ -143,7 +143,7 @@ function validateRequest(request: ChatStreamRequest): {
   readonly threadId: string;
   readonly messageId: string;
   readonly message: string;
-  readonly attachments: readonly TextAttachmentPayload[];
+  readonly attachments: readonly AttachmentPayload[];
   readonly humanInputResponse: HumanInputResponse | null;
   readonly benchmarkCaseId: string | null;
   readonly goalResumeRevision: string | null;
@@ -185,7 +185,7 @@ function validateRequest(request: ChatStreamRequest): {
   }
   let attachments;
   try {
-    attachments = validateTextAttachmentPayloads(request.attachments ?? []).map(
+    attachments = validateAttachmentPayloads(request.attachments ?? []).map(
       ({ filename, content }) => ({ filename, content }),
     );
   } catch (error) {

@@ -8,7 +8,7 @@ from typing import Protocol
 from uuid import uuid4
 from pathlib import Path
 from mini_deer_agent.workspace.directory import ignored, list_directory
-from mini_deer_agent.workspace.files import read_project_file
+from mini_deer_agent.workspace.files import read_project_file, read_project_snapshot
 from mini_deer_agent.workspace.search import (
     MAX_SCANNED_ENTRIES,
     MAX_SEARCH_BYTES,
@@ -407,11 +407,8 @@ class FileAccess:
             ],
         }
 
-    def read_file(
-        self, *, path: str, start_line: int = 1, limit: int = 200
-    ) -> dict:
-        """读取 Scope 内文件；单文件 Scope 不能借相对路径访问兄弟文件。"""
-        self._validate_binding()
+    def _read_target(self, path: str) -> tuple[Path, str]:
+        """源码分页与文档下载使用相同的 Scope 内路径映射。"""
         if self.scope.target_kind == "roots":
             selected_root, selected_path = self._split_allowed_root(path)
             if not selected_path:
@@ -432,6 +429,22 @@ class FileAccess:
                 )
             root = target.parent
             read_path = path
+        return root, read_path
+
+    def read_file_bytes(self, *, path: str) -> tuple[dict, bytes]:
+        """为通用文件面板读取原始字节；前后仍校验项目或允许根绑定。"""
+        self._validate_binding()
+        root, read_path = self._read_target(path)
+        metadata, data = read_project_snapshot(root, read_path)
+        self._validate_binding()
+        return {**metadata, "path": path}, data
+
+    def read_file(
+        self, *, path: str, start_line: int = 1, limit: int = 200
+    ) -> dict:
+        """读取 Scope 内文件；单文件 Scope 不能借相对路径访问兄弟文件。"""
+        self._validate_binding()
+        root, read_path = self._read_target(path)
         result = read_project_file(
             root, read_path, start_line=start_line, limit=limit
         )

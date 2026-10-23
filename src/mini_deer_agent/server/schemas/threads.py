@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from mini_deer_agent.domain import (
     MAX_THREAD_TITLE_LENGTH,
-    TextAttachmentMediaType,
+    AttachmentMediaType,
     normalize_thread_title,
 )
 
@@ -97,12 +97,12 @@ class RunEventResponse(BaseModel):
 
 
 class TextAttachmentResponse(BaseModel):
-    """公开一条已持久化文本附件的完整内容，供历史恢复时查看正文。"""
+    """兼容既有响应名称，恢复文本正文或图片 data URL。"""
 
     model_config = ConfigDict(extra="forbid")
 
     filename: str
-    media_type: TextAttachmentMediaType
+    media_type: AttachmentMediaType
     size_bytes: int = Field(ge=1)
     content: str = Field(min_length=1)
 

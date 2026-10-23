@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from mini_deer_agent.domain.attachments import TextAttachment
+from mini_deer_agent.domain.attachments import Attachment
 
 
 type ThreadStatus = Literal["idle", "busy", "error"]
@@ -103,7 +103,7 @@ class MessageHistoryItem:
     content: str
     created_at: str
     reasoning: str | None = None
-    attachments: tuple[TextAttachment, ...] = ()
+    attachments: tuple[Attachment, ...] = ()
     hidden_from_ui: bool = False
     human_input_response: dict[str, Any] | None = None
 

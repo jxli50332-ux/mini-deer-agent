@@ -1,0 +1,30 @@
+{
+  "mcpServers": {
+    "learning": {
+      "enabled": true,
+      "transport": "stdio",
+      "command": ".venv/Scripts/python.exe",
+      "args": ["examples/mcp_learning_server.py"]
+    },
+    "word": {
+      "enabled": true,
+      "transport": "stdio",
+      "command": "data/mcp/word/.venv/Scripts/python.exe",
+      "args": ["examples/mcp_word_server.py"],
+      "env": {
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8",
+        "MCP_TRANSPORT": "stdio"
+      }
+    }
+  },
+  "toolRoutingKeywords": {
+    "learning_add_numbers": ["加法", "两数求和", "add numbers"],
+    "learning_reverse_text": ["反转文本", "倒序字符串", "reverse text"],
+    "word_create_document": ["创建Word", "生成Word", "新建文档"],
+    "word_get_document_text": ["读取Word", "提取文档正文"],
+    "word_add_heading": ["文档标题", "添加标题"],
+    "word_add_paragraph": ["文档段落", "添加正文"],
+    "word_add_table": ["文档表格", "添加表格"]
+  }
+}

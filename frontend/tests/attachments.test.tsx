@@ -73,7 +73,7 @@ describe("文本附件输入", () => {
       />,
     );
 
-    const input = screen.getByLabelText<HTMLInputElement>("添加文本附件");
+    const input = screen.getByLabelText<HTMLInputElement>("添加附件");
     const file = new File(["代号：云杉"], "brief.md", {
       type: "text/markdown",
     });
@@ -120,7 +120,7 @@ describe("文本附件输入", () => {
     const file = new File(["代号：云杉"], "brief.md", {
       type: "text/markdown",
     });
-    fireEvent.change(screen.getByLabelText("添加文本附件"), {
+    fireEvent.change(screen.getByLabelText("添加附件"), {
       target: { files: [file] },
     });
 
@@ -152,7 +152,7 @@ describe("文本附件输入", () => {
       />,
     );
 
-    fireEvent.change(screen.getByLabelText("添加文本附件"), {
+    fireEvent.change(screen.getByLabelText("添加附件"), {
       target: { files: [new File(["x"], "brief.pdf")] },
     });
 
@@ -172,7 +172,7 @@ describe("文本附件输入", () => {
       />,
     );
 
-    fireEvent.change(screen.getByLabelText("添加文本附件"), {
+    fireEvent.change(screen.getByLabelText("添加附件"), {
       target: { files: [new File(["print(1)"], "main.py")] },
     });
 

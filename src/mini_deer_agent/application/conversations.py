@@ -6,7 +6,7 @@ from mini_deer_agent.domain import (
     ConversationHistoryPage,
     MAX_THREAD_TITLE_LENGTH,
     RunRecord,
-    TextAttachment,
+    Attachment,
     ThreadRecord,
     normalize_thread_title,
 )
@@ -39,7 +39,7 @@ class ConversationRepository(MemoryStore, Protocol):
         run_id: str,
         user_message_id: str,
         user_message: str,
-        attachments: tuple[TextAttachment, ...] = (),
+        attachments: tuple[Attachment, ...] = (),
         human_input_response: dict[str, object] | None = None,
         benchmark_case_id: str | None = None,
         hidden_from_ui: bool = False,
@@ -107,6 +107,9 @@ class ConversationRepository(MemoryStore, Protocol):
     ) -> ConversationHistoryPage:
         """返回一页按时间正序排列的可见历史。"""
 
+    def get_attachment(self, message_id: str, position: int) -> Attachment | None:
+        """按消息身份和稳定顺序读取一个用户附件。"""
+
     def save_goal_context_snapshot(
         self,
         *,
@@ -133,6 +136,10 @@ class ConversationHistoryService:
     def get_thread(self, thread_id: str) -> ThreadRecord | None:
         """查询单个 Thread。"""
         return self._repository.get_thread(thread_id)
+
+    def get_attachment(self, message_id: str, position: int) -> Attachment | None:
+        """返回已保存的用户原图或文本，供 HTTP 下载使用。"""
+        return self._repository.get_attachment(message_id, position)
 
     def list_threads(
         self,

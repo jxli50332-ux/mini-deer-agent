@@ -7,7 +7,7 @@ import {
 } from "react";
 
 import type { ChatTimelineItem } from "@/entities/message/model/types";
-import type { PreparedTextAttachment } from "@/entities/attachment/model/text-attachments";
+import type { PreparedAttachment } from "@/entities/attachment/model/attachments";
 import {
   cancelChatRun,
   ChatStreamClientError,
@@ -60,7 +60,7 @@ export interface UseChatRunResult {
   ) => void;
   readonly submit: (
     message: string,
-    attachments?: readonly PreparedTextAttachment[],
+    attachments?: readonly PreparedAttachment[],
     submitOptions?: ChatSubmitOptions,
   ) => Promise<boolean>;
   readonly cancel: () => Promise<boolean>;
@@ -199,7 +199,7 @@ export function useChatRun(options: UseChatRunOptions): UseChatRunResult {
   const submit = useCallback(
     async (
       rawMessage: string,
-      attachments: readonly PreparedTextAttachment[] = [],
+      attachments: readonly PreparedAttachment[] = [],
       submitOptions: ChatSubmitOptions = {},
     ): Promise<boolean> => {
       if (activeOperationsRef.current.has(threadId)) {

@@ -3,6 +3,7 @@ import {
   useRef,
   useState,
   type ChangeEvent,
+  type ClipboardEvent,
   type FormEvent,
   type KeyboardEvent,
   type PointerEvent,
@@ -10,11 +11,13 @@ import {
 
 import {
   formatAttachmentSize,
-  prepareSelectedTextAttachments,
-  type PreparedTextAttachment,
-} from "@/entities/attachment/model/text-attachments";
+  isImageAttachment,
+  prepareSelectedAttachments,
+  type PreparedAttachment,
+} from "@/entities/attachment/model/attachments";
 import type { TodoList } from "@/entities/todo/model/todo-list";
 import { TodoPanel } from "@/features/chat/ui/TodoPanel";
+import "./image-attachments.css";
 
 interface ComposerProps {
   readonly isActive: boolean;
@@ -44,7 +47,7 @@ interface ComposerProps {
   readonly onModelChange?: (name: string) => void | Promise<void>;
   readonly onSubmit: (
     message: string,
-    attachments: readonly PreparedTextAttachment[],
+    attachments: readonly PreparedAttachment[],
   ) => Promise<boolean>;
   readonly onCancel: () => Promise<boolean>;
 }
@@ -76,18 +79,22 @@ export function Composer({
   const lastAppliedInsertionId = useRef<number | null>(null);
   const resizeStart = useRef<{ y: number; height: number } | null>(null);
   const [isResizing, setIsResizing] = useState(false);
-  const [attachments, setAttachments] = useState<
-    readonly PreparedTextAttachment[]
-  >([]);
+  const [attachments, setAttachments] = useState<readonly PreparedAttachment[]>(
+    [],
+  );
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [isPreparingAttachments, setIsPreparingAttachments] = useState(false);
+  const attachmentPreparation = useRef<Promise<
+    readonly PreparedAttachment[]
+  > | null>(null);
+  const pastedImageSequence = useRef(0);
   const normalizedDraft = draft.trim();
   const canSubmit =
     !disabled &&
     !isActive &&
     !isModelSwitching &&
     !isPreparingAttachments &&
-    normalizedDraft.length > 0;
+    (normalizedDraft.length > 0 || attachments.some(isImageAttachment));
 
   useEffect(() => {
     if (
@@ -107,7 +114,7 @@ export function Composer({
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!canSubmit) {
+    if (!canSubmit || attachmentPreparation.current !== null) {
       return;
     }
 
@@ -115,30 +122,85 @@ export function Composer({
     setDraft("");
     setAttachments([]);
     setAttachmentError(null);
-    void onSubmit(normalizedDraft, attachments);
+    void onSubmit(normalizedDraft || "请描述附件中的图片。", attachments);
   };
 
-  const handleAttachmentSelection = async (
-    event: ChangeEvent<HTMLInputElement>,
-  ) => {
-    // FileList 与 input 是实时绑定的；必须先复制，否则清空 value 会让 files 同步变空。
-    const files = Array.from(event.currentTarget.files ?? []);
-    event.currentTarget.value = "";
-    if (files.length === 0) {
+  /** 选择和粘贴共用读取队列；连续粘贴也按顺序合并并检查附件总数。 */
+  const addAttachments = async (files: readonly File[]) => {
+    if (disabled || isActive || files.length === 0) {
       return;
     }
-
+    const previous =
+      attachmentPreparation.current ?? Promise.resolve(attachments);
+    const preparation = previous.then((current) =>
+      prepareSelectedAttachments(current, files),
+    );
+    // 一次读取失败时保留先前成功的附件，后续粘贴仍能继续。
+    const settled = preparation.catch(() => previous);
+    attachmentPreparation.current = settled;
     setAttachmentError(null);
     setIsPreparingAttachments(true);
     try {
-      setAttachments(await prepareSelectedTextAttachments(attachments, files));
+      setAttachments(await preparation);
+      setAttachmentError(null);
     } catch (error) {
       setAttachmentError(
         error instanceof Error ? error.message : "无法读取附件",
       );
     } finally {
-      setIsPreparingAttachments(false);
+      if (attachmentPreparation.current === settled) {
+        attachmentPreparation.current = null;
+        setIsPreparingAttachments(false);
+      }
     }
+  };
+
+  const handleAttachmentSelection = (event: ChangeEvent<HTMLInputElement>) => {
+    // FileList 与 input 是实时绑定的；必须先复制，否则清空 value 会让 files 同步变空。
+    const files = Array.from(event.currentTarget.files ?? []);
+    event.currentTarget.value = "";
+    void addAttachments(files);
+  };
+
+  /** 截图作为图片附件读取；含文字的剪贴板仍由 textarea 原生插入文字。 */
+  const handlePaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    if (disabled || isActive) return;
+    const itemFiles = Array.from(event.clipboardData.items)
+      .filter((item) => item.kind === "file")
+      .flatMap((item) => {
+        const file = item.getAsFile();
+        return file ? [file] : [];
+      });
+    // 浏览器只提供 files 时回退；两者都提供时不能重复添加同一张图。
+    const images = (
+      itemFiles.length > 0 ? itemFiles : Array.from(event.clipboardData.files)
+    ).filter(
+      (file) =>
+        file.type.startsWith("image/") || /\.(png|jpe?g)$/i.test(file.name),
+    );
+    if (images.length === 0) return;
+    if (!event.clipboardData.getData("text/plain")) event.preventDefault();
+    if (
+      images.some(
+        (file) => file.type && !["image/png", "image/jpeg"].includes(file.type),
+      )
+    ) {
+      setAttachmentError("粘贴图片仅支持 PNG、JPG/JPEG");
+      return;
+    }
+    void addAttachments(
+      images.map((file) => {
+        if (/\.(png|jpe?g)$/i.test(file.name)) return file;
+        // 某些剪贴板没有文件名或扩展名，补名后仍由共用流程核对真实格式。
+        const extension = file.type === "image/jpeg" ? "jpg" : "png";
+        pastedImageSequence.current += 1;
+        return new File(
+          [file],
+          `粘贴图片-${pastedImageSequence.current}.${extension}`,
+          { type: file.type },
+        );
+      }),
+    );
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -240,19 +302,19 @@ export function Composer({
               className="visually-hidden"
               type="file"
               multiple
-              accept=".txt,.md,.json,.csv,.py,.js,.jsx,.ts,.tsx,.html,.htm,.css,.scss,.yaml,.yml,.xml,.toml,.sh,.sql,.go,.java,.c,.h,.cpp,.hpp,.rs"
-              aria-label="添加文本附件"
+              accept=".png,.jpg,.jpeg,.txt,.md,.json,.csv,.py,.js,.jsx,.ts,.tsx,.html,.htm,.css,.scss,.yaml,.yml,.xml,.toml,.sh,.sql,.go,.java,.c,.h,.cpp,.hpp,.rs"
+              aria-label="添加附件"
               disabled={disabled || isActive || isPreparingAttachments}
-              onChange={(event) => void handleAttachmentSelection(event)}
+              onChange={handleAttachmentSelection}
             />
             <label
               className="composer__attachment-button"
               htmlFor="chat-attachments"
               aria-disabled={disabled || isActive || isPreparingAttachments}
             >
-              {isPreparingAttachments ? "正在读取…" : "+ 文本附件"}
+              {isPreparingAttachments ? "正在读取…" : "+ 附件"}
             </label>
-            <span>支持代码、配置等文本文件；最多 3 个</span>
+            <span>图片或文本 · 最多 3 个 · 单图 4 MiB</span>
           </div>
         </div>
         {modelError !== null && (
@@ -262,6 +324,13 @@ export function Composer({
           <ul className="composer__attachment-list" aria-label="待发送附件">
             {attachments.map((attachment, index) => (
               <li key={`${attachment.filename}:${index}`}>
+                {isImageAttachment(attachment) && (
+                  <img
+                    className="attachment-image__thumbnail"
+                    src={attachment.content}
+                    alt={`待发送图片 ${attachment.filename}`}
+                  />
+                )}
                 <span>
                   <strong>{attachment.filename}</strong>
                   {formatAttachmentSize(attachment.sizeBytes)}
@@ -269,7 +338,7 @@ export function Composer({
                 <button
                   type="button"
                   aria-label={`移除附件 ${attachment.filename}`}
-                  disabled={disabled || isActive}
+                  disabled={disabled || isActive || isPreparingAttachments}
                   onClick={() =>
                     setAttachments((current) =>
                       current.filter((_, itemIndex) => itemIndex !== index),
@@ -311,11 +380,12 @@ export function Composer({
             rows={2}
             value={draft}
             maxLength={32_768}
-            placeholder="输入消息，Enter 发送，Shift + Enter 换行……"
+            placeholder="输入消息或粘贴图片，Enter 发送，Shift + Enter 换行……"
             aria-describedby="composer-hint"
             disabled={disabled || isActive}
             onChange={(event) => setDraft(event.target.value)}
             onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
           />
           {isActive ? (
             <button
